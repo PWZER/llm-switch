@@ -7,29 +7,47 @@ transparently, and records usage for every request. Ships as a single Go binary 
 admin UI embedded.
 
 ```
-Agent (Claude Code, OpenAI SDK, ...)          llm-switch                    Upstream
+Agent (Claude Code, Codex CLI, OpenAI SDK, ...)   llm-switch                    Upstream
   POST /v1/messages (Anthropic)  ──►  parse → route → adapt → bridge  ──►  DeepSeek   (OpenAI wire)
   POST /v1/chat/completions      ──►         │ passthrough fast path     ──►  Zhipu GLM  (Anthropic wire)
-  GET  /v1/models                ──►         ▼ usage stats                    Kimi ...
+  POST /v1/responses             ──►         ▼ usage stats                    Kimi ...
+  GET  /v1/models                ──►                                          OpenAI  (Responses, passthrough)
 ```
 
 ## Features
 
-- **Dual protocol surfaces** on one port: `POST /v1/chat/completions`, `POST /v1/messages`,
-  `GET /v1/models`, `POST /v1/messages/count_tokens`, `POST /v1/embeddings`.
-- **Cross-protocol conversion** through an internal IR: Anthropic requests can ride
-  OpenAI-compatible upstreams and vice versa — including streaming SSE, tool calls
+- **Three client surfaces** on one port: `POST /v1/chat/completions` (OpenAI chat),
+  `POST /v1/responses` (OpenAI Responses API, stateless), `POST /v1/messages` (Anthropic),
+  plus `GET /v1/models` (both shapes, paginated), `POST /v1/messages/count_tokens`,
+  `POST /v1/embeddings`.
+- **Cross-protocol conversion** through an internal IR: Responses-only clients (e.g.
+  Codex CLI) can ride chat-completions and Anthropic upstreams, Anthropic requests can
+  ride OpenAI-compatible upstreams and vice versa — including streaming SSE, tool calls
   (arguments streamed incrementally), thinking/reasoning, images, and usage/cache tokens.
-- **Passthrough fast path** when the client protocol matches the channel: raw byte relay
-  with only the model field rewritten, with a usage tap for stats.
+- **Passthrough fast path** when the wire shapes match: raw byte relay with only the
+  model field rewritten, with a usage tap for stats. This covers same-protocol traffic
+  and OpenAI channels with an explicit `responses_path` (upstream Responses API).
 - **Routing**: model → channel bindings with priority (failover order) and weighted
   round-robin; automatic failover on 429/5xx/network errors (before the first byte);
   multi-key pools per provider with cooldown honoring `Retry-After`.
-- **Model aliases (hot-switching)**: stable client-facing names (e.g. `main`) re-pointable
+- **Model routes (hot-switching)**: stable client-facing names (e.g. `main`) re-pointable
   at runtime from the Web UI — agent configs never change. All admin config applies
   immediately via atomic snapshot reload, no restarts.
-- **Dynamic model lists**: fetch each provider's `/models` from the UI, merge into
-  `GET /v1/models` (OpenAI and Anthropic response shapes auto-detected).
+- **Dynamic model discovery**: `GET /v1/models` serves the merged registry (bindings +
+  model routes + manual entries) in OpenAI and Anthropic shapes, with `limit`/`after_id`
+  pagination and `GET /v1/models/{id}`; entries carry `context_length` and
+  `max_output_tokens` from the model registry. Anthropic-served models
+  additionally list `claude-<id>` mirrors and — when the registry context
+  window reaches 1,000,000 — `<id>[1m]` entries (Claude Code's 1M-context
+  marker) on the Anthropic shape.
+- **Account usage / balance probes**: declared per account (preset-prefilled where an
+  endpoint is known — DeepSeek and Kimi/Moonshot balance, Zhipu GLM coding-plan quota),
+  queried on demand from the Account Pool page with progress bars, quota windows
+  (5-hour / weekly / monthly) and reset times.
+- **Usage statistics**: per-request logs (tokens incl. cache/reasoning, latency,
+  first-token latency, attempts, error types) plus dashboard aggregations. Async batched
+  writes never block the hot path.
+- **Client API keys**: issue gateway keys to agents; keys are stored hashed and shown once.
 - **Usage statistics**: per-request logs (tokens incl. cache/reasoning, latency,
   first-token latency, attempts, error types) plus dashboard aggregations. Async batched
   writes never block the hot path.
@@ -46,21 +64,33 @@ LLM_SWITCH_ADMIN_PASSWORD=secret ./bin/llm-switch -addr 127.0.0.1:8080
 ```
 
 On first boot, if `LLM_SWITCH_ADMIN_PASSWORD` is unset, a random password is generated and
-logged once.
+logged once. First boot also seeds six built-in providers (Zhipu GLM, DeepSeek,
+Kimi/Moonshot, Kimi For Coding, OpenAI, Anthropic) with their docs-verified endpoints and
+identity model bindings — just add an API key on the Account Pool page to start routing.
+Deleting them is permanent (the seed runs once, tracked by the `seeded_providers` setting).
 
 ### Configure in the Web UI
 
-1. **Providers** → create a provider, add its API key(s).
-2. **Channels** → add one channel per endpoint. A vendor account often speaks both
-   protocols, so add both channels and pick per need:
+1. **Providers** → the seeded vendors are ready; create custom providers and endpoint
+   channels the same way. A vendor account often
+   speaks both protocols, so add both channels and pick per need:
    | Vendor | OpenAI channel | Anthropic channel |
    | --- | --- | --- |
    | DeepSeek | `https://api.deepseek.com` (`/chat/completions`) | `https://api.deepseek.com/anthropic` (`/v1/messages`) |
    | Zhipu GLM | `https://open.bigmodel.cn/api/paas/v4` | `https://open.bigmodel.cn/api/anthropic` |
    | Kimi/Moonshot | `https://api.moonshot.ai/v1` | `https://api.moonshot.ai/anthropic` |
    | Kimi For Coding | `https://api.kimi.com/coding/v1` | `https://api.kimi.com/coding/` |
-   Bind client-facing model names to upstream names on each channel.
-3. **Aliases** → create `main` (or override well-known names) and point it anywhere;
+   Bind client-facing model names to upstream names on each channel. Optional per
+   channel: a `responses_path` (e.g. `/responses`) marks the upstream as serving the
+   OpenAI Responses API natively — `/v1/responses` traffic is then relayed byte-wise
+   instead of converted. Channel **Test** is connectivity-only (URL reachability, no
+   credential checked).
+2. **Account Pool** → add accounts (API key + weight + usage probes) bound to a
+   provider. The gateway rotates requests across a provider's enabled accounts;
+   per-account **Test** (quick = list models, deep = mini chat) validates the key,
+   and per-account **Usage** reports balance/quota. Model Routes can pin a target
+   to a specific account.
+3. **Model Routes** → create `main` (or override well-known names) and point it anywhere;
    flip it anytime.
 4. **Client Keys** → issue a key for your agent (shown once).
 
@@ -74,9 +104,13 @@ export ANTHROPIC_API_KEY=sk-lsw-...
 # OpenAI SDK
 base_url = "http://127.0.0.1:8080/v1"
 api_key  = "sk-lsw-..."
+
+# Codex CLI (OpenAI Responses API)
+#   model provider: base_url http://127.0.0.1:8080/v1  (POST /v1/responses)
+#   stateless only: store=false; previous_response_id / background are rejected
 ```
 
-Model names resolve in this order: alias → channel binding → 404.
+Model names resolve after stripping the `[1m]` context marker: model route → channel binding → `claude-`-stripped retry → 404.
 
 ## Development
 
@@ -102,10 +136,12 @@ curl -N localhost:8080/v1/chat/completions \
 ## Architecture
 
 Pipeline per request: **parse → route → adapt → bridge** around a canonical IR
-(`internal/ir`). Two codecs (`internal/protocol/openai`, `internal/protocol/anthropic`)
-implement request/response/stream conversion in both directions; the IR hub means
-N client protocols × M upstream protocols need N+M converters. Same-protocol traffic
-skips the IR entirely (byte passthrough with a usage tap).
+(`internal/ir`). Three codecs (`internal/protocol/openai` chat,
+`internal/protocol/anthropic`, `internal/protocol/responses`) implement
+request/response/stream conversion in both directions; the IR hub means
+N client protocols × M upstream protocols need N+M converters. Wire-identical traffic
+skips the IR entirely (byte passthrough with a usage tap): same-protocol requests, and
+`/v1/responses` requests hitting a channel whose `responses_path` is set.
 
 Routing configuration lives in SQLite (WAL) and is served from an immutable in-memory
 snapshot swapped atomically after every admin mutation — in-flight requests pin their
@@ -119,7 +155,7 @@ timeout (streams live as long as needed, bounded by an idle watchdog).
 
 ## Security notes
 
-- Provider API keys are stored in SQLite (plaintext by necessity — they are sent
+- Account API keys are stored in SQLite (plaintext by necessity — they are sent
   upstream). Keep the data directory permission-tight (the binary sets `0700`).
 - Client gateway keys are stored as SHA-256 hashes; the plaintext is shown exactly once.
 - The admin UI is a single password + bearer session. Run it on loopback or behind

@@ -9,7 +9,7 @@ import (
 )
 
 // RequestLog is one row of request_logs. Denormalized display names survive
-// deletion of the referenced provider/channel/key.
+// deletion of the referenced provider/channel/account.
 type RequestLog struct {
 	ID               int64   `json:"id"`
 	TS               int64   `json:"ts"` // unix millis
@@ -18,6 +18,8 @@ type RequestLog struct {
 	APIKeyName       string  `json:"api_key_name"`
 	ProviderID       *int64  `json:"provider_id"`
 	ProviderName     string  `json:"provider_name"`
+	AccountID        *int64  `json:"account_id"`
+	AccountName      string  `json:"account_name"`
 	ChannelID        *int64  `json:"channel_id"`
 	ChannelName      string  `json:"channel_name"`
 	Model            string  `json:"model"`
@@ -40,11 +42,12 @@ type RequestLog struct {
 
 // LogFilter bounds a logs query. Zero values mean "unset".
 type LogFilter struct {
-	From       int64  // unix millis
+	From       int64 // unix millis
 	To         int64
 	Model      string
 	APIKeyID   int64
 	ProviderID int64
+	AccountID  int64
 	ChannelID  int64
 	Status     int
 	Page       int
@@ -52,7 +55,7 @@ type LogFilter struct {
 }
 
 const logColumns = `id, ts, request_id, api_key_id, api_key_name, provider_id, provider_name,
-	channel_id, channel_name, model, upstream_model, protocol_in, protocol_out, stream,
+	account_id, account_name, channel_id, channel_name, model, upstream_model, protocol_in, protocol_out, stream,
 	status, success, error_type, attempts, prompt_tokens, completion_tokens,
 	cache_read_tokens, cache_write_tokens, reasoning_tokens, latency_ms, first_token_ms`
 
@@ -73,10 +76,10 @@ func (r *LogsRepo) InsertBatch(ctx context.Context, rows []RequestLog) error {
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO request_logs (
 			ts, request_id, api_key_id, api_key_name, provider_id, provider_name,
-			channel_id, channel_name, model, upstream_model, protocol_in, protocol_out,
+			account_id, account_name, channel_id, channel_name, model, upstream_model, protocol_in, protocol_out,
 			stream, status, success, error_type, attempts, prompt_tokens, completion_tokens,
 			cache_read_tokens, cache_write_tokens, reasoning_tokens, latency_ms, first_token_ms
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare log insert: %w", err)
 	}
@@ -88,7 +91,7 @@ func (r *LogsRepo) InsertBatch(ctx context.Context, rows []RequestLog) error {
 		}
 		if _, err := stmt.ExecContext(ctx,
 			row.TS, row.RequestID, row.APIKeyID, row.APIKeyName, row.ProviderID, row.ProviderName,
-			row.ChannelID, row.ChannelName, row.Model, row.UpstreamModel, row.ProtocolIn, row.ProtocolOut,
+			row.AccountID, row.AccountName, row.ChannelID, row.ChannelName, row.Model, row.UpstreamModel, row.ProtocolIn, row.ProtocolOut,
 			row.Stream, row.Status, row.Success, row.ErrorType, row.Attempts, row.PromptTokens, row.CompletionTokens,
 			row.CacheReadTokens, row.CacheWriteTokens, row.ReasoningTokens, row.LatencyMS, row.FirstTokenMS,
 		); err != nil {
@@ -103,7 +106,7 @@ func scanLog(rows *sql.Rows) (RequestLog, error) {
 	var errType sql.NullString
 	var ftms sql.NullInt64
 	err := rows.Scan(&l.ID, &l.TS, &l.RequestID, &l.APIKeyID, &l.APIKeyName, &l.ProviderID, &l.ProviderName,
-		&l.ChannelID, &l.ChannelName, &l.Model, &l.UpstreamModel, &l.ProtocolIn, &l.ProtocolOut, &l.Stream,
+		&l.AccountID, &l.AccountName, &l.ChannelID, &l.ChannelName, &l.Model, &l.UpstreamModel, &l.ProtocolIn, &l.ProtocolOut, &l.Stream,
 		&l.Status, &l.Success, &errType, &l.Attempts, &l.PromptTokens, &l.CompletionTokens,
 		&l.CacheReadTokens, &l.CacheWriteTokens, &l.ReasoningTokens, &l.LatencyMS, &l.FirstTokenMS)
 	if err != nil {
@@ -178,6 +181,10 @@ func logWhere(f LogFilter) (string, []any) {
 		conds = append(conds, "provider_id = ?")
 		args = append(args, f.ProviderID)
 	}
+	if f.AccountID > 0 {
+		conds = append(conds, "account_id = ?")
+		args = append(args, f.AccountID)
+	}
 	if f.ChannelID > 0 {
 		conds = append(conds, "channel_id = ?")
 		args = append(args, f.ChannelID)
@@ -205,17 +212,17 @@ func (r *LogsRepo) DeleteLogsBefore(ctx context.Context, cutoffMS int64) (int64,
 
 // Overview aggregates one time window (unix millis bounds) for the dashboard.
 type Overview struct {
-	Requests         int64   `json:"requests"`
-	Successes        int64   `json:"successes"`
-	PromptTokens     int64   `json:"prompt_tokens"`
-	CompletionTokens int64   `json:"completion_tokens"`
-	CacheReadTokens  int64   `json:"cache_read_tokens"`
-	CacheWriteTokens int64   `json:"cache_write_tokens"`
-	ReasoningTokens  int64   `json:"reasoning_tokens"`
-	LatencyP50MS     *int64  `json:"latency_p50_ms"`
-	LatencyP95MS     *int64  `json:"latency_p95_ms"`
-	TTFTP50MS        *int64  `json:"ttft_p50_ms"`
-	TTFTP95MS        *int64  `json:"ttft_p95_ms"`
+	Requests         int64  `json:"requests"`
+	Successes        int64  `json:"successes"`
+	PromptTokens     int64  `json:"prompt_tokens"`
+	CompletionTokens int64  `json:"completion_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
+	CacheWriteTokens int64  `json:"cache_write_tokens"`
+	ReasoningTokens  int64  `json:"reasoning_tokens"`
+	LatencyP50MS     *int64 `json:"latency_p50_ms"`
+	LatencyP95MS     *int64 `json:"latency_p95_ms"`
+	TTFTP50MS        *int64 `json:"ttft_p50_ms"`
+	TTFTP95MS        *int64 `json:"ttft_p95_ms"`
 }
 
 // OverviewStats computes window totals and latency percentiles.
@@ -285,13 +292,15 @@ type GroupRow struct {
 	Successes        int64  `json:"successes"`
 	PromptTokens     int64  `json:"prompt_tokens"`
 	CompletionTokens int64  `json:"completion_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
 }
 
-// Timeseries groups a window by day and a dimension (model|provider|key).
+// Timeseries groups a window by day and a dimension (model|provider|account|key).
 func (r *LogsRepo) Timeseries(ctx context.Context, fromMS, toMS int64, groupBy string) ([]GroupRow, error) {
 	col := map[string]string{
 		"model":    "model",
 		"provider": "provider_name",
+		"account":  "account_name",
 		"key":      "api_key_name",
 	}[groupBy]
 	if col == "" {
@@ -301,7 +310,8 @@ func (r *LogsRepo) Timeseries(ctx context.Context, fromMS, toMS int64, groupBy s
 		SELECT date(ts/1000, 'unixepoch') AS bucket, `+col+` AS grp,
 			COUNT(*) AS requests, COALESCE(SUM(success),0) AS successes,
 			COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,
-			COALESCE(SUM(completion_tokens),0) AS completion_tokens
+			COALESCE(SUM(completion_tokens),0) AS completion_tokens,
+			COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens
 		FROM request_logs
 		WHERE ts >= ? AND ts <= ?
 		GROUP BY bucket, grp ORDER BY bucket DESC, requests DESC`,
@@ -313,7 +323,7 @@ func (r *LogsRepo) Timeseries(ctx context.Context, fromMS, toMS int64, groupBy s
 	out := []GroupRow{}
 	for rows.Next() {
 		var g GroupRow
-		if err := rows.Scan(&g.Bucket, &g.Group, &g.Requests, &g.Successes, &g.PromptTokens, &g.CompletionTokens); err != nil {
+		if err := rows.Scan(&g.Bucket, &g.Group, &g.Requests, &g.Successes, &g.PromptTokens, &g.CompletionTokens, &g.CacheReadTokens); err != nil {
 			return nil, fmt.Errorf("scan timeseries: %w", err)
 		}
 		out = append(out, g)

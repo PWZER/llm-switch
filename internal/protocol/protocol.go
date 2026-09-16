@@ -8,6 +8,7 @@ import (
 	"github.com/PWZER/llm-switch/internal/ir"
 	"github.com/PWZER/llm-switch/internal/protocol/anthropic"
 	"github.com/PWZER/llm-switch/internal/protocol/openai"
+	"github.com/PWZER/llm-switch/internal/protocol/responses"
 )
 
 // StreamReader folds upstream SSE payloads into canonical events.
@@ -72,6 +73,25 @@ func (anthropicCodec) NewRenderer(model string) Renderer {
 	return anthropic.NewRendererFor(model)
 }
 
+type responsesCodec struct{}
+
+func (responsesCodec) DecodeRequest(body []byte) (*ir.Request, error) {
+	return responses.DecodeRequest(body)
+}
+func (responsesCodec) EncodeRequest(req *ir.Request) ([]byte, error) {
+	return responses.EncodeRequest(req)
+}
+func (responsesCodec) DecodeResponse(body []byte) (*ir.Response, error) {
+	return responses.DecodeResponse(body)
+}
+func (responsesCodec) EncodeResponse(resp *ir.Response) ([]byte, error) {
+	return responses.EncodeResponse(resp)
+}
+func (responsesCodec) NewStreamReader() StreamReader { return responses.NewStreamReader() }
+func (responsesCodec) NewRenderer(model string) Renderer {
+	return responses.NewRendererFor(model)
+}
+
 // For returns the codec of a protocol.
 func For(p ir.Protocol) (Codec, error) {
 	switch p {
@@ -79,6 +99,8 @@ func For(p ir.Protocol) (Codec, error) {
 		return openaiCodec{}, nil
 	case ir.Anthropic:
 		return anthropicCodec{}, nil
+	case ir.OpenAIResponses:
+		return responsesCodec{}, nil
 	default:
 		return nil, fmt.Errorf("unknown protocol %q", p)
 	}

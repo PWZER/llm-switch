@@ -7,35 +7,70 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/PWZER/llm-switch/internal/engine"
+	"github.com/PWZER/llm-switch/internal/protocol/responses"
 	"github.com/PWZER/llm-switch/internal/stats"
 )
 
 const (
 	protocolOpenAI    = "openai"
 	protocolAnthropic = "anthropic"
+	// protocolOpenAIResponses is the client-facing Responses API surface
+	// (POST /v1/responses). Channels never carry this value: Responses traffic
+	// either passes through to an openai channel's responses_path or is
+	// bridged to the channel's chat protocol.
+	protocolOpenAIResponses = "openai-responses"
 
 	defaultOpenAIChatPath    = "/chat/completions"
 	defaultAnthropicChatPath = "/v1/messages"
 	embeddingsPath           = "/embeddings"
 )
 
+// surfaceProtocol maps a client surface to the upstream wire protocol it
+// prefers: the Responses surface is served by openai channels.
+func surfaceProtocol(clientProtocol string) string {
+	if clientProtocol == protocolOpenAIResponses {
+		return protocolOpenAI
+	}
+	return clientProtocol
+}
+
 // Gateway is the data-plane service.
 type Gateway struct {
 	Holder *engine.Holder
-	Pool   *KeyPool
+	Pool   *AccountPool
 	Client *http.Client
 	Log    *stats.Logger
 }
 
 // New assembles a gateway.
-func New(holder *engine.Holder, pool *KeyPool, client *http.Client, logger *stats.Logger) *Gateway {
+func New(holder *engine.Holder, pool *AccountPool, client *http.Client, logger *stats.Logger) *Gateway {
 	return &Gateway{Holder: holder, Pool: pool, Client: client, Log: logger}
+}
+
+// errAccountCooling means a route-pinned account is in cooldown; the caller
+// should fail over to the next candidate.
+var errAccountCooling = errors.New("pinned account is cooling down")
+
+// pickAccount resolves the credential for one candidate: a route-pinned
+// account is used verbatim (unless cooling), otherwise the provider's account
+// pool rotates.
+func (g *Gateway) pickAccount(cand engine.Candidate) (engine.Account, error) {
+	if cand.Account != nil {
+		if g.Pool.Cooling(cand.Account.ID) {
+			return engine.Account{}, errAccountCooling
+		}
+		return *cand.Account, nil
+	}
+	return g.Pool.Pick(cand.Channel.Provider)
 }
 
 type ctxKey int
@@ -75,10 +110,12 @@ func ValidateClientKey(holder *engine.Holder) func(key string) (engine.ClientKey
 // The caller is responsible for wrapping them with client-key auth.
 func (g *Gateway) Mount(r chi.Router) {
 	r.Post("/chat/completions", g.serve(protocolOpenAI))
+	r.Post("/responses", g.serve(protocolOpenAIResponses))
 	r.Post("/messages", g.serve(protocolAnthropic))
 	r.Post("/messages/count_tokens", g.countTokens)
 	r.Post("/embeddings", g.embeddings)
 	r.Get("/models", g.models)
+	r.Get("/models/{modelID}", g.modelByID)
 }
 
 // serve is the shared pipeline for both protocol surfaces.
@@ -87,13 +124,23 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 		start := time.Now()
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 		if err != nil {
+			slog.Warn("gateway rejected request", "reason", "read body", "err", err)
 			writeProtocolError(w, r, clientProtocol, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error())
 			return
 		}
 		model, stream, err := extractModelStream(body)
 		if err != nil || model == "" {
+			slog.Warn("gateway rejected request", "reason", "missing model field")
 			writeProtocolError(w, r, clientProtocol, http.StatusBadRequest, "invalid_request_error", `missing or invalid "model" field`)
 			return
+		}
+		if clientProtocol == protocolOpenAIResponses {
+			// Stateless-only gate lives here (not in the codec) because the
+			// passthrough path never decodes the body.
+			if verr := responses.ValidateStateless(body); verr != nil {
+				writeProtocolError(w, r, clientProtocol, http.StatusBadRequest, "invalid_request_error", verr.Error())
+				return
+			}
 		}
 
 		snap := g.Holder.Load()
@@ -102,9 +149,11 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			return
 		}
 		ck, _ := ClientKeyFrom(r.Context())
-		cands, _, found := snap.Resolve(model)
+		cands, _, found := snap.Resolve(model, surfaceProtocol(clientProtocol))
 		if !found {
-			g.recordFailure(r, start, ck, model, "", clientProtocol, stream, http.StatusNotFound, "model_not_found", 1)
+			slog.Warn("model not found",
+				"model", model, "protocol", clientProtocol, "client_key", ck.Name)
+			g.recordFailure(r, start, ck, model, "", clientProtocol, stream, http.StatusNotFound, "model_not_found", 1, nil)
 			writeModelNotFound(w, r, clientProtocol, model)
 			return
 		}
@@ -122,24 +171,41 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			lastErrBody  []byte
 			lastErrType  string
 			lastUpstream string
+			lastAccount  *engine.Account
 		)
 		for i := 0; i < maxAttempts; i++ {
 			cand := cands[i]
 			prov := cand.Channel.Provider
-			key, err := g.Pool.Pick(prov)
+			account, err := g.pickAccount(cand)
+			if errors.Is(err, errAccountCooling) {
+				slog.Warn("route-pinned account cooling, failing over", "channel", cand.Channel.Name,
+					"provider", prov.Name, "account_id", cand.Account.ID, "model", model, "attempt", i+1)
+				lastStatus, lastErrType = http.StatusServiceUnavailable, "account_cooldown"
+				lastUpstream = cand.UpstreamModel
+				continue
+			}
 			if err != nil {
 				g.recordFailure(r, start, ck, model, cand.UpstreamModel, clientProtocol, stream,
-					http.StatusServiceUnavailable, "no_keys", i+1)
+					http.StatusServiceUnavailable, "no_accounts", i+1, nil)
 				writeProtocolError(w, r, clientProtocol, http.StatusServiceUnavailable,
-					"api_error", "provider "+prov.Name+" has no enabled api keys")
+					"api_error", "provider "+prov.Name+" has no enabled accounts")
 				return
 			}
 			lastUpstream = cand.UpstreamModel
+			acc := account
+			lastAccount = &acc
 
-			upBody, perr := prepareUpstreamBody(body, clientProtocol, cand.Channel.Protocol, cand.UpstreamModel)
+			ptPath := responsesPassthroughPath(clientProtocol, cand.Channel)
+			upPath := chatPath(cand.Channel)
+			if ptPath != "" {
+				upPath = ptPath
+			}
+			upBody, perr := prepareUpstreamBody(body, clientProtocol, cand.Channel.Protocol, cand.UpstreamModel, stream, ptPath != "")
 			if perr != nil {
+				slog.Warn("request preparation failed", "channel", cand.Channel.Name,
+					"model", model, "err", perr)
 				g.recordFailure(r, start, ck, model, cand.UpstreamModel, clientProtocol, stream,
-					http.StatusBadRequest, "invalid_request", i+1)
+					http.StatusBadRequest, "invalid_request", i+1, lastAccount)
 				status := http.StatusBadRequest
 				_, isBad := perr.(errBadRequest)
 				if !isBad {
@@ -149,11 +215,12 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				return
 			}
 
-			resp, err := g.dispatch(r, cand, key.Secret, upBody, stream, clientProtocol)
+			resp, err := g.dispatch(r, cand, account.Secret, upBody, stream, clientProtocol, upPath)
 			if err != nil {
-				g.Pool.Report(key.ID, OutcomeServerError, 0)
+				slog.Warn("upstream attempt failed", "channel", cand.Channel.Name,
+					"provider", prov.Name, "account_id", account.ID, "model", model, "attempt", i+1, "err", err)
+				g.Pool.Report(account.ID, OutcomeServerError, 0)
 				lastStatus, lastErrType = http.StatusBadGateway, "network_error"
-				slog.Info("upstream attempt failed", "channel", cand.Channel.Name, "err", err)
 				continue
 			}
 
@@ -171,20 +238,24 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				} else if resp.StatusCode == http.StatusRequestTimeout {
 					errType = "timeout"
 				}
-				g.Pool.Report(key.ID, outcome, ra)
+				slog.Warn("upstream retriable failure", "channel", cand.Channel.Name,
+					"provider", prov.Name, "account_id", account.ID, "model", model, "attempt", i+1,
+					"status", resp.StatusCode, "retry_after", ra.String())
+				g.Pool.Report(account.ID, outcome, ra)
 				lastStatus, lastErrType = resp.StatusCode, errType
-				slog.Info("upstream retriable failure", "channel", cand.Channel.Name, "status", resp.StatusCode)
 				continue
 			case statusAuth:
+				slog.Warn("upstream rejected credentials", "channel", cand.Channel.Name,
+					"provider", prov.Name, "account_id", account.ID, "status", resp.StatusCode)
 				if eb := captureUpstreamError(resp); len(eb) > 0 {
 					lastErrBody = eb
 				}
-				g.Pool.Report(key.ID, OutcomeAuthError, 0)
+				g.Pool.Report(account.ID, OutcomeAuthError, 0)
 				lastStatus, lastErrType = resp.StatusCode, "auth_error"
 				continue
 			default:
 				// Committed: 2xx relayed, non-retriable 4xx/5xx passed through.
-				g.commit(w, r, start, resp, cand, key, ck, model,
+				g.commit(w, r, start, resp, cand, account, ck, model,
 					clientProtocol, stream, lastStatus, lastErrType, i+1)
 				return
 			}
@@ -195,18 +266,22 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 		if status == 0 || status < 400 {
 			status = http.StatusBadGateway
 		}
-		g.recordFailure(r, start, ck, model, lastUpstream, clientProtocol, stream, status, orDefault(lastErrType, "upstream_error"), maxAttempts)
+		slog.Error("all upstream candidates failed", "model", model,
+			"client_key", ck.Name, "attempts", maxAttempts,
+			"last_status", status, "error_type", orDefault(lastErrType, "upstream_error"))
+		g.recordFailure(r, start, ck, model, lastUpstream, clientProtocol, stream, status, orDefault(lastErrType, "upstream_error"), maxAttempts, lastAccount)
 		writeUpstreamError(w, r, clientProtocol, status, lastErrBody)
 	}
 }
 
 // dispatch sends the prepared upstream request. Auth injected per channel
-// style; hop-by-hop headers stripped.
+// style; hop-by-hop headers stripped. upPath overrides the channel chat path
+// (used for Responses passthrough).
 func (g *Gateway) dispatch(r *http.Request, cand engine.Candidate, secret string,
-	body []byte, stream bool, clientProtocol string) (*http.Response, error) {
+	body []byte, stream bool, clientProtocol, upPath string) (*http.Response, error) {
 
 	ch := cand.Channel
-	url := joinURL(ch.BaseURL, chatPath(ch))
+	url := joinURL(ch.BaseURL, upPath)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytesReader(body))
 	if err != nil {
 		return nil, err
@@ -215,10 +290,27 @@ func (g *Gateway) dispatch(r *http.Request, cand engine.Candidate, secret string
 	return g.Client.Do(req)
 }
 
+// responsesPassthroughPath returns the upstream Responses endpoint when the
+// request can be relayed to it byte-wise, else "". Only openai channels with
+// an explicit responses_path qualify.
+func responsesPassthroughPath(clientProtocol string, ch *engine.Channel) string {
+	if clientProtocol != protocolOpenAIResponses || ch.Protocol != protocolOpenAI {
+		return ""
+	}
+	if ch.ResponsesPath == nil || *ch.ResponsesPath == "" {
+		return ""
+	}
+	p := *ch.ResponsesPath
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
+}
+
 // commit relays a successful (or non-retriable) upstream response to the client
 // and records the request log entry.
 func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time,
-	resp *http.Response, cand engine.Candidate, key engine.Key, ck engine.ClientKey,
+	resp *http.Response, cand engine.Candidate, acc engine.Account, ck engine.ClientKey,
 	model, clientProtocol string, stream bool,
 	prevStatus int, prevErrType string, attempts int) {
 
@@ -227,17 +319,29 @@ func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time
 		ttft       *int64
 		err        error
 		converting = cand.Channel.Protocol != clientProtocol
+		// Responses passthrough must preempt the converted relays: the
+		// upstream body is Responses-shaped even though the channel protocol
+		// is "openai", so the usage tap keys on the responses protocol.
+		ptPath   = responsesPassthroughPath(clientProtocol, cand.Channel)
+		tapProto = cand.Channel.Protocol
 	)
+	if ptPath != "" {
+		tapProto = clientProtocol
+	}
 	switch {
+	case ptPath != "" && stream && resp.StatusCode < 400:
+		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout())
 	case stream && resp.StatusCode < 400 && converting:
 		usage, ttft, err = relayConvertedStream(w, r, resp,
 			cand.Channel.Protocol, clientProtocol, model, g.idleTimeout())
 	case stream && resp.StatusCode < 400:
-		usage, ttft, err = relayStream(w, r, resp, cand.Channel.Protocol, g.idleTimeout())
+		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout())
+	case ptPath != "":
+		usage, err = relayNonStream(w, r, resp, tapProto)
 	case converting:
 		usage, err = relayConvertedNonStream(w, r, resp, cand.Channel.Protocol, clientProtocol, model)
 	default:
-		usage, err = relayNonStream(w, r, resp, cand.Channel.Protocol)
+		usage, err = relayNonStream(w, r, resp, tapProto)
 	}
 
 	success := err == nil && resp.StatusCode < 400
@@ -246,9 +350,9 @@ func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time
 		errType = prevErrType + "+" + errType
 	}
 	_ = prevStatus
-	g.logRequest(r, start, ck, model, cand, clientProtocol, stream,
+	g.logRequest(r, start, ck, model, cand, &acc, clientProtocol, stream,
 		resp.StatusCode, success, errType, attempts, usage, ttft)
-	g.Pool.Report(key.ID, OutcomeOK, 0)
+	g.Pool.Report(acc.ID, OutcomeOK, 0)
 }
 
 // — /v1/models ------------------------------------------------------------
@@ -259,45 +363,180 @@ func (g *Gateway) models(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "gateway is starting")
 		return
 	}
-	anthropicShape := r.Header.Get("x-api-key") != "" || r.Header.Get("anthropic-version") != ""
-	type openaiModel struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
+	anthropicShape := anthropicShapeRequest(r)
+	nowS := time.Now().Unix()
+	nowRFC := time.Now().UTC().Format(time.RFC3339)
+
+	type limits struct {
+		ContextLength   *int64 `json:"context_length,omitempty"`
+		MaxOutputTokens *int64 `json:"max_output_tokens,omitempty"`
 	}
 	type anthropicModel struct {
 		Type        string `json:"type"`
 		ID          string `json:"id"`
 		DisplayName string `json:"display_name"`
+		Description string `json:"description,omitempty"`
 		CreatedAt   string `json:"created_at"`
+		limits
 	}
-	nowS := time.Now().Unix()
-	nowRFC := time.Now().UTC().Format(time.RFC3339)
-	data := snap.Models
+	type openaiModel struct {
+		ID          string `json:"id"`
+		Object      string `json:"object"`
+		Created     int64  `json:"created"`
+		OwnedBy     string `json:"owned_by"`
+		Description string `json:"description,omitempty"`
+		limits
+	}
+	// The Anthropic surface additionally lists the [1m] context variants and
+	// the claude-* discovery variants (Claude Code's discovery only accepts
+	// ids containing claude/anthropic; the [1m] suffix is its 1M-context
+	// marker); the OpenAI surface stays with the plain list.
+	models := snap.Models
+	if anthropicShape {
+		models = anthropicListing(snap)
+		sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
+	}
+	page, hasMore := listWindow(models, r.URL.Query())
+
 	if anthropicShape {
 		out := struct {
 			Data    []anthropicModel `json:"data"`
 			FirstID string           `json:"first_id"`
+			LastID  string           `json:"last_id"`
 			HasMore bool             `json:"has_more"`
-		}{Data: make([]anthropicModel, 0, len(data))}
-		for i, m := range data {
-			out.Data = append(out.Data, anthropicModel{Type: "model", ID: m.ID, DisplayName: orDefault(m.DisplayName, m.ID), CreatedAt: nowRFC})
+		}{Data: make([]anthropicModel, 0, len(page))}
+		for i, m := range page {
+			out.Data = append(out.Data, anthropicModel{
+				Type: "model", ID: m.ID, DisplayName: orDefault(m.DisplayName, m.ID), CreatedAt: nowRFC,
+				Description: m.Provider,
+				limits:      limits{ContextLength: m.ContextWindow, MaxOutputTokens: m.MaxOutputTokens},
+			})
 			if i == 0 {
 				out.FirstID = m.ID
 			}
+			out.LastID = m.ID
 		}
+		out.HasMore = hasMore
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
 	out := struct {
-		Object string        `json:"object"`
-		Data   []openaiModel `json:"data"`
-	}{Object: "list", Data: make([]openaiModel, 0, len(data))}
-	for _, m := range data {
-		out.Data = append(out.Data, openaiModel{ID: m.ID, Object: "model", Created: nowS, OwnedBy: "llm-switch"})
+		Object  string        `json:"object"`
+		Data    []openaiModel `json:"data"`
+		FirstID string        `json:"first_id"`
+		LastID  string        `json:"last_id"`
+		HasMore bool          `json:"has_more"`
+	}{Object: "list", Data: make([]openaiModel, 0, len(page))}
+	for i, m := range page {
+		out.Data = append(out.Data, openaiModel{
+			ID: m.ID, Object: "model", Created: nowS, OwnedBy: "llm-switch",
+			Description: m.Provider,
+			limits:      limits{ContextLength: m.ContextWindow, MaxOutputTokens: m.MaxOutputTokens},
+		})
+		if i == 0 {
+			out.FirstID = m.ID
+		}
+		out.LastID = m.ID
 	}
+	out.HasMore = hasMore
 	writeJSON(w, http.StatusOK, out)
+}
+
+// modelByID serves GET /v1/models/{id} in the client's surface shape.
+func (g *Gateway) modelByID(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "modelID")
+	snap := g.Holder.Load()
+	if snap == nil {
+		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "gateway is starting")
+		return
+	}
+	models := snap.Models
+	if anthropicShapeRequest(r) {
+		// anthropicListing copies before extending: the snapshot slices are
+		// shared across requests.
+		models = anthropicListing(snap)
+	}
+	for _, m := range models {
+		if m.ID != id {
+			continue
+		}
+		if anthropicShapeRequest(r) {
+			body := map[string]any{
+				"type": "model", "id": m.ID,
+				"display_name":      orDefault(m.DisplayName, m.ID),
+				"created_at":        time.Now().UTC().Format(time.RFC3339),
+				"context_length":    m.ContextWindow,
+				"max_output_tokens": m.MaxOutputTokens,
+			}
+			if m.Provider != "" {
+				body["description"] = m.Provider
+			}
+			writeJSON(w, http.StatusOK, body)
+			return
+		}
+		body := map[string]any{
+			"id": m.ID, "object": "model", "created": time.Now().Unix(), "owned_by": "llm-switch",
+			"context_length":    m.ContextWindow,
+			"max_output_tokens": m.MaxOutputTokens,
+		}
+		if m.Provider != "" {
+			body["description"] = m.Provider
+		}
+		writeJSON(w, http.StatusOK, body)
+		return
+	}
+	proto := protocolOpenAI
+	if anthropicShapeRequest(r) {
+		proto = protocolAnthropic
+	}
+	writeModelNotFound(w, r, proto, id)
+}
+
+// anthropicListing merges the plain list with the [1m] context variants and
+// the claude-* discovery variants for the Anthropic-shaped surface. Returns a
+// fresh slice: the snapshot fields are shared across requests.
+func anthropicListing(snap *engine.Snapshot) []engine.ModelEntry {
+	out := make([]engine.ModelEntry, 0,
+		len(snap.Models)+len(snap.ContextVariants)+len(snap.DiscoveryVariants))
+	out = append(out, snap.Models...)
+	out = append(out, snap.ContextVariants...)
+	out = append(out, snap.DiscoveryVariants...)
+	return out
+}
+
+// anthropicShapeRequest reports whether the client expects the Anthropic
+// surface shape (Anthropic SDKs and Claude Code always send one of these).
+func anthropicShapeRequest(r *http.Request) bool {
+	return r.Header.Get("x-api-key") != "" || r.Header.Get("anthropic-version") != ""
+}
+
+// listWindow applies Models-API pagination over the id-sorted registry:
+// limit (default 20, clamped 1..1000) and an after_id cursor (items strictly
+// after the given id in sort order). Returns the page and whether more remain.
+func listWindow(models []engine.ModelEntry, q url.Values) ([]engine.ModelEntry, bool) {
+	limit := 20
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	start := 0
+	if after := q.Get("after_id"); after != "" {
+		for start < len(models) && models[start].ID <= after {
+			start++
+		}
+	}
+	end := start + limit
+	if end > len(models) {
+		end = len(models)
+	}
+	if start >= len(models) {
+		return nil, false
+	}
+	return models[start:end], end < len(models)
 }
 
 // — count_tokens ----------------------------------------------------------
@@ -318,7 +557,7 @@ func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, r, protocolAnthropic, http.StatusServiceUnavailable, "api_error", "gateway is starting")
 		return
 	}
-	cands, _, found := snap.Resolve(model)
+	cands, _, found := snap.Resolve(model, protocolAnthropic)
 	if !found {
 		writeModelNotFound(w, r, protocolAnthropic, model)
 		return
@@ -327,19 +566,19 @@ func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
 
 	if cand.Channel.Protocol == protocolAnthropic {
 		// Native upstream: forward to its count_tokens endpoint.
-		key, err := g.Pool.Pick(cand.Channel.Provider)
+		account, err := g.pickAccount(cand)
 		if err != nil {
-			writeProtocolError(w, r, protocolAnthropic, http.StatusServiceUnavailable, "api_error", "no enabled api keys")
+			writeProtocolError(w, r, protocolAnthropic, http.StatusServiceUnavailable, "api_error", "no enabled accounts")
 			return
 		}
 		url := joinURL(cand.Channel.BaseURL, orDefault(cand.Channel.ChatPath, "/v1/messages"))
 		url = strings.TrimSuffix(url, "/messages") + "/count_tokens"
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytesReader(rewriteModel(body, cand.UpstreamModel)))
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytesReader(rewriteModel(body, cand.UpstreamModel, false)))
 		if err != nil {
 			writeProtocolError(w, r, protocolAnthropic, http.StatusInternalServerError, "api_error", err.Error())
 			return
 		}
-		setUpstreamHeaders(req, r, cand.Channel, key.Secret, protocolAnthropic, false, len(body))
+		setUpstreamHeaders(req, r, cand.Channel, account.Secret, protocolAnthropic, false, len(body))
 		resp, err := g.Client.Do(req)
 		if err != nil {
 			writeProtocolError(w, r, protocolAnthropic, http.StatusBadGateway, "api_error", "upstream unreachable")
@@ -380,7 +619,7 @@ func (g *Gateway) embeddings(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "gateway is starting")
 		return
 	}
-	cands, _, found := snap.Resolve(model)
+	cands, _, found := snap.Resolve(model, protocolOpenAI)
 	if !found {
 		writeModelNotFound(w, r, protocolOpenAI, model)
 		return
@@ -397,18 +636,18 @@ func (g *Gateway) embeddings(w http.ResponseWriter, r *http.Request) {
 			"invalid_request_error", "no embeddings-capable channel serves model "+model)
 		return
 	}
-	key, err := g.Pool.Pick(cand.Channel.Provider)
+	account, err := g.pickAccount(*cand)
 	if err != nil {
-		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "no enabled api keys")
+		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "no enabled accounts")
 		return
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
-		joinURL(cand.Channel.BaseURL, embeddingsPath), bytesReader(rewriteModel(body, cand.UpstreamModel)))
+		joinURL(cand.Channel.BaseURL, embeddingsPath), bytesReader(rewriteModel(body, cand.UpstreamModel, false)))
 	if err != nil {
 		writeProtocolError(w, r, protocolOpenAI, http.StatusInternalServerError, "api_error", err.Error())
 		return
 	}
-	setUpstreamHeaders(req, r, cand.Channel, key.Secret, protocolOpenAI, false, len(body))
+	setUpstreamHeaders(req, r, cand.Channel, account.Secret, protocolOpenAI, false, len(body))
 	resp, err := g.Client.Do(req)
 	if err != nil {
 		writeProtocolError(w, r, protocolOpenAI, http.StatusBadGateway, "api_error", "upstream unreachable")
@@ -416,7 +655,7 @@ func (g *Gateway) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	usage, rerr := relayNonStream(w, r, resp, protocolOpenAI)
 	ck, _ := ClientKeyFrom(r.Context())
-	g.logRequest(r, start, ck, model, *cand, protocolOpenAI, false,
+	g.logRequest(r, start, ck, model, *cand, &account, protocolOpenAI, false,
 		resp.StatusCode, rerr == nil && resp.StatusCode < 400, errorTypeFor(rerr, resp.StatusCode), 1, usage, nil)
 }
 
@@ -449,8 +688,10 @@ func joinURL(base, path string) string {
 }
 
 // rewriteModel rewrites only the "model" field; every other byte of the JSON
-// object survives untouched (unknown fields preserved).
-func rewriteModel(body []byte, upstreamModel string) []byte {
+// object survives untouched (unknown fields preserved). For OpenAI-shaped
+// streaming passthrough it also injects stream_options.include_usage when the
+// client did not set it, so usage lands in the final chunk for stats.
+func rewriteModel(body []byte, upstreamModel string, stream bool) []byte {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(body, &m); err != nil {
 		return body // not an object: forward as-is
@@ -460,6 +701,11 @@ func rewriteModel(body []byte, upstreamModel string) []byte {
 		return body
 	}
 	m["model"] = nm
+	if stream {
+		if _, has := m["stream_options"]; !has {
+			m["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+		}
+	}
 	out, err := json.Marshal(m)
 	if err != nil {
 		return body
@@ -557,17 +803,17 @@ func errorTypeFor(err error, status int) string {
 }
 
 func (g *Gateway) recordFailure(r *http.Request, start time.Time, ck engine.ClientKey,
-	model, upstreamModel, protocolIn string, stream bool, status int, errType string, attempts int) {
+	model, upstreamModel, protocolIn string, stream bool, status int, errType string, attempts int, acc *engine.Account) {
 
 	cand := engine.Candidate{UpstreamModel: upstreamModel}
-	g.logRequest(r, start, ck, model, cand, protocolIn, stream, status, false, errType, attempts, usageInfo{}, nil)
+	g.logRequest(r, start, ck, model, cand, acc, protocolIn, stream, status, false, errType, attempts, usageInfo{}, nil)
 }
 
 func (g *Gateway) logRequest(r *http.Request, start time.Time, ck engine.ClientKey,
-	model string, cand engine.Candidate, protocolIn string, stream bool,
+	model string, cand engine.Candidate, acc *engine.Account, protocolIn string, stream bool,
 	status int, success bool, errType string, attempts int, usage usageInfo, ttft *int64) {
 
-	entry := storeLogEntry(r, start, ck, model, cand, protocolIn, stream,
+	entry := storeLogEntry(r, start, ck, model, cand, acc, protocolIn, stream,
 		status, success, errType, attempts, usage, ttft)
 	if g.Log != nil {
 		g.Log.Log(entry)

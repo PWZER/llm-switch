@@ -11,3 +11,9 @@ internal/web/dist/*
 # Environment / local
 *.local
 .env
+
+# TypeScript incremental build cache
+web/*.tsbuildinfo
+
+**.log
+**.swp

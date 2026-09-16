@@ -11,14 +11,14 @@ import (
 // Store aggregates the repositories. Write statements go through db.Write
 // (single connection); read statements go through db.Read (WAL readers).
 type Store struct {
-	db *DB
+	db        *DB
 	Settings  *SettingsRepo
 	Admin     *AdminRepo
 	Providers *ProviderRepo
-	Keys      *ProviderKeyRepo
+	Accounts  *AccountRepo
 	Channels  *ChannelRepo
 	Models    *ModelRepo
-	Aliases   *AliasRepo
+	Routes    *ModelRouteRepo
 	APIKeys   *APIKeyRepo
 	Logs      *LogsRepo
 }
@@ -32,10 +32,10 @@ func New(db *DB) (*Store, error) {
 	s.Settings = &SettingsRepo{db: db}
 	s.Admin = &AdminRepo{db: db}
 	s.Providers = &ProviderRepo{db: db}
-	s.Keys = &ProviderKeyRepo{db: db}
+	s.Accounts = &AccountRepo{db: db}
 	s.Channels = &ChannelRepo{db: db}
 	s.Models = &ModelRepo{db: db}
-	s.Aliases = &AliasRepo{db: db}
+	s.Routes = &ModelRouteRepo{db: db}
 	s.APIKeys = &APIKeyRepo{db: db}
 	s.Logs = &LogsRepo{db: db}
 	return s, nil
@@ -43,6 +43,37 @@ func New(db *DB) (*Store, error) {
 
 // Close releases the underlying pools.
 func (s *Store) Close() error { return s.db.Close() }
+
+// DeleteChannel removes a channel and strips it from every model route target
+// chain (routes left empty are deleted). The model_routes table carries no FK
+// to the JSON target list, so the cleanup is application-level.
+func (s *Store) DeleteChannel(ctx context.Context, id int64) error {
+	if err := s.Channels.Delete(ctx, id); err != nil {
+		return err
+	}
+	return s.Routes.RemoveChannel(ctx, id)
+}
+
+// DeleteProvider removes a provider (accounts, channels, and their model rows
+// cascade via FK) and strips every one of its channels from model route
+// target chains.
+func (s *Store) DeleteProvider(ctx context.Context, id int64) error {
+	channels, err := s.Channels.List(ctx)
+	if err != nil {
+		return err
+	}
+	if err := s.Providers.Delete(ctx, id); err != nil {
+		return err
+	}
+	for _, c := range channels {
+		if c.ProviderID == id {
+			if err := s.Routes.RemoveChannel(ctx, c.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
 
 // now returns the current unix second; overridable in tests via setClock.
 func now() int64 { return time.Now().Unix() }

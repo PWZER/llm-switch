@@ -31,6 +31,7 @@ func (s *Server) handleListLogs(w http.ResponseWriter, req *http.Request) {
 	f.Model = req.URL.Query().Get("model")
 	f.APIKeyID = queryID(req, "key_id")
 	f.ProviderID = queryID(req, "provider_id")
+	f.AccountID = queryID(req, "account_id")
 	f.ChannelID = queryID(req, "channel_id")
 	f.Status = int(queryID(req, "status"))
 	f.Page, _ = strconv.Atoi(req.URL.Query().Get("page"))
@@ -82,7 +83,7 @@ func (s *Server) handleStatsOverview(w http.ResponseWriter, req *http.Request) {
 	httpx.WriteEnvelope(w, req, data)
 }
 
-// handleStatsTimeseries serves GET /stats/timeseries?from&to&group_by=model|provider|key.
+// handleStatsTimeseries serves GET /stats/timeseries?from&to&group_by=model|provider|account|key.
 func (s *Server) handleStatsTimeseries(w http.ResponseWriter, req *http.Request) {
 	to := time.Now().UnixMilli()
 	from := to - 7*24*3600*1000
@@ -101,7 +102,8 @@ func (s *Server) handleStatsTimeseries(w http.ResponseWriter, req *http.Request)
 	httpx.WriteEnvelope(w, req, rows)
 }
 
-// handleEngineStatus exposes snapshot version + key cooldown state for the UI.
+// handleEngineStatus exposes snapshot version + account cooldown state (account
+// id -> until) for the UI.
 func (s *Server) handleEngineStatus(w http.ResponseWriter, req *http.Request) {
 	var version int64
 	if s.Snapshot != nil {

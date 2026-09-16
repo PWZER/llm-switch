@@ -3,6 +3,7 @@ package gateway
 import (
 	"bufio"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -15,12 +16,19 @@ type errBadRequest struct{ msg string }
 
 func (e errBadRequest) Error() string { return e.msg }
 
-// prepareUpstreamBody produces the body for one candidate. Same protocol:
-// passthrough rewrite of the model field only. Cross protocol: client wire ->
+// prepareUpstreamBody produces the body for one candidate. Responses
+// passthrough: rewrite the model field only (stream_options is chat
+// vocabulary — never injected into a Responses body). Same protocol:
+// passthrough rewrite of the model field only (plus stream_options injection
+// so OpenAI-shaped streams report usage). Cross protocol: client wire ->
 // IR -> upstream wire (the full conversion path).
-func prepareUpstreamBody(raw []byte, clientProto, upstreamProto, upstreamModel string) ([]byte, error) {
+func prepareUpstreamBody(raw []byte, clientProto, upstreamProto, upstreamModel string, stream bool, passthrough bool) ([]byte, error) {
+	if passthrough {
+		return rewriteModel(raw, upstreamModel, false), nil
+	}
 	if upstreamProto == clientProto {
-		return rewriteModel(raw, upstreamModel), nil
+		// Usage injection only makes sense on the OpenAI wire shape.
+		return rewriteModel(raw, upstreamModel, stream && upstreamProto == string(ir.OpenAI)), nil
 	}
 	cc, err := protocol.For(ir.Protocol(clientProto))
 	if err != nil {
@@ -35,7 +43,14 @@ func prepareUpstreamBody(raw []byte, clientProto, upstreamProto, upstreamModel s
 		return nil, errBadRequest{derr.Error()}
 	}
 	req.Model = upstreamModel
-	return uc.EncodeRequest(req)
+	out, eerr := uc.EncodeRequest(req)
+	if eerr != nil {
+		// Encode failures mean the client asked for something the upstream
+		// wire cannot express (e.g. Responses text.format on anthropic):
+		// that is a client error, not a gateway failure.
+		return nil, errBadRequest{eerr.Error()}
+	}
+	return out, nil
 }
 
 // relayConvertedStream pipes a cross-protocol upstream SSE stream to the
@@ -126,11 +141,13 @@ func relayConvertedStream(w http.ResponseWriter, r *http.Request, resp *http.Res
 				return usage, ttft, errClientCanceled
 			}
 			if wdCtx.Err() != nil {
+				slog.Warn("converted stream idle timeout", "upstream", upstreamProto, "client", clientProto)
 				return usage, ttft, errUpstreamIdleTimeout
 			}
 			if rerr == io.EOF {
 				return usage, ttft, nil
 			}
+			slog.Warn("converted stream read failed", "upstream", upstreamProto, "client", clientProto, "err", rerr)
 			return usage, ttft, rerr
 		}
 	}

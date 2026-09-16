@@ -27,7 +27,7 @@ type Server struct {
 	Reload func(ctx context.Context) error
 	// Snapshot exposes the current engine holder (version reporting).
 	Snapshot interface{ Version() int64 }
-	// Cooldowns reports keys currently cooling down (key id -> until).
+	// Cooldowns reports accounts currently cooling down (account id -> until).
 	Cooldowns func() map[int64]time.Time
 	// Dropped reports rows dropped by the stats writer (backpressure counter).
 	Dropped func() int64
@@ -144,29 +144,33 @@ func (s *Server) mountProtected(pr chi.Router) {
 	pr.Put("/providers/{id}", s.handleUpdateProvider)
 	pr.Delete("/providers/{id}", s.handleDeleteProvider)
 
-	pr.Get("/providers/{id}/keys", s.handleListProviderKeys)
-	pr.Post("/providers/{id}/keys", s.handleCreateProviderKey)
-	pr.Put("/keys/{id}", s.handleUpdateProviderKey)
-	pr.Delete("/keys/{id}", s.handleDeleteProviderKey)
+	pr.Get("/providers/{id}/accounts", s.handleListProviderAccounts)
+	pr.Post("/providers/{id}/accounts", s.handleCreateAccount)
+	pr.Get("/accounts", s.handleListAccounts)
+	pr.Put("/accounts/{id}", s.handleUpdateAccount)
+	pr.Delete("/accounts/{id}", s.handleDeleteAccount)
+	pr.Post("/accounts/{id}/test", s.handleTestAccount)
+	pr.Post("/accounts/{id}/usage", s.handleAccountUsage)
 	pr.Post("/providers/{id}/refresh-models", s.handleRefreshModels)
+	pr.Post("/providers/{id}/probe", s.handleProbeEndpoint)
+	pr.Post("/providers/{id}/models-preview", s.handlePreviewModels)
 
 	pr.Get("/channels", s.handleListChannels)
 	pr.Post("/channels", s.handleCreateChannel)
 	pr.Get("/channels/{id}", s.handleGetChannel)
 	pr.Put("/channels/{id}", s.handleUpdateChannel)
 	pr.Delete("/channels/{id}", s.handleDeleteChannel)
-	pr.Put("/channels/{id}/models", s.handleReplaceBindings)
 	pr.Post("/channels/{id}/test", s.handleTestChannel)
 
 	pr.Get("/models", s.handleListModels)
 	pr.Post("/models", s.handleCreateModel)
-	pr.Put("/models/{id}", s.handleUpdateModel)
-	pr.Delete("/models/{id}", s.handleDeleteModel)
+	pr.Put("/models/{providerID}/{id}", s.handleUpdateModel)
+	pr.Delete("/models/{providerID}/{id}", s.handleDeleteModel)
 
-	pr.Get("/aliases", s.handleListAliases)
-	pr.Put("/aliases/{name}", s.handleUpsertAlias)
-	pr.Post("/aliases/{name}/switch", s.handleUpsertAlias)
-	pr.Delete("/aliases/{name}", s.handleDeleteAlias)
+	pr.Get("/model-routes", s.handleListRoutes)
+	pr.Put("/model-routes/{name}", s.handleUpsertRoute)
+	pr.Post("/model-routes/{name}/switch", s.handleUpsertRoute)
+	pr.Delete("/model-routes/{name}", s.handleDeleteRoute)
 
 	pr.Get("/client-keys", s.handleListClientKeys)
 	pr.Post("/client-keys", s.handleCreateClientKey)

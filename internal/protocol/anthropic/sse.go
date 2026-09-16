@@ -31,7 +31,7 @@ type wireResponse struct {
 	Content    []wireBlock `json:"content"`
 	StopReason string      `json:"stop_reason"`
 	Usage      *wireUsage  `json:"usage"`
-	Error *struct {
+	Error      *struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
 	} `json:"error"`
@@ -146,13 +146,13 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 // — stream reader: upstream Anthropic SSE -> IR events ---------------------
 
 type sseFrame struct {
-	Type string `json:"type"`
+	Type    string `json:"type"`
 	Message *struct {
 		Model string     `json:"model"`
 		Usage *wireUsage `json:"usage"`
 	} `json:"message"`
 	ContentBlock *wireBlock `json:"content_block"`
-	Delta *struct {
+	Delta        *struct {
 		Type        string `json:"type"`
 		Text        string `json:"text"`
 		Thinking    string `json:"thinking"`
@@ -160,7 +160,10 @@ type sseFrame struct {
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
 	Usage *struct {
-		OutputTokens int64 `json:"output_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+		InputTokens              int64 `json:"input_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
@@ -249,6 +252,17 @@ func (s *StreamReader) Feed(payload []byte) []ir.Event {
 		}
 		if frame.Usage != nil {
 			usage.Output = frame.Usage.OutputTokens
+			// Anthropic-compatible vendors sometimes repeat the full usage in
+			// message_delta (and omit it from message_start) — merge non-zeros.
+			if frame.Usage.InputTokens > 0 {
+				usage.Input = frame.Usage.InputTokens
+			}
+			if frame.Usage.CacheReadInputTokens > 0 {
+				usage.CacheRead = frame.Usage.CacheReadInputTokens
+			}
+			if frame.Usage.CacheCreationInputTokens > 0 {
+				usage.CacheWrite = frame.Usage.CacheCreationInputTokens
+			}
 		}
 		s.emitted = append(s.emitted, ir.Event{Kind: ir.EvFinish, Stop: stop, Usage: usage})
 	case "message_stop":
@@ -296,7 +310,7 @@ func (r *Renderer) Start() ([]byte, error) {
 		"type": "message_start",
 		"message": map[string]any{
 			"id": "msg_lsw", "type": "message", "role": "assistant",
-			"model": orDefault(r.model, "unknown"),
+			"model":   orDefault(r.model, "unknown"),
 			"content": []any{},
 			"usage": map[string]any{
 				"input_tokens": 0, "output_tokens": 0,

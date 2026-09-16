@@ -10,7 +10,6 @@ interface SettingsMap {
   max_failover_attempts?: string;
   default_max_tokens?: string;
   stream_idle_timeout_s?: string;
-  auto_bind_new_models?: string;
   log_bodies?: string;
   [k: string]: string | undefined;
 }

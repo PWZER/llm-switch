@@ -33,12 +33,11 @@ export default function ClientKeys() {
 
   return (
     <div>
-      <Typography.Paragraph type="secondary">{t('keys.tip')}</Typography.Paragraph>
       <Space style={{ marginBottom: 16 }}>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>
           {t('keys.new')}
         </Button>
-        <Button onClick={load}>{t('common.reload')}</Button>
+        <Button onClick={load}>{t('common.refresh')}</Button>
       </Space>
       <Table<ClientKey>
         rowKey="id"

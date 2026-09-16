@@ -11,16 +11,16 @@ import (
 // plaintext; `Prefix` is the display form ("sk-lsw-abcd…"). The plaintext is
 // returned exactly once by the create endpoint and never stored.
 type APIKey struct {
-	ID         int64   `json:"id"`
-	Name       string  `json:"name"`
-	Key        string  `json:"-"`
-	Prefix     string  `json:"prefix"`
-	Enabled    bool    `json:"enabled"`
-	TokenLimit *int64  `json:"token_limit"`
-	ExpiresAt  *int64  `json:"expires_at"`
-	CreatedAt  int64   `json:"created_at"`
-	UpdatedAt  int64   `json:"updated_at"`
-	LastUsedAt *int64  `json:"last_used_at"`
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	Key        string `json:"-"`
+	Prefix     string `json:"prefix"`
+	Enabled    bool   `json:"enabled"`
+	TokenLimit *int64 `json:"token_limit"`
+	ExpiresAt  *int64 `json:"expires_at"`
+	CreatedAt  int64  `json:"created_at"`
+	UpdatedAt  int64  `json:"updated_at"`
+	LastUsedAt *int64 `json:"last_used_at"`
 }
 
 // APIKeyRepo manages client-facing gateway keys.

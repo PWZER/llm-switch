@@ -22,8 +22,8 @@ const sessionTTL = 7 * 24 * time.Hour
 type Admin struct {
 	st *store.Store
 
-	mu       sync.Mutex
-	failures int
+	mu        sync.Mutex
+	failures  int
 	lockUntil time.Time
 }
 

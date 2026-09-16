@@ -29,20 +29,20 @@ type wireBlock struct {
 		URL       string `json:"url,omitempty"`
 	} `json:"source,omitempty"`
 	// tool_use
-	ID   string          `json:"id,omitempty"`
-	Name string          `json:"name,omitempty"`
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
 	// tool_result
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
 	// thinking
-	Thinking string `json:"thinking,omitempty"`
+	Thinking  string `json:"thinking,omitempty"`
 	Signature string `json:"signature,omitempty"`
 }
 
 type wireMessage struct {
-	Role    string      `json:"role"`
+	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
 }
 
@@ -58,19 +58,19 @@ type wireThinking struct {
 }
 
 type wireRequest struct {
-	Model         string        `json:"model"`
+	Model         string          `json:"model"`
 	System        json.RawMessage `json:"system,omitempty"`
-	Messages      []wireMessage `json:"messages"`
-	MaxTokens     int64         `json:"max_tokens"`
-	Stream        bool          `json:"stream,omitempty"`
-	Temperature   *float64      `json:"temperature,omitempty"`
-	TopP          *float64      `json:"top_p,omitempty"`
-	StopSequences []string      `json:"stop_sequences,omitempty"`
-	Tools         []wireTool    `json:"tools,omitempty"`
+	Messages      []wireMessage   `json:"messages"`
+	MaxTokens     int64           `json:"max_tokens"`
+	Stream        bool            `json:"stream,omitempty"`
+	Temperature   *float64        `json:"temperature,omitempty"`
+	TopP          *float64        `json:"top_p,omitempty"`
+	StopSequences []string        `json:"stop_sequences,omitempty"`
+	Tools         []wireTool      `json:"tools,omitempty"`
 	ToolChoice    *struct {
-		Type                string `json:"type"` // auto|any|tool|none
-		Name                string `json:"name,omitempty"`
-		DisableParallelToolUse *bool `json:"disable_parallel_tool_use,omitempty"`
+		Type                   string `json:"type"` // auto|any|tool|none
+		Name                   string `json:"name,omitempty"`
+		DisableParallelToolUse *bool  `json:"disable_parallel_tool_use,omitempty"`
 	} `json:"tool_choice,omitempty"`
 	Thinking *wireThinking `json:"thinking,omitempty"`
 }
@@ -84,11 +84,11 @@ func DecodeRequest(body []byte) (*ir.Request, error) {
 		return nil, fmt.Errorf("invalid anthropic request: %w", err)
 	}
 	req := &ir.Request{
-		Model:   w.Model,
-		Stream:  w.Stream,
-		MaxTokens: w.MaxTokens,
-		Temperature: w.Temperature,
-		TopP:        w.TopP,
+		Model:         w.Model,
+		Stream:        w.Stream,
+		MaxTokens:     w.MaxTokens,
+		Temperature:   w.Temperature,
+		TopP:          w.TopP,
 		StopSequences: w.StopSequences,
 	}
 	req.System = decodeSystem(w.System)
@@ -197,6 +197,11 @@ func decodeBlocks(raw json.RawMessage) []ir.Block {
 // EncodeRequest renders the IR as an Anthropic messages body, applying the
 // max_tokens default (Anthropic requires it) and temperature clamp (<=1).
 func EncodeRequest(req *ir.Request) ([]byte, error) {
+	if len(req.ResponseFormat) > 0 {
+		// Set only by Responses text.format; Anthropic has no counterpart, and
+		// silently dropping it would change output semantics.
+		return nil, fmt.Errorf("text.format/response_format is not supported when bridging to an anthropic upstream")
+	}
 	w := wireRequest{Model: req.Model, Stream: req.Stream}
 	w.MaxTokens = req.MaxTokens
 	if w.MaxTokens <= 0 {

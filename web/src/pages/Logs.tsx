@@ -52,6 +52,11 @@ export default function Logs() {
     { title: t('logs.key'), dataIndex: 'api_key_name' },
     { title: t('logs.channel'), dataIndex: 'channel_name' },
     {
+      title: t('logs.account'),
+      dataIndex: 'account_name',
+      render: (v: string) => v || <span style={{ opacity: 0.4 }}>-</span>,
+    },
+    {
       title: t('logs.status'),
       dataIndex: 'status',
       width: 80,
@@ -117,7 +122,6 @@ export default function Logs() {
       </div>
       <Table<RequestLog>
         rowKey="id"
-        size="small"
         dataSource={items}
         columns={columns}
         pagination={{

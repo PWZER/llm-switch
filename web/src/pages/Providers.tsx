@@ -1,27 +1,45 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import {
-  App as AntApp, Button, Drawer, Form, Input, InputNumber, Modal, Popconfirm, Select, Space,
-  Switch, Table, Tag, Typography,
+  App as AntApp, Button, Drawer, Form, Input, InputNumber, Modal, Popconfirm,
+  Select, Space, Switch, Table, Tag, Typography, theme,
 } from 'antd';
-import { PlusOutlined, SettingOutlined } from '@ant-design/icons';
-import { api, Channel, ChannelModel, Provider, ProviderKey } from '../api/client';
+import { PlusOutlined, SettingOutlined, SyncOutlined, DownOutlined } from '@ant-design/icons';
+import {
+  api, Channel, Provider,
+} from '../api/client';
 import { useLang } from '../i18n/i18n';
-import { endpointPresets, presetKey, type EndpointPreset } from '../data/presets';
+import { endpointPresets, presetKey } from '../data/presets';
+import { AccountPickerModal } from '../components/account';
+import { ProviderLogo } from '../components/logo';
 
-// Merged provider management: one provider (account + shared key pool) hosts
-// one or more protocol endpoints, each with its own model bindings and
-// failover priority. Replaces the old Providers + Channels page pair.
+// Merged provider management: one provider (vendor account + endpoints) hosts
+// one or more protocol endpoints, each with its own failover priority. The
+// provider also owns the models-list fetch URL (models_url, absolute) and the
+// staged register_models list — model rows are provider-scoped and register
+// at provider save time. Credentials live on accounts, managed on the Account
+// Pool page — this drawer handles names, models_url and endpoints only. A
+// single ProviderDrawer serves both create (endpoints buffer locally,
+// persisted in one submit) and manage (every section mutates the API
+// immediately).
 
 export default function Providers() {
   const { t } = useLang();
   const { message } = AntApp.useApp();
   const [providers, setProviders] = useState<Provider[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
-  const [managing, setManaging] = useState<Provider | null>(null);
-  const [creating, setCreating] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [editing, setEditing] = useState<Provider | null>(null);
 
   const load = useCallback(() => {
-    api.get<Provider[]>('/api/v1/providers').then((x) => setProviders(x ?? [])).catch((e) => message.error(e.message));
+    api
+      .get<Provider[]>('/api/v1/providers')
+      .then((x) => {
+        const list = x ?? [];
+        setProviders(list);
+        // Keep the open drawer pointed at fresh data after remote mutations.
+        setEditing((prev) => (prev ? (list.find((p) => p.id === prev.id) ?? prev) : prev));
+      })
+      .catch((e) => message.error(e.message));
     api.get<Channel[]>('/api/v1/channels').then((x) => setChannels(x ?? [])).catch(() => {});
   }, [message]);
   useEffect(load, [load]);
@@ -37,13 +55,17 @@ export default function Providers() {
     load();
   };
 
-  const channelName = (id: number) => channels.find((c) => c.id === id)?.name ?? `#${id}`;
-  void channelName;
-
   return (
     <div>
       <Space style={{ marginBottom: 16 }}>
-        <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreating(true)}>
+        <Button
+          type="primary"
+          icon={<PlusOutlined />}
+          onClick={() => {
+            setEditing(null);
+            setDrawerOpen(true);
+          }}
+        >
           {t('prov.new')}
         </Button>
         <Button onClick={load}>{t('common.refresh')}</Button>
@@ -52,7 +74,16 @@ export default function Providers() {
         rowKey="id"
         dataSource={providers}
         columns={[
-          { title: t('common.name'), dataIndex: 'name' },
+          {
+            title: t('common.name'),
+            dataIndex: 'name',
+            render: (v: string) => (
+              <Space size={8}>
+                <ProviderLogo name={v} size={20} />
+                <span>{v}</span>
+              </Space>
+            ),
+          },
           {
             title: t('common.enabled'),
             dataIndex: 'enabled',
@@ -66,7 +97,7 @@ export default function Providers() {
               return (
                 <Space wrap>
                   {list.map((c) => (
-                    <Tooltiped key={c.id} title={`${c.base_url}${c.chat_path} · ${c.models?.length ?? 0} models`}>
+                    <Tooltiped key={c.id} title={`${c.base_url}${c.chat_path}`}>
                       <Tag color={c.protocol === 'openai' ? 'green' : 'orange'}>
                         {c.protocol}
                         {!c.enabled ? ' (off)' : ''}
@@ -82,7 +113,14 @@ export default function Providers() {
             width: 200,
             render: (_, p) => (
               <Space>
-                <Button size="small" icon={<SettingOutlined />} onClick={() => setManaging(p)}>
+                <Button
+                  size="small"
+                  icon={<SettingOutlined />}
+                  onClick={() => {
+                    setEditing(p);
+                    setDrawerOpen(true);
+                  }}
+                >
                   {t('prov.manage')}
                 </Button>
                 <Popconfirm title={t('prov.deleteConfirm')} onConfirm={() => remove(p)}>
@@ -94,20 +132,11 @@ export default function Providers() {
         ]}
       />
 
-      <CreateDrawer
-        open={creating}
-        onClose={() => setCreating(false)}
-        onDone={() => {
-          setCreating(false);
-          message.success(t('prov.created'));
-          load();
-        }}
-      />
-
-      <ManageDrawer
-        provider={managing}
+      <ProviderDrawer
+        open={drawerOpen}
+        provider={editing}
         channels={channels}
-        onClose={() => setManaging(null)}
+        onClose={() => setDrawerOpen(false)}
         onChanged={load}
       />
     </div>
@@ -122,168 +151,325 @@ function Tooltiped({ title, children }: { title: string; children: ReactNode }) 
   );
 }
 
-// — create drawer: provider + first endpoint in one step -------------------
+// — provider drawer: create (local buffering) + manage (remote) --------------
 
-interface CreateForm {
-  name: string;
-  presetKey?: string;
-  base_url?: string;
-  chat_path?: string;
-  auth_style?: 'bearer' | 'x-api-key';
-}
-
-function CreateDrawer({ open, onClose, onDone }: { open: boolean; onClose: () => void; onDone: () => void }) {
-  const { t } = useLang();
-  const { message } = AntApp.useApp();
-  const [form] = Form.useForm<CreateForm>();
-  const [preset, setPreset] = useState<EndpointPreset | null>(null);
-
-  const applyPreset = (key?: string) => {
-    const p = endpointPresets.find((x) => presetKey(x) === key) ?? null;
-    setPreset(p);
-    form.setFieldsValue(
-      p
-        ? { base_url: p.base_url, chat_path: p.chat_path, auth_style: p.auth_style }
-        : { base_url: undefined, chat_path: undefined, auth_style: 'bearer' },
-    );
-  };
-
-  const submit = async (v: CreateForm) => {
-    try {
-      const created = await api.post<{ id: number }>('/api/v1/providers', { name: v.name });
-      if (v.base_url) {
-        await api.post('/api/v1/channels', {
-          provider_id: created.id,
-          name: preset ? `${preset.vendor.toLowerCase()}-${preset.protocol}` : 'default',
-          protocol: preset?.protocol ?? 'openai',
-          base_url: v.base_url,
-          chat_path: v.chat_path,
-          auth_style: v.auth_style ?? 'bearer',
-          priority: 10,
-          weight: 1,
-          enabled: true,
-          passthrough: true,
-          models: [],
-        });
-      }
-      onDone();
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : 'failed');
-    }
-  };
-
-  return (
-    <Drawer
-      title={t('prov.new')}
-      open={open}
-      onClose={onClose}
-      width={480}
-      extra={
-        <Button type="primary" onClick={() => form.submit()}>
-          {t('common.create')}
-        </Button>
-      }
-    >
-      <Form form={form} layout="vertical" onFinish={submit}>
-        <Form.Item name="presetKey" label={t('prov.preset')} tooltip={t('prov.presetTip')}>
-          <Select
-            allowClear
-            placeholder={t('prov.presetCustom')}
-            onChange={applyPreset}
-            options={endpointPresets.map((p) => ({ value: presetKey(p), label: presetKey(p) }))}
-          />
-        </Form.Item>
-        <Form.Item name="name" label={t('common.name')} rules={[{ required: true }]}>
-          <Input placeholder={t('prov.namePlaceholder')} />
-        </Form.Item>
-        <Typography.Title level={5} style={{ marginTop: 8 }}>
-          {t('prov.endpoint')}
-        </Typography.Title>
-        <Form.Item name="base_url" label={t('prov.baseUrl')}>
-          <Input placeholder="https://api.deepseek.com" />
-        </Form.Item>
-        <Form.Item name="chat_path" label={t('prov.chatPath')} tooltip={t('prov.chatPathTip')}>
-          <Input placeholder="/chat/completions" />
-        </Form.Item>
-        <Form.Item name="auth_style" label={t('prov.authStyle')} initialValue="bearer">
-          <Select
-            style={{ width: 200 }}
-            options={[
-              { value: 'bearer', label: t('prov.bearer') },
-              { value: 'x-api-key', label: t('prov.xApiKey') },
-            ]}
-          />
-        </Form.Item>
-        <Typography.Text type="secondary">
-          {t('prov.keys')} / {t('prov.bindings')}: {t('prov.manage')} →
-        </Typography.Text>
-      </Form>
-    </Drawer>
-  );
-}
-
-// — manage drawer: shared keys + endpoint cards ----------------------------
-
-function ManageDrawer({
+function ProviderDrawer({
+  open,
   provider,
   channels,
   onClose,
   onChanged,
 }: {
+  open: boolean;
   provider: Provider | null;
   channels: Channel[];
   onClose: () => void;
   onChanged: () => void;
 }) {
   const { t } = useLang();
-  const [adding, setAdding] = useState(false);
-  const [editing, setEditing] = useState<Channel | null>(null);
+  const { message } = AntApp.useApp();
+  const isCreate = provider == null;
 
-  const list = provider ? channels.filter((c) => c.provider_id === provider.id) : [];
+  // Create-mode local buffers.
+  const [name, setName] = useState('');
+  const [modelsUrl, setModelsUrl] = useState('');
+  const [stagedModels, setStagedModels] = useState<string[]>([]);
+  const [localEndpoints, setLocalEndpoints] = useState<EndpointForm[]>([]);
+  const [creating, setCreating] = useState(false);
+
+  // Manage-mode buffers.
+  const [editName, setEditName] = useState('');
+  const [editModelsUrl, setEditModelsUrl] = useState('');
+
+  // Fetch-models flow (both modes): the credential is picked explicitly.
+  const [fetching, setFetching] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setName('');
+    setModelsUrl('');
+    setStagedModels([]);
+    setLocalEndpoints([]);
+    setEditName(provider?.name ?? '');
+    setEditModelsUrl(provider?.models_url ?? '');
+  }, [open, provider?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const currentModelsUrl = isCreate ? modelsUrl : editModelsUrl;
+  const setCurrentModelsUrl = isCreate ? setModelsUrl : setEditModelsUrl;
+
+  // The preview's auth header style follows the provider's own endpoints
+  // (openai first — the models list is an OpenAI-style endpoint), mirroring
+  // the backend refresh-models resolution.
+  const providerAuthStyle = (() => {
+    const styles = isCreate
+      ? localEndpoints.map((e) => ({ protocol: e.protocol, auth_style: e.auth_style }))
+      : channels
+          .filter((c) => c.provider_id === provider?.id && c.enabled)
+          .map((c) => ({ protocol: c.protocol, auth_style: c.auth_style }));
+    return (styles.find((s) => s.protocol === 'openai') ?? styles[0])?.auth_style ?? 'bearer';
+  })();
+
+  const fetchModelsPreview = async (cred: { account_id?: number; api_key?: string }) => {
+    if (!currentModelsUrl.trim()) {
+      message.warning(t('prov.modelsUrl') + ' ?');
+      return;
+    }
+    setFetching(true);
+    try {
+      const r = await api.post<{ models: string[] }>(
+        `/api/v1/providers/${provider?.id ?? 0}/models-preview`,
+        { models_url: currentModelsUrl.trim(), auth_style: providerAuthStyle, ...cred },
+      );
+      setStagedModels(r.models);
+      message.success(`${r.models.length} ${t('prov.fetchedPreview')}`);
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : 'failed');
+    } finally {
+      setFetching(false);
+    }
+  };
+
+  // EndpointModal preset picks prefill the drawer-level models_url and the
+  // staged register list — only when untouched, so editing never silently
+  // overwrites user work.
+  const applyPresetToProvider = (ids: string[], url: string) => {
+    if (stagedModels.length === 0 && ids.length > 0) setStagedModels(ids);
+    if (!currentModelsUrl.trim() && url) setCurrentModelsUrl(url);
+  };
+
+  const rename = async () => {
+    if (!provider || !editName.trim() || editName.trim() === provider.name) return;
+    try {
+      await api.put(`/api/v1/providers/${provider.id}`, { name: editName.trim() });
+      message.success(t('prov.saved'));
+      onChanged();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : 'failed');
+    }
+  };
+
+  // Manage mode: persist models_url (empty string clears) and register the
+  // staged model ids in one provider update.
+  const saveModels = async () => {
+    if (!provider) return;
+    try {
+      await api.put(`/api/v1/providers/${provider.id}`, {
+        models_url: editModelsUrl.trim(),
+        register_models: stagedModels.length > 0 ? stagedModels : undefined,
+      });
+      setStagedModels([]);
+      message.success(t('prov.saved'));
+      onChanged();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : 'failed');
+    }
+  };
+
+  const submitCreate = async () => {
+    if (!name.trim()) {
+      message.warning(t('common.name') + ' ?');
+      return;
+    }
+    setCreating(true);
+    try {
+      const created = await api.post<{ id: number }>('/api/v1/providers', {
+        name: name.trim(),
+        models_url: modelsUrl.trim() || undefined,
+        register_models: stagedModels.length > 0 ? stagedModels : undefined,
+      });
+      let partial = false;
+      for (const ep of localEndpoints) {
+        const { presetKey: _preset, ...payload } = ep;
+        try {
+          await api.post('/api/v1/channels', { ...payload, provider_id: created.id });
+        } catch {
+          partial = true;
+        }
+      }
+      if (partial) message.warning(t('prov.createPartial'));
+      else message.success(t('prov.created'));
+      onChanged();
+      onClose();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : 'failed');
+    } finally {
+      setCreating(false);
+    }
+  };
 
   return (
     <Drawer
-      title={`${t('prov.manage')} — ${provider?.name ?? ''}`}
-      open={!!provider}
+      title={
+        isCreate ? (
+          t('prov.new')
+        ) : (
+          <Space size={8}>
+            <ProviderLogo name={provider.name} size={20} />
+            <span>{`${t('prov.manage')} — ${provider.name}`}</span>
+          </Space>
+        )
+      }
+      open={open}
       onClose={onClose}
-      width={720}
+      width={960}
+      extra={
+        isCreate && (
+          <Button type="primary" loading={creating} onClick={submitCreate}>
+            {t('common.create')}
+          </Button>
+        )
+      }
     >
-      {provider && (
+      {open && (
         <>
-          <Typography.Title level={5}>{t('prov.keys')}</Typography.Title>
-          <KeysTable providerId={provider.id} />
+          <Typography.Title level={5}>{t('common.name')}</Typography.Title>
+          {isCreate ? (
+            <Input
+              placeholder={t('prov.namePlaceholder')}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              style={{ width: 280 }}
+            />
+          ) : (
+            <Space>
+              <Input
+                value={editName}
+                onChange={(e) => setEditName(e.target.value)}
+                style={{ width: 280 }}
+              />
+              <Button
+                size="small"
+                disabled={!editName.trim() || editName.trim() === provider.name}
+                onClick={rename}
+              >
+                {t('common.save')}
+              </Button>
+            </Space>
+          )}
+
+          <Typography.Title level={5} style={{ marginTop: 24 }}>
+            {t('prov.modelsUrl')}
+          </Typography.Title>
+          <Space wrap>
+            <Input
+              placeholder="https://api.deepseek.com/models"
+              value={currentModelsUrl}
+              onChange={(e) => setCurrentModelsUrl(e.target.value)}
+              style={{ width: 400 }}
+            />
+            {!isCreate && (
+              <Button
+                size="small"
+                disabled={
+                  editModelsUrl.trim() === (provider.models_url ?? '') && stagedModels.length === 0
+                }
+                onClick={saveModels}
+              >
+                {t('common.save')}
+              </Button>
+            )}
+            <Button icon={<DownOutlined />} loading={fetching} onClick={() => setPickerOpen(true)}>
+              {fetching ? t('prov.fetching') : t('prov.fetchModelsBtn')}
+            </Button>
+          </Space>
+          <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4 }}>
+            {t('prov.modelsUrlTip')}
+          </Typography.Paragraph>
+          {stagedModels.length > 0 && (
+            <>
+              <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+                {t('prov.registerModelsTip')}
+              </Typography.Paragraph>
+              <div style={{ maxHeight: 160, overflow: 'auto', marginBottom: 8 }}>
+                <Space wrap size={4}>
+                  {stagedModels.map((id) => (
+                    <Tag key={id}>{id}</Tag>
+                  ))}
+                </Space>
+              </div>
+            </>
+          )}
 
           <Typography.Title level={5} style={{ marginTop: 24 }}>
             {t('prov.endpoints')}
           </Typography.Title>
-          <Button
-            size="small"
-            icon={<PlusOutlined />}
-            style={{ marginBottom: 12 }}
-            onClick={() => setAdding(true)}
-          >
-            {t('prov.addEndpoint')}
-          </Button>
-          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-            {list.map((c) => (
-              <EndpointCard
-                key={c.id}
-                channel={c}
-                onEdit={() => setEditing(c)}
-                onChanged={onChanged}
-              />
-            ))}
-            {list.length === 0 && (
-              <Typography.Text type="secondary">{t('prov.addEndpoint')} →</Typography.Text>
-            )}
-          </Space>
+          {isCreate ? (
+            <LocalEndpoints
+              value={localEndpoints}
+              onChange={setLocalEndpoints}
+              onPresetModels={applyPresetToProvider}
+            />
+          ) : (
+            <RemoteEndpoints
+              providerId={provider.id}
+              channels={channels}
+              onChanged={onChanged}
+              onPresetModels={applyPresetToProvider}
+            />
+          )}
+          <AccountPickerModal
+            open={pickerOpen}
+            providerId={provider?.id ?? 0}
+            onClose={() => setPickerOpen(false)}
+            onPick={(cred) => {
+              setPickerOpen(false);
+              fetchModelsPreview(cred);
+            }}
+          />
         </>
       )}
+    </Drawer>
+  );
+}
 
+// — endpoints section: remote (cards + test) or local (buffered list) --------
+
+function RemoteEndpoints({
+  providerId,
+  channels,
+  onChanged,
+  onPresetModels,
+}: {
+  providerId: number;
+  channels: Channel[];
+  onChanged: () => void;
+  onPresetModels?: (models: string[], modelsUrl: string) => void;
+}) {
+  const { t } = useLang();
+  const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState<Channel | null>(null);
+
+  const list = channels.filter((c) => c.provider_id === providerId);
+
+  return (
+    <>
+      <Button
+        size="small"
+        icon={<PlusOutlined />}
+        style={{ marginBottom: 12 }}
+        onClick={() => setAdding(true)}
+      >
+        {t('prov.addEndpoint')}
+      </Button>
+      <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+        {list.map((c) => (
+          <EndpointCard
+            key={c.id}
+            channel={c}
+            onEdit={() => setEditing(c)}
+            onChanged={onChanged}
+          />
+        ))}
+        {list.length === 0 && (
+          <Typography.Text type="secondary">{t('prov.addEndpoint')} →</Typography.Text>
+        )}
+      </Space>
       <EndpointModal
         open={adding || !!editing}
         editing={editing}
-        providerId={provider?.id ?? 0}
+        providerId={providerId}
+        onPresetModels={onPresetModels}
         onClose={() => {
           setAdding(false);
           setEditing(null);
@@ -294,7 +480,105 @@ function ManageDrawer({
           onChanged();
         }}
       />
-    </Drawer>
+    </>
+  );
+}
+
+function LocalEndpoints({
+  value,
+  onChange,
+  onPresetModels,
+}: {
+  value: EndpointForm[];
+  onChange: (eps: EndpointForm[]) => void;
+  onPresetModels?: (models: string[], modelsUrl: string) => void;
+}) {
+  const { t } = useLang();
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editIdx, setEditIdx] = useState<number | null>(null);
+
+  const openAdd = () => {
+    setEditIdx(null);
+    setModalOpen(true);
+  };
+
+  return (
+    <>
+      <Button
+        size="small"
+        icon={<PlusOutlined />}
+        style={{ marginBottom: 12 }}
+        onClick={openAdd}
+      >
+        {t('prov.addEndpoint')}
+      </Button>
+      <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+        {value.map((ep, i) => (
+          <LocalEndpointCard
+            key={i}
+            endpoint={ep}
+            onEdit={() => {
+              setEditIdx(i);
+              setModalOpen(true);
+            }}
+            onDelete={() => onChange(value.filter((_, j) => j !== i))}
+          />
+        ))}
+        {value.length === 0 && (
+          <Typography.Text type="secondary">{t('prov.addEndpoint')} →</Typography.Text>
+        )}
+      </Space>
+      <EndpointModal
+        open={modalOpen}
+        editing={null}
+        initial={editIdx != null ? value[editIdx] : null}
+        providerId={0}
+        onPresetModels={onPresetModels}
+        onLocalSubmit={(v) => {
+          onChange(editIdx != null ? value.map((x, j) => (j === editIdx ? v : x)) : [...value, v]);
+        }}
+        onClose={() => setModalOpen(false)}
+        onDone={() => setModalOpen(false)}
+      />
+    </>
+  );
+}
+
+function LocalEndpointCard({
+  endpoint,
+  onEdit,
+  onDelete,
+}: {
+  endpoint: EndpointForm;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const { t } = useLang();
+  const { token } = theme.useToken();
+  return (
+    <div style={{ border: `1px solid ${token.colorBorderSecondary}`, borderRadius: 8, padding: 12 }}>
+      <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+        <Space>
+          <Tag color={endpoint.protocol === 'openai' ? 'green' : 'orange'}>{endpoint.protocol}</Tag>
+          <Typography.Text strong>{endpoint.name}</Typography.Text>
+          <Typography.Text type="secondary" code>
+            {endpoint.base_url}
+            {endpoint.chat_path}
+          </Typography.Text>
+        </Space>
+        <Space>
+          <Button size="small" onClick={onEdit}>{t('common.edit')}</Button>
+          <Popconfirm title={t('common.delete') + '?'} onConfirm={onDelete}>
+            <Button danger size="small">{t('common.delete')}</Button>
+          </Popconfirm>
+        </Space>
+      </Space>
+      <div style={{ marginTop: 8 }}>
+        <Typography.Text type="secondary">
+          {t('prov.priority')}: {endpoint.priority} · {t('prov.weight')}: {endpoint.weight}
+        </Typography.Text>
+      </div>
+    </div>
   );
 }
 
@@ -309,9 +593,10 @@ function EndpointCard({
 }) {
   const { t } = useLang();
   const { message } = AntApp.useApp();
+  const { token } = theme.useToken();
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<
-    | { ok: boolean; mode: string; status: number; error?: string; dns_ms: number; connect_ms: number; tls_ms: number; first_byte_ms: number; total_ms: number; model: string; entries?: number }
+    | { ok: boolean; class: string; status: number; error?: string; dns_ms: number; connect_ms: number; tls_ms: number; first_byte_ms: number; total_ms: number; model: string }
     | null
   >(null);
 
@@ -332,9 +617,9 @@ function EndpointCard({
     setTestResult(null);
     try {
       const r = await api.post<{
-        ok: boolean; mode: string; status: number; error?: string; dns_ms: number;
-        connect_ms: number; tls_ms: number; first_byte_ms: number; total_ms: number;
-        model: string; entries?: number;
+        ok: boolean; class: string; status: number; error?: string;
+        dns_ms: number; connect_ms: number; tls_ms: number; first_byte_ms: number;
+        total_ms: number; model: string;
       }>(`/api/v1/channels/${channel.id}/test`);
       setTestResult(r);
     } catch (e) {
@@ -343,6 +628,24 @@ function EndpointCard({
       setTesting(false);
     }
   };
+
+  // Verdict color by class: green = reachable (2xx, API-alive validation, or
+  // auth unchecked — key validation is the account test's job); orange =
+  // reachable with a fixable problem; red = unreachable.
+  const verdict = testResult && (() => {
+    switch (testResult.class) {
+      case 'ok':
+        return <Typography.Text type="success">✓ {t('prov.testOk')} · HTTP {testResult.status}</Typography.Text>;
+      case 'validation':
+        return <Typography.Text type="success">✓ {t('prov.test.class.validation')}</Typography.Text>;
+      case 'auth':
+        return <Typography.Text type="success">✓ {t('prov.test.class.authUnchecked')}</Typography.Text>;
+      case 'unreachable':
+        return <Typography.Text type="danger">✗ {t('prov.test.class.unreachable')}</Typography.Text>;
+      default:
+        return <Typography.Text type="warning">⚠ {t(`prov.test.class.${testResult.class}`)}</Typography.Text>;
+    }
+  })();
 
   const timing = testResult && (
     <span>
@@ -358,18 +661,12 @@ function EndpointCard({
           {testResult.tls_ms > 0 ? ` · ${t('prov.test.tls')} ${testResult.tls_ms}ms` : ''}
         </>
       )}
-      {testResult.mode === 'chat' && testResult.model ? ` · ${testResult.model}` : ''}
-      {testResult.mode === 'models_list' && (
-        <>
-          {' '}· {t('prov.test.modelsList')}
-          {testResult.entries != null ? ` · ${testResult.entries} ${t('prov.test.models')}` : ''}
-        </>
-      )}
+      {testResult.model ? ` · ${testResult.model}` : ''}
     </span>
   );
 
   return (
-    <div style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: 12 }}>
+    <div style={{ border: `1px solid ${token.colorBorderSecondary}`, borderRadius: 8, padding: 12 }}>
       <Space style={{ width: '100%', justifyContent: 'space-between' }}>
         <Space>
           <Tag color={channel.protocol === 'openai' ? 'green' : 'orange'}>{channel.protocol}</Tag>
@@ -393,29 +690,19 @@ function EndpointCard({
       </Space>
       <div style={{ marginTop: 8 }}>
         <Typography.Text type="secondary">
-          {t('prov.priority')}: {channel.priority} · {t('prov.weight')}: {channel.weight} ·{' '}
+          {t('prov.priority')}: {channel.priority} · {t('prov.weight')}: {channel.weight}
         </Typography.Text>
-        {(channel.models ?? []).map((m) => (
-          <Tag key={m.model}>
-            {m.model} → {m.upstream_model}
-          </Tag>
-        ))}
       </div>
       {testResult && (
         <div style={{ marginTop: 8 }}>
-          {testResult.ok ? (
-            <Typography.Text type="success">
-              ✓ {t('prov.testOk')} · HTTP {testResult.status} · {timing}
-            </Typography.Text>
-          ) : (
-            <Typography.Text type="danger">
-              ✗ {testResult.status ? `HTTP ${testResult.status}` : ''}{' '}
-              {testResult.error ?? ''}{' '}
-              {testResult.total_ms > 0 && (
-                <Typography.Text type="secondary">
-                  ({t('prov.test.total')} {testResult.total_ms}ms)
-                </Typography.Text>
-              )}
+          <div>
+            {verdict}
+            {' · '}
+            <Typography.Text type="secondary">{timing}</Typography.Text>
+          </div>
+          {testResult.error && (
+            <Typography.Text type="secondary" style={{ fontSize: 12, wordBreak: 'break-all' }}>
+              {testResult.error}
             </Typography.Text>
           )}
         </div>
@@ -431,35 +718,112 @@ interface EndpointForm {
   base_url: string;
   chat_path: string;
   auth_style: 'bearer' | 'x-api-key';
+  responses_path?: string;
   priority: number;
   weight: number;
   enabled: boolean;
   passthrough: boolean;
   supports_embeddings: boolean;
-  models: ChannelModel[];
 }
 
 function EndpointModal({
   open,
   editing,
+  initial,
   providerId,
+  onLocalSubmit,
+  onPresetModels,
   onClose,
   onDone,
 }: {
   open: boolean;
   editing: Channel | null;
+  /** Local-mode edit initial values (provider not persisted yet). */
+  initial?: EndpointForm | null;
   providerId: number;
+  /** Local mode: hand the form values to the parent (provider not persisted). */
+  onLocalSubmit?: (v: EndpointForm) => void;
+  /** A preset pick also prefills the provider-level models_url + register list. */
+  onPresetModels?: (models: string[], modelsUrl: string) => void;
   onClose: () => void;
   onDone: () => void;
 }) {
   const { t } = useLang();
   const { message } = AntApp.useApp();
   const [form] = Form.useForm<EndpointForm>();
+  // responses_path only applies to openai channels (backend rejects it for
+  // anthropic), so the field is hidden and stripped for other protocols.
+  const protocol = Form.useWatch('protocol', form);
+  const [probing, setProbing] = useState(false);
+  const [probeResult, setProbeResult] = useState<
+    | { ok: boolean; class: string; status: number; error?: string; first_byte_ms: number; total_ms: number; model: string }
+    | null
+  >(null);
+
+  // Connectivity probe of the form's CURRENT values (pre-save): no credential.
+  const runProbe = async () => {
+    const v = form.getFieldsValue();
+    if (!v.base_url) {
+      message.warning(t('prov.baseUrl') + ' ?');
+      return;
+    }
+    setProbing(true);
+    setProbeResult(null);
+    try {
+      const r = await api.post<{
+        ok: boolean; class: string; status: number; error?: string;
+        first_byte_ms: number; total_ms: number; model: string;
+      }>(`/api/v1/providers/${providerId}/probe`, {
+        protocol: v.protocol,
+        base_url: v.base_url,
+        chat_path: v.chat_path,
+        auth_style: v.auth_style,
+      });
+      setProbeResult(r);
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : 'failed');
+    } finally {
+      setProbing(false);
+    }
+  };
+
+  const probeVerdict = probeResult && (() => {
+    switch (probeResult.class) {
+      case 'ok':
+        return <Typography.Text type="success">✓ {t('prov.testOk')} · HTTP {probeResult.status} · {probeResult.first_byte_ms}ms/{probeResult.total_ms}ms</Typography.Text>;
+      case 'validation':
+        return <Typography.Text type="success">✓ {t('prov.test.class.validation')}</Typography.Text>;
+      case 'auth':
+        // 401/403 without a credential = reachable; key validation is the
+        // account test's job (same verdict as the saved-channel test).
+        return <Typography.Text type="success">✓ {t('prov.test.class.authUnchecked')}</Typography.Text>;
+      case 'unreachable':
+        return <Typography.Text type="danger">✗ {t('prov.test.class.unreachable')}</Typography.Text>;
+      default:
+        return <Typography.Text type="warning">⚠ {t(`prov.test.class.${probeResult.class}`)}</Typography.Text>;
+    }
+  })();
 
   useEffect(() => {
     if (!open) return;
+    setProbeResult(null);
     if (editing) {
-      form.setFieldsValue({ ...editing, models: editing.models ?? [] });
+      form.setFieldsValue({
+        name: editing.name,
+        protocol: editing.protocol,
+        base_url: editing.base_url,
+        chat_path: editing.chat_path,
+        auth_style: editing.auth_style,
+        responses_path: editing.responses_path ?? undefined,
+        priority: editing.priority,
+        weight: editing.weight,
+        enabled: editing.enabled,
+        passthrough: editing.passthrough,
+        supports_embeddings: editing.supports_embeddings,
+      });
+    } else if (initial) {
+      form.resetFields();
+      form.setFieldsValue(initial);
     } else {
       form.resetFields();
       form.setFieldsValue({
@@ -471,10 +835,9 @@ function EndpointModal({
         passthrough: true,
         supports_embeddings: false,
         chat_path: '/chat/completions',
-        models: [],
       });
     }
-  }, [open, editing, form]);
+  }, [open, editing, initial, form]);
 
   const applyPreset = (key?: string) => {
     const p = endpointPresets.find((x) => presetKey(x) === key) ?? null;
@@ -484,19 +847,23 @@ function EndpointModal({
         base_url: p.base_url,
         chat_path: p.chat_path,
         auth_style: p.auth_style,
+        responses_path: p.responses_path ?? '',
       });
-      // Auto-bind the vendor's known models (identity mapping) only when no
-      // bindings exist yet, so editing never silently overwrites user edits.
-      const current = form.getFieldValue('models') as ChannelModel[] | undefined;
-      if ((!current || current.length === 0) && p.models.length > 0) {
-        form.setFieldsValue({
-          models: p.models.map((m) => ({ model: m, upstream_model: m })),
-        });
-      }
+      // The vendor's known models and fetch URL belong to the provider, not
+      // the endpoint — hand them up to the drawer.
+      onPresetModels?.(p.models, p.models_url);
     }
   };
 
   const submit = async (v: EndpointForm) => {
+    // Drop a stale responses_path left over from an openai preset/protocol
+    // switch — the backend rejects it on anthropic channels.
+    if (v.protocol !== 'openai') v.responses_path = undefined;
+    if (onLocalSubmit) {
+      onLocalSubmit(v);
+      onDone();
+      return;
+    }
     try {
       if (editing) {
         await api.put(`/api/v1/channels/${editing.id}`, { ...v, provider_id: providerId });
@@ -510,9 +877,11 @@ function EndpointModal({
     }
   };
 
+  const editName = editing?.name ?? initial?.name;
+
   return (
     <Modal
-      title={editing ? `${t('prov.editEndpoint')} — ${editing.name}` : t('prov.addEndpoint')}
+      title={editName ? `${t('prov.editEndpoint')} — ${editName}` : t('prov.addEndpoint')}
       open={open}
       onCancel={onClose}
       onOk={() => form.submit()}
@@ -557,6 +926,28 @@ function EndpointModal({
         <Form.Item name="chat_path" label={t('prov.chatPath')} tooltip={t('prov.chatPathTip')}>
           <Input placeholder="/chat/completions" />
         </Form.Item>
+        {protocol === 'openai' && (
+          <Form.Item name="responses_path" label={t('prov.responsesPath')} tooltip={t('prov.responsesPathTip')}>
+            <Input placeholder="/responses" />
+          </Form.Item>
+        )}
+        {!onLocalSubmit && (
+          <Space style={{ marginBottom: 12 }} wrap>
+            <Button icon={<SyncOutlined spin={probing} />} onClick={runProbe} disabled={probing}>
+              {probing ? t('prov.testing') : t('prov.testConnection')}
+            </Button>
+          </Space>
+        )}
+        {probeVerdict && (
+          <div style={{ marginBottom: 12 }}>
+            {probeVerdict}
+            {probeResult?.error && (
+              <Typography.Text type="secondary" style={{ fontSize: 12, wordBreak: 'break-all', display: 'block' }}>
+                {probeResult.error}
+              </Typography.Text>
+            )}
+          </div>
+        )}
         <Space size="large">
           <Form.Item name="priority" label={t('prov.priority')} tooltip={t('prov.priorityTip')}>
             <InputNumber />
@@ -574,113 +965,8 @@ function EndpointModal({
             <Switch />
           </Form.Item>
         </Space>
-
-        <Typography.Title level={5} style={{ marginTop: 8 }}>
-          {t('prov.bindings')}
-        </Typography.Title>
-        <Form.List name="models">
-          {(fields, { add, remove }) => (
-            <div>
-              {fields.map((field) => (
-                <Space key={field.key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-                  <Form.Item name={[field.name, 'model']} noStyle>
-                    <Input placeholder={t('prov.clientModel')} style={{ width: 220 }} />
-                  </Form.Item>
-                  <span>→</span>
-                  <Form.Item name={[field.name, 'upstream_model']} noStyle>
-                    <Input placeholder={t('prov.upstreamModel')} style={{ width: 220 }} />
-                  </Form.Item>
-                  <Button size="small" onClick={() => remove(field.name)}>
-                    {t('common.remove')}
-                  </Button>
-                </Space>
-              ))}
-              <Button size="small" onClick={() => add()}>
-                {t('common.add')}
-              </Button>
-            </div>
-          )}
-        </Form.List>
       </Form>
     </Modal>
   );
 }
 
-// — keys sub-table (shared key pool of the provider) ------------------------
-
-function KeysTable({ providerId }: { providerId: number }) {
-  const { t } = useLang();
-  const { message } = AntApp.useApp();
-  const [keys, setKeys] = useState<ProviderKey[]>([]);
-  const [label, setLabel] = useState('');
-  const [apiKey, setApiKey] = useState('');
-  const [weight, setWeight] = useState(1);
-
-  const load = useCallback(() => {
-    api.get<ProviderKey[]>(`/api/v1/providers/${providerId}/keys`).then((x) => setKeys(x ?? [])).catch(() => {});
-  }, [providerId]);
-  useEffect(load, [load]);
-
-  const add = async () => {
-    if (!apiKey) return;
-    try {
-      await api.post(`/api/v1/providers/${providerId}/keys`, { label, api_key: apiKey, weight });
-      setApiKey('');
-      setLabel('');
-      message.success(t('prov.keyAdded'));
-      load();
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : 'failed');
-    }
-  };
-
-  return (
-    <div>
-      <Space style={{ marginBottom: 8 }} wrap>
-        <Input placeholder={t('prov.keyLabel')} value={label} onChange={(e) => setLabel(e.target.value)} style={{ width: 120 }} />
-        <Input.Password placeholder={t('prov.key')} value={apiKey} onChange={(e) => setApiKey(e.target.value)} style={{ width: 280 }} />
-        <InputNumber min={1} value={weight} onChange={(v) => setWeight(v ?? 1)} />
-        <Button onClick={add}>{t('prov.addKey')}</Button>
-      </Space>
-      <Table<ProviderKey>
-        size="small"
-        rowKey="id"
-        dataSource={keys}
-        columns={[
-          { title: t('prov.keyLabel'), dataIndex: 'label' },
-          { title: t('keys.keyColumn'), dataIndex: 'api_key_mask' },
-          { title: t('prov.weight'), dataIndex: 'weight', width: 80 },
-          {
-            title: t('common.enabled'),
-            dataIndex: 'enabled',
-            render: (v: boolean, k) => (
-              <Switch
-                size="small"
-                checked={v}
-                onChange={async (x) => {
-                  await api.put(`/api/v1/keys/${k.id}`, { enabled: x });
-                  load();
-                }}
-              />
-            ),
-          },
-          {
-            title: '',
-            render: (_, k) => (
-              <Popconfirm
-                title={t('common.delete') + '?'}
-                onConfirm={async () => {
-                  await api.del(`/api/v1/keys/${k.id}`);
-                  load();
-                }}
-              >
-                <Button danger size="small">{t('common.delete')}</Button>
-              </Popconfirm>
-            ),
-          },
-        ]}
-        pagination={false}
-      />
-    </div>
-  );
-}

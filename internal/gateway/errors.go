@@ -31,7 +31,7 @@ func protocolErrorBody(protocol, errType, msg string) map[string]any {
 // writeModelNotFound returns the 404 shape each SDK expects, with an
 // actionable hint: model_not_found always means routing has no match.
 func writeModelNotFound(w http.ResponseWriter, r *http.Request, protocol, model string) {
-	hint := " (no alias or endpoint binding serves this name — add a binding on the provider page or create an alias)"
+	hint := " (no model route or registered model serves this name — register the model on a provider or create a model route)"
 	if protocol == protocolAnthropic {
 		writeProtocolError(w, r, protocol, http.StatusNotFound, "not_found_error", "model: "+model+hint)
 		return
@@ -68,9 +68,10 @@ func captureUpstreamError(resp *http.Response) []byte {
 func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
 
 // storeLogEntry assembles the request_logs row. cand.Channel may be nil when
-// routing never reached an upstream (model not found, no keys, all failed).
+// routing never reached an upstream (model not found, no accounts, all failed);
+// acc is nil on those same early-failure paths.
 func storeLogEntry(r *http.Request, start time.Time, ck engine.ClientKey,
-	model string, cand engine.Candidate, protocolIn string, stream bool,
+	model string, cand engine.Candidate, acc *engine.Account, protocolIn string, stream bool,
 	status int, success bool, errType string, attempts int, usage usageInfo, ttft *int64) store.RequestLog {
 
 	entry := store.RequestLog{
@@ -96,6 +97,11 @@ func storeLogEntry(r *http.Request, start time.Time, ck engine.ClientKey,
 	if ck.ID != 0 {
 		id := ck.ID
 		entry.APIKeyID = &id
+	}
+	if acc != nil {
+		aid := acc.ID
+		entry.AccountID = &aid
+		entry.AccountName = acc.DisplayName()
 	}
 	if c := cand.Channel; c != nil {
 		cid := c.ID

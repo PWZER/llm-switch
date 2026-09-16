@@ -52,27 +52,32 @@ export const api = {
 
 // — shared types -----------------------------------------------------------
 
+export interface UsageProbe {
+  type: 'balance' | 'plan';
+  path: string;
+  name?: string;
+  auth_style?: 'bearer' | 'raw';
+}
+
 export interface Provider {
   id: number;
   name: string;
+  /** Absolute models-list fetch URL; null = not configured. */
+  models_url: string | null;
   enabled: boolean;
   created_at: number;
   updated_at: number;
 }
 
-export interface ProviderKey {
+/** One upstream credential set of a provider; the API key is an attribute. */
+export interface Account {
   id: number;
   provider_id: number;
   label: string;
   api_key_mask: string;
   weight: number;
   enabled: boolean;
-}
-
-export interface ChannelModel {
-  channel_id?: number;
-  model: string;
-  upstream_model: string;
+  usage_probes: UsageProbe[];
 }
 
 export interface Channel {
@@ -84,31 +89,106 @@ export interface Channel {
   base_url: string;
   chat_path: string;
   auth_style: 'bearer' | 'x-api-key';
-  models_url: string | null;
+  responses_path: string | null;
   extra_headers: string;
   enabled: boolean;
   priority: number;
   weight: number;
-  auto_bind: boolean;
   supports_embeddings: boolean;
   passthrough: boolean;
   force_upstream_stream: boolean;
-  models: ChannelModel[];
 }
 
+// — usage / balance probes ---------------------------------------------------
+
+export interface UsageWindow {
+  name: string;
+  window?: string;
+  used_percent?: number;
+  remaining_percent?: number;
+  unlimited?: boolean;
+  resets_at?: number; // unix seconds
+  unit?: string; // quota unit, e.g. CREDIT
+  used_amount?: number;
+  limit_amount?: number;
+  note?: string; // raw numbers when percent semantics were unclassifiable
+}
+
+export interface UsageBalance {
+  currency?: string;
+  total?: number;
+  available?: number;
+  granted?: number;
+  voucher?: number;
+  cash?: number;
+}
+
+export interface ProbeResult {
+  probe: string;
+  type: 'balance' | 'plan';
+  path?: string;
+  ok: boolean;
+  status?: number;
+  error?: string;
+  plan?: string;
+  balance?: UsageBalance;
+  windows?: UsageWindow[];
+  raw?: string;
+}
+
+export interface AccountUsageReport {
+  account_id: number;
+  provider_id: number;
+  label: string;
+  key_mask: string;
+  queried_at: number; // unix seconds
+  configured: boolean;
+  results: ProbeResult[];
+}
+
+/** Two-tier account availability test result (quick = /models, deep = mini chat). */
+export interface AccountTestResult {
+  ok: boolean;
+  class?: string; // ok|validation|auth|model|path|unreachable
+  status?: number;
+  error?: string;
+  model?: string;
+  key_mask?: string;
+  depth: 'quick' | 'deep';
+  model_count?: number;
+  models?: string[];
+  dns_ms?: number;
+  connect_ms?: number;
+  tls_ms?: number;
+  first_byte_ms?: number;
+  total_ms?: number;
+}
+
+/** One models-table row: a provider serving a client-facing model name. */
 export interface Model {
   id: string;
+  provider_id: number;
+  /** Upstream alias; empty = identity (upstream gets `id`). */
+  upstream_model: string;
   display_name: string;
-  source: string;
   enabled: boolean;
   context_window: number | null;
   max_output_tokens: number | null;
+  /** Enriched by the admin list endpoint. */
+  provider_name?: string;
+  provider_enabled?: boolean;
 }
 
-export interface Alias {
-  name: string;
+export interface ModelRouteTarget {
   channel_id: number;
   upstream_model: string;
+  /** Pin the target to one account of the channel's provider; 0/absent = pool rotation. */
+  account_id?: number;
+}
+
+export interface ModelRoute {
+  name: string;
+  targets: ModelRouteTarget[];
   updated_at: number;
 }
 
@@ -129,6 +209,8 @@ export interface RequestLog {
   request_id: string;
   api_key_name: string;
   provider_name: string;
+  account_id: number | null;
+  account_name: string;
   channel_name: string;
   model: string;
   upstream_model: string;

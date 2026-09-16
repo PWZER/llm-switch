@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,6 +32,12 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 	if !ok {
 		return
 	}
+	if protocol == protocolOpenAIResponses {
+		// Responses-shaped body: usage nests under response.completed /
+		// response.incomplete, or top-level for the non-stream object.
+		tapResponsesUsage(payload, u)
+		return
+	}
 	var frame struct {
 		Type  string `json:"type"`
 		Usage *struct {
@@ -40,7 +47,7 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 			// OpenAI names completion tokens differently from Anthropic.
 			CompletionTokens *int64 `json:"completion_tokens"`
 			// OpenAI modern + detail forms
-			PromptTokensDetails     *struct {
+			PromptTokensDetails *struct {
 				CachedTokens *int64 `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
 			CompletionTokensDetails *struct {
@@ -78,9 +85,14 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 			u.CacheWrite = *mu.CacheCreationToken
 		}
 	case frame.Type == "message_delta" && frame.Usage != nil:
-		// Anthropic message_delta: final output tokens.
+		// Anthropic message_delta: official spec carries output_tokens only,
+		// but several Anthropic-compatible vendors (Zhipu/DeepSeek) put the
+		// FULL usage here and omit it from message_start — merge both sides.
 		if frame.Usage.OutputTokens != nil {
 			u.Completion = *frame.Usage.OutputTokens
+		}
+		if frame.Usage.InputTokens != nil && *frame.Usage.InputTokens > 0 {
+			u.Prompt = *frame.Usage.InputTokens
 		}
 	case frame.Usage != nil:
 		// OpenAI chunk with usage (include_usage) or non-stream body shape.
@@ -102,6 +114,48 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 		if fu.PromptCacheHitTokens != nil {
 			u.CacheRead = *fu.PromptCacheHitTokens
 		}
+	}
+}
+
+// tapResponsesUsage harvests usage from a Responses-shaped payload: streaming
+// events nest it under response.completed / response.incomplete; the
+// non-stream body is the bare response object (type "response" after the
+// tap's `data:` wrapper). Gated on the responses protocol so the generic
+// chat/anthropic parsing below never sees these field names.
+func tapResponsesUsage(payload []byte, u *usageInfo) {
+	var frame struct {
+		Type     string `json:"type"`
+		Response *struct {
+			Usage *struct {
+				InputTokens        *int64 `json:"input_tokens"`
+				OutputTokens       *int64 `json:"output_tokens"`
+				InputTokensDetails *struct {
+					CachedTokens *int64 `json:"cached_tokens"`
+				} `json:"input_tokens_details"`
+				OutputTokensDetails *struct {
+					ReasoningTokens *int64 `json:"reasoning_tokens"`
+				} `json:"output_tokens_details"`
+			} `json:"usage"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		return
+	}
+	if frame.Response == nil || frame.Response.Usage == nil {
+		return
+	}
+	ru := frame.Response.Usage
+	if ru.InputTokens != nil {
+		u.Prompt = *ru.InputTokens
+	}
+	if ru.OutputTokens != nil {
+		u.Completion = *ru.OutputTokens
+	}
+	if ru.InputTokensDetails != nil && ru.InputTokensDetails.CachedTokens != nil {
+		u.CacheRead = *ru.InputTokensDetails.CachedTokens
+	}
+	if ru.OutputTokensDetails != nil && ru.OutputTokensDetails.ReasoningTokens != nil {
+		u.Reasoning = *ru.OutputTokensDetails.ReasoningTokens
 	}
 }
 
@@ -184,11 +238,13 @@ func relayStream(w http.ResponseWriter, r *http.Request, resp *http.Response, pr
 				return u, ttft, errClientCanceled
 			}
 			if wdCtx.Err() != nil {
+				slog.Warn("upstream stream idle timeout")
 				return u, ttft, errUpstreamIdleTimeout
 			}
 			if err == io.EOF {
 				return u, ttft, nil
 			}
+			slog.Warn("upstream stream read failed", "err", err)
 			return u, ttft, err
 		}
 	}

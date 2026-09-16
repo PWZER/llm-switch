@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -25,6 +26,7 @@ func ClientKeyAuth(validate func(key string) (ClientKeyRecord, bool)) func(http.
 			}
 			rec, ok := validate(key)
 			if !ok {
+				slog.Warn("client authentication failed", "remote", r.RemoteAddr, "path", r.URL.Path)
 				protocol := protocolOpenAI
 				if strings.Contains(r.URL.Path, "/messages") {
 					protocol = protocolAnthropic

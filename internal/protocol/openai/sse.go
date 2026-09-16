@@ -13,8 +13,8 @@ type StreamReader struct {
 	started  bool
 	finish   *ir.StopReason
 	usage    ir.Usage
-	seqTool  int                                    // OpenAI chunk index -> sequential tool index
-	chunkIdx map[int]int                            // upstream tool_calls index -> ToolIndex
+	seqTool  int         // OpenAI chunk index -> sequential tool index
+	chunkIdx map[int]int // upstream tool_calls index -> ToolIndex
 	emitted  []ir.Event
 }
 
@@ -175,7 +175,7 @@ func (r *Renderer) Frame(ev ir.Event) ([]byte, error) {
 				"index": 0,
 				"delta": map[string]any{
 					"tool_calls": []any{map[string]any{
-						"index": ev.ToolIndex,
+						"index":    ev.ToolIndex,
 						"function": map[string]any{"arguments": ev.ArgsFragment},
 					}},
 				},

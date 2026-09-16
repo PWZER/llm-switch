@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -22,9 +23,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, req *http.Request) {
 	token, expires, err := s.Admin.Login(req.Context(), body.Password)
 	switch {
 	case errors.Is(err, auth.ErrInvalidPassword):
+		slog.Warn("admin login failed", "remote", req.RemoteAddr)
 		httpx.WriteEnvelopeError(w, req, http.StatusUnauthorized, 40102, "invalid password")
 		return
 	case err != nil:
+		slog.Warn("admin login throttled or errored", "remote", req.RemoteAddr, "err", err)
 		httpx.WriteEnvelopeError(w, req, http.StatusTooManyRequests, 42901, err.Error())
 		return
 	}

@@ -1,5 +1,5 @@
--- Initial schema: settings, admin auth, providers/channels/keys, model routing, logs.
--- Timestamps are unix seconds unless noted otherwise.
+-- Initial schema: settings, admin auth, providers/accounts/channels, model
+-- routing, logs. Timestamps are unix seconds unless noted otherwise.
 
 CREATE TABLE settings (
   key        TEXT PRIMARY KEY,
@@ -27,27 +27,30 @@ CREATE TABLE sessions (
   expires_at INTEGER NOT NULL
 );
 
--- Vendor account. One account's API key typically works on both the OpenAI and
--- Anthropic endpoints, so keys live here and are shared by all of the provider's channels.
+-- Vendor account. One provider hosts one or more protocol endpoints
+-- (channels); credentials live on the provider's accounts.
 CREATE TABLE providers (
-  id         INTEGER PRIMARY KEY,
-  name       TEXT NOT NULL UNIQUE,
-  enabled    INTEGER NOT NULL DEFAULT 1,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  id           INTEGER PRIMARY KEY,
+  name         TEXT NOT NULL UNIQUE,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
 );
 
-CREATE TABLE provider_keys (
-  id         INTEGER PRIMARY KEY,
-  provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-  label      TEXT NOT NULL DEFAULT '',
-  api_key    TEXT NOT NULL,
-  weight     INTEGER NOT NULL DEFAULT 1,
-  enabled    INTEGER NOT NULL DEFAULT 1,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+-- Provider API keys: a provider pools 1:N accounts, picked by weighted RR.
+-- The API key is one attribute of an account; usage probes are per-account.
+CREATE TABLE accounts (
+  id           INTEGER PRIMARY KEY,
+  provider_id  INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  label        TEXT NOT NULL DEFAULT '',
+  api_key      TEXT NOT NULL,
+  weight       INTEGER NOT NULL DEFAULT 1,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  usage_probes TEXT NOT NULL DEFAULT '[]', -- JSON array of {type, path, name?, auth_style?} quota probes
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
 );
-CREATE INDEX idx_pkeys_provider ON provider_keys(provider_id);
+CREATE INDEX idx_accounts_provider ON accounts(provider_id);
 
 -- Protocol-specific endpoint. One provider may expose several channels
 -- (e.g. Zhipu openai + Zhipu anthropic); failover walks channels by priority.
@@ -60,6 +63,7 @@ CREATE TABLE channels (
   chat_path             TEXT NOT NULL DEFAULT '',
   auth_style            TEXT NOT NULL DEFAULT 'bearer' CHECK (auth_style IN ('bearer','x-api-key')),
   models_url            TEXT,
+  responses_path        TEXT, -- OpenAI Responses endpoint relative to base_url; NULL = bridge via IR
   extra_headers         TEXT NOT NULL DEFAULT '{}',
   enabled               INTEGER NOT NULL DEFAULT 1,
   priority              INTEGER NOT NULL DEFAULT 0,
@@ -82,24 +86,30 @@ CREATE TABLE channel_models (
 );
 CREATE INDEX idx_cmodel_model ON channel_models(model);
 
--- Hot-switchable aliases: stable client-facing names -> (channel, upstream_model).
-CREATE TABLE aliases (
-  name           TEXT PRIMARY KEY,
-  channel_id     INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-  upstream_model TEXT NOT NULL,
-  updated_at     INTEGER NOT NULL
+-- Hot-switchable model routes: stable client-facing names -> ordered failover
+-- chains of (channel, upstream_model). The first healthy target serves.
+-- Names are canonical: the "[1m]" suffix is reserved for the GET /v1/models
+-- 1M-context marker and is rejected at the admin API.
+CREATE TABLE model_routes (
+  name         TEXT PRIMARY KEY,
+  targets_json TEXT NOT NULL DEFAULT '[]',
+  updated_at   INTEGER NOT NULL
 );
 
--- Client-facing model registry merged into GET /v1/models.
+-- Client-facing model registry merged into GET /v1/models, keyed per provider:
+-- the same model name may exist once per provider, each row with its own
+-- enabled flag and limits. provider_id 0 is the manual (not provider-tied)
+-- entry. GET /v1/models merges duplicates by name.
 CREATE TABLE models (
-  id                TEXT PRIMARY KEY,
+  id                TEXT NOT NULL,
   display_name      TEXT NOT NULL DEFAULT '',
-  source            TEXT NOT NULL DEFAULT 'manual',
+  provider_id       INTEGER NOT NULL DEFAULT 0,
   context_window    INTEGER,
   max_output_tokens INTEGER,
   enabled           INTEGER NOT NULL DEFAULT 1,
   created_at        INTEGER NOT NULL,
-  updated_at        INTEGER NOT NULL
+  updated_at        INTEGER NOT NULL,
+  PRIMARY KEY (provider_id, id)
 );
 
 -- Gateway keys issued to Agents. `key` holds the sha256 hex of the plaintext;
@@ -117,7 +127,7 @@ CREATE TABLE api_keys (
   last_used_at INTEGER
 );
 
--- Denormalized display names survive provider/channel/key deletion.
+-- Denormalized display names survive provider/channel/account deletion.
 CREATE TABLE request_logs (
   id                INTEGER PRIMARY KEY,
   ts                INTEGER NOT NULL,            -- unix millis
@@ -126,6 +136,8 @@ CREATE TABLE request_logs (
   api_key_name      TEXT NOT NULL DEFAULT '',
   provider_id       INTEGER,
   provider_name     TEXT NOT NULL DEFAULT '',
+  account_id        INTEGER,
+  account_name      TEXT NOT NULL DEFAULT '',
   channel_id        INTEGER,
   channel_name      TEXT NOT NULL DEFAULT '',
   model             TEXT NOT NULL,               -- client-facing
@@ -145,7 +157,8 @@ CREATE TABLE request_logs (
   latency_ms        INTEGER NOT NULL DEFAULT 0,
   first_token_ms    INTEGER
 );
-CREATE INDEX idx_logs_ts       ON request_logs(ts);
-CREATE INDEX idx_logs_model_ts ON request_logs(model, ts);
-CREATE INDEX idx_logs_key_ts   ON request_logs(api_key_id, ts);
-CREATE INDEX idx_logs_prov_ts  ON request_logs(provider_id, ts);
+CREATE INDEX idx_logs_ts         ON request_logs(ts);
+CREATE INDEX idx_logs_model_ts   ON request_logs(model, ts);
+CREATE INDEX idx_logs_key_ts     ON request_logs(api_key_id, ts);
+CREATE INDEX idx_logs_prov_ts    ON request_logs(provider_id, ts);
+CREATE INDEX idx_logs_account_ts ON request_logs(account_id, ts);

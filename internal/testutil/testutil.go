@@ -23,6 +23,7 @@ type Fake struct {
 	failN    int
 	requests int
 	lastBody []byte
+	lastAuth string
 }
 
 // NewOpenAI starts a fake OpenAI-compatible upstream.
@@ -65,6 +66,13 @@ func (f *Fake) LastBody() []byte {
 	return out
 }
 
+// LastAuthorization returns the most recent Authorization header seen.
+func (f *Fake) LastAuthorization() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastAuth
+}
+
 func (f *Fake) remember(body []byte) {
 	f.mu.Lock()
 	f.lastBody = body
@@ -72,6 +80,9 @@ func (f *Fake) remember(body []byte) {
 }
 
 func (f *Fake) handle(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.lastAuth = r.Header.Get("Authorization")
+	f.mu.Unlock()
 	switch {
 	case r.URL.Path == "/models" && f.Protocol == "openai":
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -86,6 +97,9 @@ func (f *Fake) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	case r.URL.Path == "/chat/completions" && f.Protocol == "openai":
 		f.chat(w, r)
+		return
+	case r.URL.Path == "/responses" && f.Protocol == "openai":
+		f.responses(w, r)
 		return
 	case r.URL.Path == "/v1/messages" && f.Protocol == "anthropic":
 		f.messages(w, r)
@@ -255,6 +269,84 @@ data: {"type":"content_block_stop","index":0}`),
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`),
 		[]byte(`event: message_stop
 data: {"type":"message_stop"}`),
+	})
+}
+
+// responses scripts a fake Responses API endpoint (openai fake only). Tools
+// in the request switch to the tool-call scenario, mirroring chat().
+func (f *Fake) responses(w http.ResponseWriter, r *http.Request) {
+	if !f.gate() {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error": map[string]any{"message": "slow down", "type": "rate_limit_error"}})
+		return
+	}
+	raw, _ := io.ReadAll(r.Body)
+	f.remember(raw)
+	var body struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+		Tools  []any  `json:"tools"`
+	}
+	_ = json.Unmarshal(raw, &body)
+
+	created := fmt.Sprintf("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fake_1\",\"model\":%q}}", body.Model)
+	completed := fmt.Sprintf(`event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fake_1","status":"completed","model":%q,"usage":{"input_tokens":12,"output_tokens":6,"total_tokens":18,"input_tokens_details":{"cached_tokens":4}}}}`, body.Model)
+	completedTool := fmt.Sprintf(`event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fake_tool","status":"completed","model":%q,"usage":{"input_tokens":20,"output_tokens":5,"total_tokens":25}}}`, body.Model)
+
+	if len(body.Tools) > 0 {
+		if !body.Stream {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id": "resp_fake_tool", "object": "response", "status": "completed", "model": body.Model,
+				"output": []any{map[string]any{
+					"type": "function_call", "id": "fc_fake", "call_id": "call_fake_1",
+					"name": "get_weather", "arguments": `{"city":"Beijing"}`, "status": "completed",
+				}},
+				"usage": map[string]any{"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+			})
+			return
+		}
+		sse(w, [][]byte{
+			[]byte(created),
+			[]byte(`event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_fake","call_id":"call_fake_1","name":"get_weather","arguments":""}}`),
+			[]byte(`event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_fake","output_index":0,"delta":"{\"city\":"}`),
+			[]byte(`event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_fake","output_index":0,"delta":"\"Beijing\"}"}`),
+			[]byte(`event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_fake","call_id":"call_fake_1","name":"get_weather","arguments":"{\"city\":\"Beijing\"}"}}`),
+			[]byte(completedTool),
+		})
+		return
+	}
+
+	if !body.Stream {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": "resp_fake_1", "object": "response", "status": "completed", "model": body.Model,
+			"output": []any{map[string]any{
+				"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+				"content": []any{map[string]any{"type": "output_text", "text": "Hello from fake Responses", "annotations": []any{}}},
+			}},
+			"usage": map[string]any{
+				"input_tokens": 12, "output_tokens": 6, "total_tokens": 18,
+				"input_tokens_details": map[string]any{"cached_tokens": 4},
+			},
+		})
+		return
+	}
+	sse(w, [][]byte{
+		[]byte(created),
+		[]byte(`event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"in_progress","content":[]}}`),
+		[]byte(`event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hello"}`),
+		[]byte(`event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":" stream"}`),
+		[]byte(`event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hello stream","annotations":[]}]}}`),
+		[]byte(completed),
 	})
 }
 

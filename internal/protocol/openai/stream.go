@@ -39,8 +39,8 @@ type wireDelta struct {
 }
 
 type wireUsage struct {
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
+	PromptTokens        int64 `json:"prompt_tokens"`
+	CompletionTokens    int64 `json:"completion_tokens"`
 	PromptTokensDetails *struct {
 		CachedTokens int64 `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
@@ -179,9 +179,9 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 			"finish_reason": mapStopReason(resp.Stop),
 		}},
 		"usage": map[string]any{
-			"prompt_tokens":     resp.Usage.Input,
-			"completion_tokens": resp.Usage.Output,
-			"total_tokens":      resp.Usage.Input + resp.Usage.Output,
+			"prompt_tokens":             resp.Usage.Input,
+			"completion_tokens":         resp.Usage.Output,
+			"total_tokens":              resp.Usage.Input + resp.Usage.Output,
 			"prompt_tokens_details":     map[string]any{"cached_tokens": resp.Usage.CacheRead},
 			"completion_tokens_details": map[string]any{"reasoning_tokens": resp.Usage.Reasoning},
 		},

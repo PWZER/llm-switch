@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Button, Card, Form, Input, Typography } from 'antd';
+import { Button, Card, Form, Input, Typography, theme } from 'antd';
 import { useNavigate } from 'react-router-dom';
 import { api, setToken } from '../api/client';
 import { useLang } from '../i18n/i18n';
@@ -7,6 +7,7 @@ import { useLang } from '../i18n/i18n';
 export default function Login() {
   const nav = useNavigate();
   const { t } = useLang();
+  const { token } = theme.useToken();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -31,7 +32,7 @@ export default function Login() {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: '#f5f5f5',
+        background: token.colorBgLayout,
       }}
     >
       <Card style={{ width: 360 }}>

@@ -22,11 +22,11 @@ const (
 
 // Logger batches request-log writes off the request path.
 type Logger struct {
-	st      *store.Store
-	ch      chan store.RequestLog
-	dropped atomic.Int64
-	wg      sync.WaitGroup
-	stop    chan struct{}
+	st       *store.Store
+	ch       chan store.RequestLog
+	dropped  atomic.Int64
+	wg       sync.WaitGroup
+	stop     chan struct{}
 	stopOnce sync.Once
 }
 

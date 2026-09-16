@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -54,8 +55,19 @@ func run() error {
 	}
 	defer st.Close()
 
-	admin := auth.NewAdmin(st)
+	// First boot only: seed the built-in vendor providers/channels so the
+	// gateway works out of the box once an API key is added.
 	bootCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	seeded, err := st.SeedDefaultProviders(bootCtx)
+	if err != nil {
+		cancel()
+		return err
+	}
+	if seeded {
+		logger.Info("seeded default providers")
+	}
+
+	admin := auth.NewAdmin(st)
 	generated, err := admin.Bootstrap(bootCtx, cfg.AdminPassword)
 	cancel()
 	if err != nil {
@@ -71,7 +83,7 @@ func run() error {
 	if err := holder.Rebuild(context.Background(), st); err != nil {
 		return err
 	}
-	pool := gateway.NewKeyPool()
+	pool := gateway.NewAccountPool()
 	gw := gateway.New(holder, pool, gateway.NewUpstreamClient(), stats.New(st))
 	defer gw.Log.Close(context.Background())
 
@@ -125,11 +137,19 @@ func run() error {
 		r.Handle("/*", web.Handler())
 	}
 
+	// Base context for every request: canceled at the start of shutdown so
+	// in-flight streams (which derive their upstream calls and idle watchdogs
+	// from the request context) unblock immediately instead of holding
+	// srv.Shutdown for its full timeout.
+	baseCtx, stopRequests := context.WithCancel(context.Background())
+	defer stopRequests()
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           r,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return baseCtx },
 		// No WriteTimeout: streaming responses must live as long as needed.
 	}
 
@@ -149,6 +169,9 @@ func run() error {
 		return err
 	case sig := <-stop:
 		logger.Info("shutting down", "signal", sig.String())
+		// A second Ctrl+C restores the default behavior: exit immediately.
+		signal.Stop(stop)
+		stopRequests()
 	}
 
 	shutdownCtx, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)

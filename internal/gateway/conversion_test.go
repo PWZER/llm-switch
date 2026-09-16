@@ -6,12 +6,14 @@ import (
 	"testing"
 )
 
-// The harness binds "test-model" to the OpenAI fake and "claude-test" to the
-// Anthropic fake, so calling either model from either surface exercises the
-// full conversion matrix.
+// The harness provider has both an openai and an anthropic channel, and rows
+// are provider-scoped with same-protocol routing preferred — so each test
+// first disables the surface's own protocol, forcing the request onto the
+// opposite-protocol channel and exercising the full conversion matrix.
 
 func TestAnthropicClientToOpenAIUpstreamNonStream(t *testing.T) {
 	h := newHarness(t)
+	h.disableHarnessProtocol("anthropic") // force the cross-protocol bridge
 	resp, raw := h.post("/v1/messages", `{
 		"model":"test-model","max_tokens":100,
 		"system":"You are helpful.",
@@ -68,6 +70,7 @@ func TestAnthropicClientToOpenAIUpstreamNonStream(t *testing.T) {
 
 func TestAnthropicClientToOpenAIUpstreamStream(t *testing.T) {
 	h := newHarness(t)
+	h.disableHarnessProtocol("anthropic") // force the cross-protocol bridge
 	resp, raw := h.post("/v1/messages", `{"model":"test-model","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"Hi"}]}`,
 		map[string]string{"anthropic-version": "2023-06-01"})
 	if resp.StatusCode != 200 {
@@ -96,6 +99,7 @@ func TestAnthropicClientToOpenAIUpstreamStream(t *testing.T) {
 
 func TestAnthropicClientToOpenAIUpstreamTools(t *testing.T) {
 	h := newHarness(t)
+	h.disableHarnessProtocol("anthropic") // force the cross-protocol bridge
 	// Turn 1: tool definition -> tool_use block back.
 	resp, raw := h.post("/v1/messages", `{
 		"model":"test-model","max_tokens":100,
@@ -161,6 +165,7 @@ func TestAnthropicClientToOpenAIUpstreamTools(t *testing.T) {
 
 func TestOpenAIClientToAnthropicUpstreamNonStream(t *testing.T) {
 	h := newHarness(t)
+	h.disableHarnessProtocol("openai") // force the cross-protocol bridge
 	resp, raw := h.post("/v1/chat/completions", `{"model":"claude-test","messages":[{"role":"user","content":"Hi"}]}`, nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d: %s", resp.StatusCode, raw)
@@ -173,8 +178,8 @@ func TestOpenAIClientToAnthropicUpstreamNonStream(t *testing.T) {
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens     int64 `json:"prompt_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
+			PromptTokens        int64 `json:"prompt_tokens"`
+			CompletionTokens    int64 `json:"completion_tokens"`
 			PromptTokensDetails struct {
 				CachedTokens int64 `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
@@ -206,6 +211,7 @@ func TestOpenAIClientToAnthropicUpstreamNonStream(t *testing.T) {
 
 func TestOpenAIClientToAnthropicUpstreamStream(t *testing.T) {
 	h := newHarness(t)
+	h.disableHarnessProtocol("openai") // force the cross-protocol bridge
 	resp, raw := h.post("/v1/chat/completions", `{"model":"claude-test","stream":true,"messages":[{"role":"user","content":"Hi"}]}`, nil)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status %d", resp.StatusCode)
@@ -227,6 +233,7 @@ func TestOpenAIClientToAnthropicUpstreamStream(t *testing.T) {
 
 func TestOpenAIClientToAnthropicUpstreamTools(t *testing.T) {
 	h := newHarness(t)
+	h.disableHarnessProtocol("openai") // force the cross-protocol bridge
 	resp, raw := h.post("/v1/chat/completions", `{
 		"model":"claude-test",
 		"tools":[{"type":"function","function":{"name":"get_weather","description":"w","parameters":{"type":"object"}}}],
@@ -239,8 +246,8 @@ func TestOpenAIClientToAnthropicUpstreamTools(t *testing.T) {
 		Choices []struct {
 			Message struct {
 				ToolCalls []struct {
-					ID        string `json:"id"`
-					Function  struct {
+					ID       string `json:"id"`
+					Function struct {
 						Name      string `json:"name"`
 						Arguments string `json:"arguments"`
 					} `json:"function"`

@@ -11,6 +11,9 @@ type Protocol string
 const (
 	OpenAI    Protocol = "openai"
 	Anthropic Protocol = "anthropic"
+	// OpenAIResponses is the OpenAI Responses API wire shape (POST /v1/responses).
+	// It is a client-surface protocol only; channels never carry this value.
+	OpenAIResponses Protocol = "openai-responses"
 )
 
 // BlockType is the canonical content block kind.
@@ -28,7 +31,7 @@ const (
 type Block struct {
 	Type BlockType
 
-	Text string // BlockText / thinking payload for BlockThinking
+	Text      string // BlockText / thinking payload for BlockThinking
 	Signature string // thinking signature; empty for synthesized thinking
 
 	// BlockImage
@@ -105,6 +108,11 @@ type Request struct {
 	TopP          *float64
 	StopSequences []string
 	Thinking      *Thinking
+	// ResponseFormat carries a chat-shaped `response_format` payload
+	// ({"type":"json_object"} or {"type":"json_schema","json_schema":{...}}).
+	// Set only by the Responses codec (text.format); the chat codec never
+	// populates it on decode. Anthropic-bound requests reject it.
+	ResponseFormat json.RawMessage
 }
 
 // Usage is the canonical token accounting.
@@ -120,10 +128,10 @@ type Usage struct {
 type StopReason string
 
 const (
-	StopEndTurn      StopReason = "end_turn"
-	StopMaxTokens    StopReason = "max_tokens"
-	StopToolUse      StopReason = "tool_use"
-	StopStopSequence StopReason = "stop_sequence"
+	StopEndTurn       StopReason = "end_turn"
+	StopMaxTokens     StopReason = "max_tokens"
+	StopToolUse       StopReason = "tool_use"
+	StopStopSequence  StopReason = "stop_sequence"
 	StopContentFilter StopReason = "content_filter"
 )
 
@@ -142,15 +150,15 @@ type Response struct {
 type EventKind string
 
 const (
-	EvStart     EventKind = "start"      // carries Model
-	EvTextDelta EventKind = "text"       // carries Text
-	EvThinkDelta EventKind = "thinking"  // carries Text
-	EvToolStart EventKind = "tool_start" // carries ToolID, ToolName, ToolIndex
-	EvToolDelta EventKind = "tool_delta" // carries ToolIndex, ArgsFragment
-	EvToolEnd   EventKind = "tool_end"   // carries ToolIndex
-	EvFinish    EventKind = "finish"     // carries Stop, Usage
-	EvPing      EventKind = "ping"
-	EvError     EventKind = "error" // carries ErrText
+	EvStart      EventKind = "start"      // carries Model
+	EvTextDelta  EventKind = "text"       // carries Text
+	EvThinkDelta EventKind = "thinking"   // carries Text
+	EvToolStart  EventKind = "tool_start" // carries ToolID, ToolName, ToolIndex
+	EvToolDelta  EventKind = "tool_delta" // carries ToolIndex, ArgsFragment
+	EvToolEnd    EventKind = "tool_end"   // carries ToolIndex
+	EvFinish     EventKind = "finish"     // carries Stop, Usage
+	EvPing       EventKind = "ping"
+	EvError      EventKind = "error" // carries ErrText
 )
 
 // Event is one canonical stream event.

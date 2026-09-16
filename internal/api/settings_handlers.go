@@ -10,12 +10,11 @@ import (
 // settingKeys is the editable allowlist. admin password and anything secret
 // deliberately live outside this table.
 var settingKeys = map[string]string{
-	"retention_days":         "int",
-	"max_failover_attempts":  "int",
-	"default_max_tokens":     "int",
-	"auto_bind_new_models":   "bool",
-	"stream_idle_timeout_s":  "int",
-	"log_bodies":             "bool",
+	"retention_days":        "int",
+	"max_failover_attempts": "int",
+	"default_max_tokens":    "int",
+	"stream_idle_timeout_s": "int",
+	"log_bodies":            "bool",
 }
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, req *http.Request) {

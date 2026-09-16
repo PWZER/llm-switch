@@ -42,20 +42,23 @@ type wireTool struct {
 }
 
 type wireRequest struct {
-	Model          string        `json:"model"`
-	Messages       []wireMessage `json:"messages"`
-	Stream         bool          `json:"stream,omitempty"`
-	StreamOptions  *struct {
+	Model         string        `json:"model"`
+	Messages      []wireMessage `json:"messages"`
+	Stream        bool          `json:"stream,omitempty"`
+	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
-	MaxTokens     *int64            `json:"max_tokens,omitempty"`
-	Temperature   *float64          `json:"temperature,omitempty"`
-	TopP          *float64          `json:"top_p,omitempty"`
-	Stop          []string          `json:"stop,omitempty"`
-	Tools         []wireTool        `json:"tools,omitempty"`
-	ToolChoice    json.RawMessage   `json:"tool_choice,omitempty"`
-	Thinking      *wireThinking     `json:"thinking,omitempty"`
+	MaxTokens       *int64          `json:"max_tokens,omitempty"`
+	Temperature     *float64        `json:"temperature,omitempty"`
+	TopP            *float64        `json:"top_p,omitempty"`
+	Stop            []string        `json:"stop,omitempty"`
+	Tools           []wireTool      `json:"tools,omitempty"`
+	ToolChoice      json.RawMessage `json:"tool_choice,omitempty"`
+	Thinking        *wireThinking   `json:"thinking,omitempty"`
 	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	// ResponseFormat is emitted only when bridging from a Responses request
+	// carrying text.format; the chat decoder never populates it.
+	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
 }
 
 type wireThinking struct {
@@ -240,7 +243,7 @@ func imageBlock(url string) ir.Block {
 // stream is true the gateway asks for usage in the final chunk.
 func EncodeRequest(req *ir.Request) ([]byte, error) {
 	w := wireRequest{
-		Model: req.Model,
+		Model:  req.Model,
 		Stream: req.Stream,
 	}
 	if req.Stream {
@@ -255,6 +258,9 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 	w.Temperature = req.Temperature
 	w.TopP = req.TopP
 	w.Stop = req.StopSequences
+	if len(req.ResponseFormat) > 0 {
+		w.ResponseFormat = req.ResponseFormat
+	}
 
 	if len(req.System) > 0 {
 		w.Messages = append(w.Messages, wireMessage{
@@ -327,7 +333,7 @@ func EncodeRequest(req *ir.Request) ([]byte, error) {
 					case ir.BlockImage:
 						if b.ImageIsURL {
 							parts = append(parts, map[string]any{
-								"type": "image_url",
+								"type":      "image_url",
 								"image_url": map[string]string{"url": b.ImageData},
 							})
 						} else {

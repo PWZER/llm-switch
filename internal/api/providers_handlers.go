@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
-	"strconv"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
-
-	"github.com/go-chi/chi/v5"
 
 	"github.com/PWZER/llm-switch/internal/httpx"
 	"github.com/PWZER/llm-switch/internal/store"
@@ -27,17 +27,24 @@ func (s *Server) handleListProviders(w http.ResponseWriter, req *http.Request) {
 
 func (s *Server) handleCreateProvider(w http.ResponseWriter, req *http.Request) {
 	var body struct {
-		Name string `json:"name"`
+		Name           string   `json:"name"`
+		ModelsURL      *string  `json:"models_url"`
+		RegisterModels []string `json:"register_models"`
 	}
 	if !readJSON(w, req, &body) || body.Name == "" {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "name is required")
 		return
 	}
-	id, err := s.St.Providers.Create(req.Context(), body.Name)
+	if err := validateModelsURL(body.ModelsURL); err != nil {
+		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, err.Error())
+		return
+	}
+	id, err := s.St.Providers.Create(req.Context(), body.Name, body.ModelsURL)
 	if err != nil {
 		mapStoreErr(w, req, err)
 		return
 	}
+	s.registerModels(req.Context(), id, body.RegisterModels)
 	httpx.WriteEnvelopeStatus(w, req, http.StatusCreated, map[string]int64{"id": id})
 }
 
@@ -62,14 +69,35 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	var body struct {
-		Name    *string `json:"name"`
-		Enabled *bool   `json:"enabled"`
+		Name           *string  `json:"name"`
+		ModelsURL      *string  `json:"models_url"` // non-nil = set (empty string clears)
+		Enabled        *bool    `json:"enabled"`
+		RegisterModels []string `json:"register_models"`
 	}
 	if !readJSON(w, req, &body) {
 		return
 	}
-	if body.Name != nil {
-		if err := s.St.Providers.Rename(req.Context(), id, *body.Name); err != nil {
+	if body.Name != nil || body.ModelsURL != nil {
+		if err := validateModelsURL(body.ModelsURL); err != nil {
+			httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, err.Error())
+			return
+		}
+		p, err := s.St.Providers.Get(req.Context(), id)
+		if err != nil {
+			mapStoreErr(w, req, err)
+			return
+		}
+		if body.Name != nil {
+			p.Name = *body.Name
+		}
+		if body.ModelsURL != nil {
+			if *body.ModelsURL == "" {
+				p.ModelsURL = nil
+			} else {
+				p.ModelsURL = body.ModelsURL
+			}
+		}
+		if err := s.St.Providers.Update(req.Context(), &p); err != nil {
 			mapStoreErr(w, req, err)
 			return
 		}
@@ -80,6 +108,7 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, req *http.Request) 
 			return
 		}
 	}
+	s.registerModels(req.Context(), id, body.RegisterModels)
 	p, err := s.St.Providers.Get(req.Context(), id)
 	if err != nil {
 		mapStoreErr(w, req, err)
@@ -88,106 +117,71 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, req *http.Request) 
 	httpx.WriteEnvelope(w, req, p)
 }
 
+// validateModelsURL accepts nil/empty (unset) or an absolute http(s) URL —
+// the fetch URL is configured explicitly at the provider level, never
+// derived from endpoint base URLs.
+func validateModelsURL(u *string) error {
+	if u == nil || *u == "" {
+		return nil
+	}
+	parsed, err := url.Parse(*u)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return errText("models_url must be an absolute http(s) URL")
+	}
+	return nil
+}
+
+// registerModels inserts provider-scoped identity rows for the given ids
+// (insert-if-missing; existing rows are never touched). Failures are logged,
+// not fatal: the provider itself is already saved.
+func (s *Server) registerModels(ctx context.Context, providerID int64, ids []string) {
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, err := s.St.Models.EnsureModel(ctx, &store.Model{
+			ID: id, ProviderID: providerID, UpstreamModel: id,
+		}); err != nil {
+			slog.Warn("register model failed", "provider_id", providerID, "model", id, "err", err)
+		}
+	}
+}
+
 func (s *Server) handleDeleteProvider(w http.ResponseWriter, req *http.Request) {
 	id, ok := pathID(req)
 	if !ok {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "invalid id")
 		return
 	}
-	if err := s.St.Providers.Delete(req.Context(), id); err != nil {
+	if err := s.St.DeleteProvider(req.Context(), id); err != nil {
 		mapStoreErr(w, req, err)
 		return
 	}
 	httpx.WriteEnvelope(w, req, map[string]bool{"ok": true})
 }
 
-// — provider keys ---------------------------------------------------------
-
-func (s *Server) handleListProviderKeys(w http.ResponseWriter, req *http.Request) {
-	id, ok := pathID(req)
-	if !ok {
-		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "invalid id")
-		return
-	}
-	keys, err := s.St.Keys.List(req.Context(), id)
-	if err != nil {
-		mapStoreErr(w, req, err)
-		return
-	}
-	httpx.WriteEnvelope(w, req, keys)
-}
-
-func (s *Server) handleCreateProviderKey(w http.ResponseWriter, req *http.Request) {
-	id, ok := pathID(req)
-	if !ok {
-		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "invalid id")
-		return
-	}
-	var body struct {
-		Label  string `json:"label"`
-		APIKey string `json:"api_key"`
-		Weight int    `json:"weight"`
-	}
-	if !readJSON(w, req, &body) {
-		return
-	}
-	if body.APIKey == "" {
-		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "api_key is required")
-		return
-	}
-	if body.Weight < 1 {
-		body.Weight = 1
-	}
-	keyID, err := s.St.Keys.Create(req.Context(), id, body.Label, body.APIKey, body.Weight)
-	if err != nil {
-		mapStoreErr(w, req, err)
-		return
-	}
-	httpx.WriteEnvelopeStatus(w, req, http.StatusCreated, map[string]any{
-		"id": keyID, "api_key_mask": maskForDisplay(body.APIKey),
-	})
-}
-
-func (s *Server) handleUpdateProviderKey(w http.ResponseWriter, req *http.Request) {
-	keyID, err := strconv.ParseInt(chi.URLParam(req, "id"), 10, 64)
-	if err != nil || keyID <= 0 {
-		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "invalid id")
-		return
-	}
-	var body struct {
-		Label   *string `json:"label"`
-		Weight  *int    `json:"weight"`
-		Enabled *bool   `json:"enabled"`
-	}
-	if !readJSON(w, req, &body) {
-		return
-	}
-	if err := s.St.Keys.Update(req.Context(), keyID, body.Label, body.Weight, body.Enabled); err != nil {
-		mapStoreErr(w, req, err)
-		return
-	}
-	httpx.WriteEnvelope(w, req, map[string]bool{"ok": true})
-}
-
-func (s *Server) handleDeleteProviderKey(w http.ResponseWriter, req *http.Request) {
-	keyID, err := strconv.ParseInt(chi.URLParam(req, "id"), 10, 64)
-	if err != nil || keyID <= 0 {
-		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "invalid id")
-		return
-	}
-	if err := s.St.Keys.Delete(req.Context(), keyID); err != nil {
-		mapStoreErr(w, req, err)
-		return
-	}
-	httpx.WriteEnvelope(w, req, map[string]bool{"ok": true})
-}
-
-// handleRefreshModels fetches the upstream model list through the provider's
-// first enabled channel and upserts new entries (never overwrites existing).
+// handleRefreshModels fetches the upstream model list from the provider's
+// configured models_url (provider-level, absolute — never derived from
+// endpoint URLs) and registers unknown entries as provider-scoped rows: every
+// live endpoint of the provider can then serve them. Manual edits survive:
+// EnsureModel only backfills NULL limits.
+// The account to authenticate with is chosen explicitly: account_id is
+// required and must name an enabled account of this provider — there is no
+// silent fallback.
 func (s *Server) handleRefreshModels(w http.ResponseWriter, req *http.Request) {
 	id, ok := pathID(req)
 	if !ok {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "invalid id")
+		return
+	}
+	var body struct {
+		AccountID int64 `json:"account_id"`
+	}
+	// Tolerate an empty body so the 40002 below carries the actionable message.
+	_ = json.NewDecoder(io.LimitReader(req.Body, 64<<10)).Decode(&body)
+	if body.AccountID <= 0 {
+		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "account_id is required")
 		return
 	}
 	p, err := s.St.Providers.Get(req.Context(), id)
@@ -195,95 +189,116 @@ func (s *Server) handleRefreshModels(w http.ResponseWriter, req *http.Request) {
 		mapStoreErr(w, req, err)
 		return
 	}
-	channels, err := s.St.Channels.List(req.Context())
-	if err != nil {
-		mapStoreErr(w, req, err)
+	account, err := s.St.Accounts.Get(req.Context(), body.AccountID)
+	if err != nil || account.ProviderID != id || !account.Enabled {
+		httpx.WriteEnvelopeError(w, req, http.StatusNotFound, 40401, "account not found or disabled")
 		return
 	}
-	var channel *store.Channel
-	for i := range channels {
-		if channels[i].ProviderID == id && channels[i].Enabled {
-			channel = &channels[i]
-			break
-		}
-	}
-	if channel == nil {
+	if p.ModelsURL == nil || *p.ModelsURL == "" {
 		httpx.WriteEnvelopeError(w, req, http.StatusConflict, 40901,
-			"provider has no enabled channel to fetch models through")
-		return
-	}
-	keys, err := s.St.Keys.EnabledKeys(req.Context(), id)
-	if err != nil || len(keys) == 0 {
-		httpx.WriteEnvelopeError(w, req, http.StatusConflict, 40902, "provider has no enabled api key")
+			"models_url is not configured for this provider — set it on the provider first")
 		return
 	}
 
-	added, err := s.fetchUpstreamModels(req.Context(), channel, keys[0].APIKey, id)
+	// The auth header style comes from the provider's endpoints (OpenAI
+	// protocol first — the models list is an OpenAI-style endpoint); with no
+	// channels at all, bearer is the safe default.
+	authStyle := "bearer"
+	if channels, err := s.St.Channels.List(req.Context()); err == nil {
+		sort.Slice(channels, func(i, j int) bool {
+			return channels[i].Protocol == "openai" && channels[j].Protocol != "openai"
+		})
+		for _, ch := range channels {
+			if ch.ProviderID == id && ch.Enabled {
+				authStyle = ch.AuthStyle
+				break
+			}
+		}
+	}
+
+	models, err := getModelsURL(req.Context(), *p.ModelsURL, authStyle, account.APIKey)
 	if err != nil {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadGateway, 60001, "fetch models: "+err.Error())
 		return
 	}
-	httpx.WriteEnvelope(w, req, map[string]any{"provider": p.Name, "models_added": added})
+	added := 0
+	for _, m := range models {
+		inserted, err := s.St.Models.EnsureModel(req.Context(), &store.Model{
+			ID:              m.ID,
+			ProviderID:      id,
+			UpstreamModel:   m.ID,
+			DisplayName:     m.ID,
+			ContextWindow:   m.ContextLength,
+			MaxOutputTokens: m.MaxOutputTokens,
+		})
+		if err != nil {
+			mapStoreErr(w, req, err)
+			return
+		}
+		if inserted {
+			added++
+		}
+	}
+	httpx.WriteEnvelope(w, req, map[string]any{
+		"provider": p.Name, "account_id": account.ID, "models_added": added,
+	})
 }
 
-// fetchUpstreamModels GETs the model list (OpenAI and Anthropic shapes share
-// the data[].id envelope) and inserts unknown entries.
-func (s *Server) fetchUpstreamModels(ctx context.Context, ch *store.Channel, secret string, providerID int64) (int, error) {
-	base := strings.TrimSuffix(ch.BaseURL, "/")
-	modelsPath := orString(ch.ModelsURL, "/models")
-	if ch.Protocol == "anthropic" && ch.ModelsURL == nil {
-		modelsPath = "/v1/models"
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+modelsPath, nil)
+// upstreamHTTPError is a non-2xx models-list response.
+type upstreamHTTPError struct {
+	status int
+	msg    string
+}
+
+func (e *upstreamHTTPError) Error() string {
+	return fmt.Sprintf("upstream status %d: %s", e.status, e.msg)
+}
+
+// upstreamModel is one entry of a models-list response. Vendor models lists
+// (OpenAI and Anthropic shapes) carry only ids; aggregators like OpenRouter
+// add top-level context_length / max_output_tokens — parsed when present,
+// else NULL so the registry stays untouched.
+type upstreamModel struct {
+	ID              string `json:"id"`
+	ContextLength   *int64 `json:"context_length"`
+	MaxOutputTokens *int64 `json:"max_output_tokens"`
+}
+
+func getModelsURL(ctx context.Context, url, authStyle, secret string) ([]upstreamModel, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if ch.AuthStyle == "x-api-key" {
+	if authStyle == "x-api-key" {
 		req.Header.Set("x-api-key", secret)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+secret)
 	}
 	resp, err := httpClientForRefresh.Do(req)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return 0, fmt.Errorf("upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, &upstreamHTTPError{status: resp.StatusCode, msg: strings.TrimSpace(string(body))}
 	}
 	var list struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		Data []upstreamModel `json:"data"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&list); err != nil {
-		return 0, err
+		return nil, err
 	}
-	added := 0
+	models := make([]upstreamModel, 0, len(list.Data))
 	for _, m := range list.Data {
-		if m.ID == "" {
-			continue
-		}
-		inserted, err := s.St.Models.EnsureModel(ctx, m.ID, fmt.Sprintf("provider:%d", providerID))
-		if err != nil {
-			return added, err
-		}
-		if inserted {
-			added++
+		if m.ID != "" {
+			models = append(models, m)
 		}
 	}
-	return added, nil
+	return models, nil
 }
 
 var httpClientForRefresh = &http.Client{Timeout: 30 * time.Second}
-
-func orString(v *string, fb string) string {
-	if v != nil && *v != "" {
-		return *v
-	}
-	return fb
-}
 
 func maskForDisplay(key string) string {
 	if len(key) <= 8 {

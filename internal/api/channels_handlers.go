@@ -2,28 +2,27 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/PWZER/llm-switch/internal/httpx"
 	"github.com/PWZER/llm-switch/internal/store"
 )
 
 type channelBody struct {
-	ProviderID          int64                  `json:"provider_id"`
-	Name                string                 `json:"name"`
-	Protocol            string                 `json:"protocol"`
-	BaseURL             string                 `json:"base_url"`
-	ChatPath            string                 `json:"chat_path"`
-	AuthStyle           string                 `json:"auth_style"`
-	ModelsURL           *string                `json:"models_url"`
-	ExtraHeaders        string                 `json:"extra_headers"`
-	Enabled             *bool                  `json:"enabled"`
-	Priority            *int                   `json:"priority"`
-	Weight              *int                   `json:"weight"`
-	AutoBind            *bool                  `json:"auto_bind"`
-	SupportsEmbeddings  *bool                  `json:"supports_embeddings"`
-	Passthrough         *bool                  `json:"passthrough"`
-	ForceUpstreamStream *bool                  `json:"force_upstream_stream"`
-	Models              []store.ChannelModel   `json:"models"`
+	ProviderID          int64   `json:"provider_id"`
+	Name                string  `json:"name"`
+	Protocol            string  `json:"protocol"`
+	BaseURL             string  `json:"base_url"`
+	ChatPath            string  `json:"chat_path"`
+	AuthStyle           string  `json:"auth_style"`
+	ResponsesPath       *string `json:"responses_path"`
+	ExtraHeaders        string  `json:"extra_headers"`
+	Enabled             *bool   `json:"enabled"`
+	Priority            *int    `json:"priority"`
+	Weight              *int    `json:"weight"`
+	SupportsEmbeddings  *bool   `json:"supports_embeddings"`
+	Passthrough         *bool   `json:"passthrough"`
+	ForceUpstreamStream *bool   `json:"force_upstream_stream"`
 }
 
 func (s *Server) handleListChannels(w http.ResponseWriter, req *http.Request) {
@@ -49,12 +48,6 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		mapStoreErr(w, req, err)
 		return
-	}
-	if len(body.Models) > 0 {
-		if err := s.St.Channels.ReplaceBindings(req.Context(), id, body.Models); err != nil {
-			mapStoreErr(w, req, err)
-			return
-		}
 	}
 	out, err := s.St.Channels.Get(req.Context(), id)
 	if err != nil {
@@ -105,12 +98,6 @@ func (s *Server) handleUpdateChannel(w http.ResponseWriter, req *http.Request) {
 		mapStoreErr(w, req, err)
 		return
 	}
-	if body.Models != nil {
-		if err := s.St.Channels.ReplaceBindings(req.Context(), id, body.Models); err != nil {
-			mapStoreErr(w, req, err)
-			return
-		}
-	}
 	out, err := s.St.Channels.Get(req.Context(), id)
 	if err != nil {
 		mapStoreErr(w, req, err)
@@ -125,42 +112,11 @@ func (s *Server) handleDeleteChannel(w http.ResponseWriter, req *http.Request) {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "invalid id")
 		return
 	}
-	if err := s.St.Channels.Delete(req.Context(), id); err != nil {
+	if err := s.St.DeleteChannel(req.Context(), id); err != nil {
 		mapStoreErr(w, req, err)
 		return
 	}
 	httpx.WriteEnvelope(w, req, map[string]bool{"ok": true})
-}
-
-func (s *Server) handleReplaceBindings(w http.ResponseWriter, req *http.Request) {
-	id, ok := pathID(req)
-	if !ok {
-		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "invalid id")
-		return
-	}
-	var body struct {
-		Models []store.ChannelModel `json:"models"`
-	}
-	if !readJSON(w, req, &body) {
-		return
-	}
-	for _, m := range body.Models {
-		if m.Model == "" || m.UpstreamModel == "" {
-			httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002,
-				"each binding needs model and upstream_model")
-			return
-		}
-	}
-	if err := s.St.Channels.ReplaceBindings(req.Context(), id, body.Models); err != nil {
-		mapStoreErr(w, req, err)
-		return
-	}
-	out, err := s.St.Channels.Get(req.Context(), id)
-	if err != nil {
-		mapStoreErr(w, req, err)
-		return
-	}
-	httpx.WriteEnvelope(w, req, out)
 }
 
 func validateChannelBody(b *channelBody, creating bool) error {
@@ -187,25 +143,34 @@ func validateChannelBody(b *channelBody, creating bool) error {
 	if b.ExtraHeaders != "" && b.ExtraHeaders != "{}" && b.ExtraHeaders[0] != '{' {
 		return errText("extra_headers must be a JSON object string")
 	}
+	if b.ResponsesPath != nil {
+		p := strings.TrimSpace(*b.ResponsesPath)
+		if p != "" {
+			if strings.Contains(p, "://") || strings.ContainsAny(p, " \t\r\n") {
+				return errText("responses_path must be a URL path like /responses")
+			}
+			if b.Protocol == "anthropic" {
+				return errText("responses_path applies to openai channels only")
+			}
+		}
+	}
 	return nil
 }
 
 // toChannel materializes the body into a store row, applying defaults on create.
 func (b *channelBody) toChannel(creating bool) store.Channel {
 	c := store.Channel{
-		ProviderID:   b.ProviderID,
-		Name:         b.Name,
-		Protocol:     b.Protocol,
-		BaseURL:      b.BaseURL,
-		ChatPath:     b.ChatPath,
-		AuthStyle:    b.AuthStyle,
-		ModelsURL:    b.ModelsURL,
-		ExtraHeaders: b.ExtraHeaders,
-		Models:       b.Models,
+		ProviderID:    b.ProviderID,
+		Name:          b.Name,
+		Protocol:      b.Protocol,
+		BaseURL:       b.BaseURL,
+		ChatPath:      b.ChatPath,
+		AuthStyle:     b.AuthStyle,
+		ResponsesPath: b.ResponsesPath,
+		ExtraHeaders:  b.ExtraHeaders,
 	}
 	if creating {
 		c.Enabled = true
-		c.AutoBind = true
 		c.Passthrough = true
 		c.Weight = 1
 	}
@@ -217,9 +182,6 @@ func (b *channelBody) toChannel(creating bool) store.Channel {
 	}
 	if b.Weight != nil {
 		c.Weight = *b.Weight
-	}
-	if b.AutoBind != nil {
-		c.AutoBind = *b.AutoBind
 	}
 	if b.SupportsEmbeddings != nil {
 		c.SupportsEmbeddings = *b.SupportsEmbeddings
