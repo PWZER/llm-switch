@@ -117,9 +117,9 @@ func TestModelsPaginationAndContext(t *testing.T) {
 		t.Fatalf("openai shape missing context fields: %s", raw)
 	}
 	// The description marks the source ("[model]" for registry rows) and
-	// names the account that would serve first:
-	// "[model] {provider}/{account}({endpoint})".
-	if !strings.Contains(string(raw), `"description":"[model] fake/k1(fake-openai)"`) {
+	// names the account that would serve first: "[model] {provider}/{account}"
+	// (the channel name is omitted — any live channel can serve the name).
+	if !strings.Contains(string(raw), `"description":"[model] fake/k1"`) {
 		t.Fatalf("openai shape missing provider/account description: %s", raw)
 	}
 	if strings.Contains(string(raw), `"claude-zzz-model"`) {
@@ -166,8 +166,8 @@ func TestModelsDescriptionSourceMarker(t *testing.T) {
 	// OpenAI shape: rows carry "[model] ", route names (pure or dual) "[route] ".
 	_, raw := h.getModels(t, "", false)
 	for _, want := range []string{
-		`"description":"[model] fake/k1(fake-openai)"`,
-		`"description":"[route] fake/k1(fake-openai)"`,
+		`"description":"[model] fake/k1"`,
+		`"description":"[route] fake/k1"`,
 		`"dual-model"`, `"route-only"`,
 	} {
 		if !strings.Contains(string(raw), want) {
@@ -177,7 +177,7 @@ func TestModelsDescriptionSourceMarker(t *testing.T) {
 
 	// Anthropic shape: the claude-* discovery mirrors inherit the marker.
 	_, raw = h.getModels(t, "", true)
-	if !strings.Contains(string(raw), `"description":"[route] fake/k1(fake-openai)"`) {
+	if !strings.Contains(string(raw), `"description":"[route] fake/k1"`) {
 		t.Fatalf("anthropic shape missing [route] description: %s", raw)
 	}
 
@@ -185,7 +185,7 @@ func TestModelsDescriptionSourceMarker(t *testing.T) {
 	for _, shape := range []struct {
 		anthropic bool
 		want      string
-	}{{false, `"description":"[route] fake/k1(fake-openai)"`}, {true, `"description":"[route] fake/k1(fake-openai)"`}} {
+	}{{false, `"description":"[route] fake/k1"`}, {true, `"description":"[route] fake/k1"`}} {
 		req, err := http.NewRequest(http.MethodGet, h.srv.URL+"/v1/models/route-only", nil)
 		must(t, err)
 		req.Header.Set("Authorization", "Bearer "+h.key)
@@ -260,6 +260,107 @@ func TestModelsGetByID(t *testing.T) {
 	raw3 := readAll(t, resp3)
 	if resp3.StatusCode != 404 || !strings.Contains(string(raw3), "invalid_request_error") {
 		t.Fatalf("openai 404 wrong: %d %s", resp3.StatusCode, raw3)
+	}
+}
+
+// TestSurfacePrefixModelsShape: the prefixed mounts make the base_url the
+// shape control point. /anthropic/v1/models renders the full Anthropic shape
+// (decorations included) under bearer-only auth — the Claude Code
+// ANTHROPIC_AUTH_TOKEN case the bare /v1 header sniff mis-serves — and
+// /openai/v1/models stays plain even with sniffed headers present. Bare /v1
+// keeps header sniffing (covered by the other tests in this file).
+func TestSurfacePrefixModelsShape(t *testing.T) {
+	h := newHarness(t)
+	h.seedRegistry()
+
+	// Bearer-only on the anthropic prefix: decorated Anthropic listing.
+	req, err := http.NewRequest(http.MethodGet, h.srv.URL+"/anthropic/v1/models", nil)
+	must(t, err)
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	resp, err := h.client.Do(req)
+	must(t, err)
+	raw := readAll(t, resp)
+	if resp.StatusCode != 200 || !strings.Contains(string(raw), `"type":"model"`) {
+		t.Fatalf("anthropic prefix listing wrong: %d %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), `"claude-zzz-model"`) {
+		t.Fatalf("anthropic prefix must list discovery variants: %s", raw)
+	}
+	if strings.Contains(string(raw), `"object":"list"`) {
+		t.Fatalf("anthropic prefix must not render the openai envelope: %s", raw)
+	}
+
+	// Sniffed headers cannot flip the openai prefix.
+	req, err = http.NewRequest(http.MethodGet, h.srv.URL+"/openai/v1/models", nil)
+	must(t, err)
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	req.Header.Set("x-api-key", h.key)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	resp, err = h.client.Do(req)
+	must(t, err)
+	raw = readAll(t, resp)
+	if resp.StatusCode != 200 || !strings.Contains(string(raw), `"object":"list"`) {
+		t.Fatalf("openai prefix listing wrong: %d %s", resp.StatusCode, raw)
+	}
+	if strings.Contains(string(raw), `"claude-zzz-model"`) {
+		t.Fatalf("openai prefix must stay plain: %s", raw)
+	}
+
+	// By-id: the anthropic prefix serves discovery variants, the openai
+	// prefix 404s them.
+	req, err = http.NewRequest(http.MethodGet, h.srv.URL+"/anthropic/v1/models/claude-zzz-model", nil)
+	must(t, err)
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	resp, err = h.client.Do(req)
+	must(t, err)
+	raw = readAll(t, resp)
+	if resp.StatusCode != 200 || !strings.Contains(string(raw), `"context_length":128000`) {
+		t.Fatalf("anthropic prefix by-id variant wrong: %d %s", resp.StatusCode, raw)
+	}
+	req, err = http.NewRequest(http.MethodGet, h.srv.URL+"/openai/v1/models/claude-zzz-model", nil)
+	must(t, err)
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	resp, err = h.client.Do(req)
+	must(t, err)
+	readAll(t, resp)
+	if resp.StatusCode != 404 {
+		t.Fatalf("openai prefix must not serve variants, got %d", resp.StatusCode)
+	}
+
+	// Auth-failure bodies follow the prefix's shape.
+	req, err = http.NewRequest(http.MethodGet, h.srv.URL+"/anthropic/v1/models", nil)
+	must(t, err)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	resp, err = h.client.Do(req)
+	must(t, err)
+	raw = readAll(t, resp)
+	if resp.StatusCode != 401 || !strings.Contains(string(raw), `"type":"error"`) {
+		t.Fatalf("anthropic prefix auth error shape wrong: %d %s", resp.StatusCode, raw)
+	}
+	req, err = http.NewRequest(http.MethodGet, h.srv.URL+"/openai/v1/models", nil)
+	must(t, err)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	resp, err = h.client.Do(req)
+	must(t, err)
+	raw = readAll(t, resp)
+	if resp.StatusCode != 401 || strings.Contains(string(raw), `"type":"error"`) {
+		t.Fatalf("openai prefix auth error shape wrong: %d %s", resp.StatusCode, raw)
+	}
+}
+
+// TestSurfacePrefixChatEndpoints: the chat surfaces serve under their
+// prefixes exactly as on bare /v1.
+func TestSurfacePrefixChatEndpoints(t *testing.T) {
+	h := newHarness(t)
+
+	_, raw := h.post("/anthropic/v1/messages", `{"model":"claude-test","max_tokens":16,"stream":false}`,
+		map[string]string{"anthropic-version": "2023-06-01"})
+	if !strings.Contains(string(raw), "Hello from fake Anthropic") {
+		t.Fatalf("anthropic prefix messages broken: %s", raw)
+	}
+	_, raw = h.post("/openai/v1/chat/completions", `{"model":"test-model","max_tokens":16,"stream":false}`, nil)
+	if !strings.Contains(string(raw), "Hello from fake OpenAI") {
+		t.Fatalf("openai prefix chat broken: %s", raw)
 	}
 }
 
@@ -420,12 +521,19 @@ func TestContext1mMarker(t *testing.T) {
 		t.Fatalf("kimi-k3[1m] did not route: %s", raw)
 	}
 
-	// Listing: plain + marked + both mirrors on the Anthropic surface only;
-	// the marked entry's display name carries the suffix too.
+	// Listing: a 1M-capable model lists only the [1m] forms on the Anthropic
+	// surface — the marked id and its claude-* mirror; the plain id and its
+	// mirror are superseded (the marked id routes to the same identity via
+	// suffix stripping). The marked entry's display name carries the suffix.
 	_, raw = h.getModels(t, "", true)
-	for _, want := range []string{`"kimi-k3[1m]"`, `"display_name":"kimi-k3[1m]"`, `"claude-kimi-k3[1m]"`, `"claude-kimi-k3"`} {
+	for _, want := range []string{`"id":"kimi-k3[1m]"`, `"display_name":"kimi-k3[1m]"`, `"id":"claude-kimi-k3[1m]"`} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("anthropic listing missing %s: %s", want, raw)
+		}
+	}
+	for _, gone := range []string{`"id":"kimi-k3"`, `"id":"claude-kimi-k3"`} {
+		if strings.Contains(string(raw), gone) {
+			t.Fatalf("anthropic listing must drop the plain 1m forms, found %s: %s", gone, raw)
 		}
 	}
 	_, raw = h.getModels(t, "", false)
@@ -446,6 +554,19 @@ func TestContext1mMarker(t *testing.T) {
 	raw = readAll(h.t, resp)
 	if resp.StatusCode != 200 || !strings.Contains(string(raw), `"context_length":1048576`) {
 		t.Fatalf("marked get-by-id wrong: %d %s", resp.StatusCode, raw)
+	}
+
+	// The plain id is unlisted on the Anthropic surface once the [1m] entry
+	// exists: by-id 404s there too (routing itself still accepts the name).
+	reqPlain, err := http.NewRequest(http.MethodGet, h.srv.URL+"/v1/models/kimi-k3", nil)
+	must(h.t, err)
+	reqPlain.Header.Set("Authorization", "Bearer "+h.key)
+	reqPlain.Header.Set("anthropic-version", "2023-06-01")
+	respPlain, err := h.client.Do(reqPlain)
+	must(h.t, err)
+	readAll(h.t, respPlain)
+	if respPlain.StatusCode != 404 {
+		t.Fatalf("plain 1m id must be unlisted on the anthropic surface, got %d", respPlain.StatusCode)
 	}
 
 	// The log records the canonical bare identity, so the decorated request

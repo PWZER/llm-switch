@@ -129,16 +129,17 @@ func TestSnapshotListFilteringAndProviders(t *testing.T) {
 		t.Fatalf("disabled row must not be listed: %+v", e)
 	}
 
-	// Description renders as "{provider}({endpoint})" — the serving channel
-	// that would handle the name first. A provider-scoped route target
-	// describes the provider's build-order top channel.
+	// Description renders as "{provider}/{account}" — the account that would
+	// serve first; the channel name is intentionally omitted (any live
+	// channel of the provider can serve the name, so naming one reads as a
+	// protocol mark). A provider without enabled accounts is bare.
 	for _, id := range []string{"reg-model", "test-model", "my-route", "auto-route"} {
-		if e := findEntry(snap, id); e != nil && e.Provider != "fake(fake-anthropic)" {
-			t.Fatalf("%s provider = %q, want %q", id, e.Provider, "fake(fake-anthropic)")
+		if e := findEntry(snap, id); e != nil && e.Provider != "fake" {
+			t.Fatalf("%s provider = %q, want %q", id, e.Provider, "fake")
 		}
 	}
-	if e := findEntry(snap, "oai-model"); e != nil && e.Provider != "fake2(fake2-oai)" {
-		t.Fatalf("oai-model provider = %q, want %q", e.Provider, "fake2(fake2-oai)")
+	if e := findEntry(snap, "oai-model"); e != nil && e.Provider != "fake2" {
+		t.Fatalf("oai-model provider = %q, want %q", e.Provider, "fake2")
 	}
 
 	// Row limits survive the merge.
@@ -178,7 +179,7 @@ func TestSnapshotDiscoveryVariants(t *testing.T) {
 		if v.ID != "claude-reg-model" {
 			continue
 		}
-		if v.Provider != "fake(fake-anthropic)" || v.ContextWindow == nil || *v.ContextWindow != 32000 {
+		if v.Provider != "fake" || v.ContextWindow == nil || *v.ContextWindow != 32000 {
 			t.Fatalf("variant metadata not copied: %+v", v)
 		}
 		return
@@ -207,7 +208,7 @@ func TestSnapshotContext1mMarkers(t *testing.T) {
 	if marked == nil {
 		t.Fatal("missing big-model[1m] in snapshot ContextVariants")
 	}
-	if marked.ContextWindow == nil || *marked.ContextWindow != 1048576 || marked.Provider != "fake(fake-anthropic)" {
+	if marked.ContextWindow == nil || *marked.ContextWindow != 1048576 || marked.Provider != "fake" {
 		t.Fatalf("marked entry metadata not copied: %+v", marked)
 	}
 	if marked.DisplayName != "big-model[1m]" {

@@ -126,19 +126,28 @@ dir always fails with "already running".
 
 ### Point your agents at it
 
+Protocol surfaces live under explicit base_url prefixes: `/anthropic` serves the
+Anthropic protocol (its `/v1/models` always lists the Anthropic shape —
+`claude-<id>` discovery mirrors and `[1m]` context entries), `/openai` serves the
+OpenAI protocols (its `/v1/models` stays a plain OpenAI list). The prefix, not
+request headers, decides the shape.
+
 ```bash
 # Claude Code / Anthropic SDK
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8901
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8901/anthropic
 export ANTHROPIC_API_KEY=sk-lsw-...
 
 # OpenAI SDK
-base_url = "http://127.0.0.1:8901/v1"
+base_url = "http://127.0.0.1:8901/openai/v1"
 api_key  = "sk-lsw-..."
 
 # Codex CLI (OpenAI Responses API)
-#   model provider: base_url http://127.0.0.1:8901/v1  (POST /v1/responses)
+#   model provider: base_url http://127.0.0.1:8901/openai/v1  (POST /openai/v1/responses)
 #   stateless only: store=false; previous_response_id / background are rejected
 ```
+
+The unprefixed `/v1/*` paths keep working for existing clients; there the
+`/v1/models` shape is sniffed from the `x-api-key` / `anthropic-version` headers.
 
 Model names resolve after stripping the `[1m]` context marker: model route (provider + upstream model, with optional endpoint/account pins — no pin = auto-select among the provider's enabled endpoints) → models rows → `claude-`-stripped retry → 404.
 

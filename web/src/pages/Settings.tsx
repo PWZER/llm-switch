@@ -118,9 +118,9 @@ export default function Settings() {
       </Card>
 
       <Typography.Paragraph type="secondary" style={{ maxWidth: 560 }}>
-        {t('settings.tip1')} <code>ANTHROPIC_BASE_URL=http://your-host:8901</code> {t('settings.tip2')}{' '}
+        {t('settings.tip1')} <code>ANTHROPIC_BASE_URL=http://your-host:8901/anthropic</code> {t('settings.tip2')}{' '}
         <code>x-api-key</code>; {t('settings.tip3')}{' '}
-        <code>base_url=http://your-host:8901/v1</code>.
+        <code>base_url=http://your-host:8901/openai/v1</code>.
       </Typography.Paragraph>
     </Space>
   );

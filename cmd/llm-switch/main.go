@@ -123,17 +123,33 @@ func run(cfg *config.Config) error {
 	// Data plane: client-key auth (snapshot lookup, no DB on the hot path),
 	// then the gateway routes. NOTE: never wrap /v1 in a Timeout middleware —
 	// it kills long streams.
-	v1 := chi.NewRouter()
-	v1.Use(gateway.ClientKeyAuth(func(key string) (gateway.ClientKeyRecord, bool) {
+	validateKey := func(key string) (gateway.ClientKeyRecord, bool) {
 		snap := holder.Load()
 		if snap == nil {
 			return gateway.ClientKeyRecord{}, false
 		}
 		rec, ok := snap.ClientKeys[engine.HashKey(key)]
 		return gateway.ClientKeyRecord{ID: rec.ID, Name: rec.Name}, ok
-	}))
+	}
+	v1 := chi.NewRouter()
+	v1.Use(gateway.ClientKeyAuth(validateKey))
 	gw.Mount(v1)
 	r.Mount("/v1", v1)
+
+	// Prefixed protocol surfaces: the base_url prefix — not request headers —
+	// pins the /models listing shape and the auth-failure error shape. Claude
+	// Code only exposes ANTHROPIC_BASE_URL, so its models URL is always
+	// <base_url>/v1/models; /anthropic guarantees it the decorated Anthropic
+	// listing. Bare /v1 stays for existing clients (header-sniffed shape).
+	anthroV1 := chi.NewRouter()
+	anthroV1.Use(gateway.ClientKeyAuthFor("anthropic", validateKey))
+	gw.MountAnthropic(anthroV1)
+	r.Mount("/anthropic/v1", anthroV1)
+
+	openaiV1 := chi.NewRouter()
+	openaiV1.Use(gateway.ClientKeyAuthFor("openai", validateKey))
+	gw.MountOpenAI(openaiV1)
+	r.Mount("/openai/v1", openaiV1)
 
 	// Admin API with the post-mutation snapshot reload hook.
 	apiSrv := &api.Server{

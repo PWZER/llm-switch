@@ -17,7 +17,19 @@ type ClientKeyRecord struct {
 // ClientKeyAuth guards the data plane with gateway keys, accepted from
 // `Authorization: Bearer` (OpenAI SDKs) or `x-api-key` (Anthropic SDKs).
 // validate performs the snapshot hash lookup; no DB access on the hot path.
+// The auth-failure error body's shape is guessed from the URL path.
 func ClientKeyAuth(validate func(key string) (ClientKeyRecord, bool)) func(http.Handler) http.Handler {
+	return clientKeyAuth("", validate)
+}
+
+// ClientKeyAuthFor is ClientKeyAuth with the auth-failure error shape pinned
+// to a client surface ("anthropic" or "openai" — the prefixed mounts, where
+// the base_url prefix decides); the empty string guesses from the path.
+func ClientKeyAuthFor(surface string, validate func(key string) (ClientKeyRecord, bool)) func(http.Handler) http.Handler {
+	return clientKeyAuth(surface, validate)
+}
+
+func clientKeyAuth(surface string, validate func(key string) (ClientKeyRecord, bool)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := r.Header.Get("x-api-key")
@@ -27,9 +39,12 @@ func ClientKeyAuth(validate func(key string) (ClientKeyRecord, bool)) func(http.
 			rec, ok := validate(key)
 			if !ok {
 				slog.Warn("client authentication failed", "remote", r.RemoteAddr, "path", r.URL.Path)
-				protocol := protocolOpenAI
-				if strings.Contains(r.URL.Path, "/messages") {
-					protocol = protocolAnthropic
+				protocol := surface
+				if protocol == "" {
+					protocol = protocolOpenAI
+					if strings.Contains(r.URL.Path, "/messages") {
+						protocol = protocolAnthropic
+					}
 				}
 				writeProtocolError(w, r, protocol, http.StatusUnauthorized, "authentication_error", "invalid api key")
 				return

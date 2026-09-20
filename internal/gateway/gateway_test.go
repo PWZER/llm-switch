@@ -90,13 +90,24 @@ func newHarness(t *testing.T) *harness {
 	gw := gateway.New(holder, pool, gateway.NewUpstreamClient(), logger)
 
 	r := chi.NewRouter()
-	v1 := chi.NewRouter()
-	v1.Use(gateway.ClientKeyAuth(func(key string) (gateway.ClientKeyRecord, bool) {
+	validateKey := func(key string) (gateway.ClientKeyRecord, bool) {
 		rec, ok := holder.Load().ClientKeys[engine.HashKey(key)]
 		return gateway.ClientKeyRecord{ID: rec.ID, Name: rec.Name}, ok
-	}))
+	}
+	v1 := chi.NewRouter()
+	v1.Use(gateway.ClientKeyAuth(validateKey))
 	gw.Mount(v1)
 	r.Mount("/v1", v1)
+	// Prefixed mounts mirror main.go: the base_url prefix pins the /models
+	// shape and the auth-failure error shape.
+	anthroV1 := chi.NewRouter()
+	anthroV1.Use(gateway.ClientKeyAuthFor("anthropic", validateKey))
+	gw.MountAnthropic(anthroV1)
+	r.Mount("/anthropic/v1", anthroV1)
+	openaiV1 := chi.NewRouter()
+	openaiV1.Use(gateway.ClientKeyAuthFor("openai", validateKey))
+	gw.MountOpenAI(openaiV1)
+	r.Mount("/openai/v1", openaiV1)
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)

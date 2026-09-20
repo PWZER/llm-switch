@@ -106,16 +106,72 @@ func ValidateClientKey(holder *engine.Holder) func(key string) (engine.ClientKey
 	}
 }
 
+// modelsShape fixes how /models renders its listing: auto sniffs the request
+// headers (bare /v1 mount); the forced shapes belong to the prefixed mounts,
+// where the base_url prefix — not headers — is the shape control point.
+type modelsShape uint8
+
+const (
+	shapeAuto modelsShape = iota
+	shapeAnthropic
+	shapeOpenAI
+)
+
+// anthropic reports whether the request renders the Anthropic shape: forced
+// on the prefixed mounts, header-sniffed on the bare /v1 mount.
+func (shape modelsShape) anthropic(r *http.Request) bool {
+	switch shape {
+	case shapeAnthropic:
+		return true
+	case shapeOpenAI:
+		return false
+	default:
+		return anthropicShapeRequest(r)
+	}
+}
+
+// shapeProtocol picks the error-body protocol of a mount; auto keeps the
+// pre-prefix openai default.
+func shapeProtocol(shape modelsShape) string {
+	if shape == shapeAnthropic {
+		return protocolAnthropic
+	}
+	return protocolOpenAI
+}
+
 // Mount registers the data-plane routes (relative to the mount point, /v1).
-// The caller is responsible for wrapping them with client-key auth.
-func (g *Gateway) Mount(r chi.Router) {
-	r.Post("/chat/completions", g.serve(protocolOpenAI))
-	r.Post("/responses", g.serve(protocolOpenAIResponses))
-	r.Post("/messages", g.serve(protocolAnthropic))
-	r.Post("/messages/count_tokens", g.countTokens)
-	r.Post("/embeddings", g.embeddings)
-	r.Get("/models", g.models)
-	r.Get("/models/{modelID}", g.modelByID)
+// The caller is responsible for wrapping them with client-key auth. The
+// /models shape is sniffed from request headers.
+func (g *Gateway) Mount(r chi.Router) { g.mountRoutes(r, shapeAuto) }
+
+// MountAnthropic registers the Anthropic-protocol surface (messages,
+// count_tokens, models) for the /anthropic base_url prefix; /models always
+// renders the Anthropic shape (claude-* mirrors and [1m] entries included).
+func (g *Gateway) MountAnthropic(r chi.Router) { g.mountRoutes(r, shapeAnthropic) }
+
+// MountOpenAI registers the OpenAI-protocol surface (chat/completions,
+// responses, embeddings, models) for the /openai base_url prefix; /models
+// always renders the plain OpenAI shape.
+func (g *Gateway) MountOpenAI(r chi.Router) { g.mountRoutes(r, shapeOpenAI) }
+
+func (g *Gateway) mountRoutes(r chi.Router, shape modelsShape) {
+	switch shape {
+	case shapeAnthropic:
+		r.Post("/messages", g.serve(protocolAnthropic))
+		r.Post("/messages/count_tokens", g.countTokens)
+	case shapeOpenAI:
+		r.Post("/chat/completions", g.serve(protocolOpenAI))
+		r.Post("/responses", g.serve(protocolOpenAIResponses))
+		r.Post("/embeddings", g.embeddings)
+	default: // shapeAuto: the bare /v1 mount serves every endpoint.
+		r.Post("/chat/completions", g.serve(protocolOpenAI))
+		r.Post("/responses", g.serve(protocolOpenAIResponses))
+		r.Post("/messages", g.serve(protocolAnthropic))
+		r.Post("/messages/count_tokens", g.countTokens)
+		r.Post("/embeddings", g.embeddings)
+	}
+	r.Get("/models", g.modelsWith(shape))
+	r.Get("/models/{modelID}", g.modelByIDWith(shape))
 }
 
 // serve is the shared pipeline for both protocol surfaces.
@@ -362,13 +418,23 @@ func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time
 
 // — /v1/models ------------------------------------------------------------
 
-func (g *Gateway) models(w http.ResponseWriter, r *http.Request) {
+// modelsWith / modelByIDWith bind a mount's modelsShape into the shared
+// models handlers.
+func (g *Gateway) modelsWith(shape modelsShape) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { g.models(shape, w, r) }
+}
+
+func (g *Gateway) modelByIDWith(shape modelsShape) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { g.modelByID(shape, w, r) }
+}
+
+func (g *Gateway) models(shape modelsShape, w http.ResponseWriter, r *http.Request) {
 	snap := g.Holder.Load()
 	if snap == nil {
-		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "gateway is starting")
+		writeProtocolError(w, r, shapeProtocol(shape), http.StatusServiceUnavailable, "api_error", "gateway is starting")
 		return
 	}
-	anthropicShape := anthropicShapeRequest(r)
+	anthropicShape := shape.anthropic(r)
 	nowS := time.Now().Unix()
 	nowRFC := time.Now().UTC().Format(time.RFC3339)
 
@@ -448,15 +514,16 @@ func (g *Gateway) models(w http.ResponseWriter, r *http.Request) {
 }
 
 // modelByID serves GET /v1/models/{id} in the client's surface shape.
-func (g *Gateway) modelByID(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) modelByID(shape modelsShape, w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "modelID")
 	snap := g.Holder.Load()
 	if snap == nil {
-		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "gateway is starting")
+		writeProtocolError(w, r, shapeProtocol(shape), http.StatusServiceUnavailable, "api_error", "gateway is starting")
 		return
 	}
+	anthropicShape := shape.anthropic(r)
 	models := snap.Models
-	if anthropicShapeRequest(r) {
+	if anthropicShape {
 		// anthropicListing copies before extending: the snapshot slices are
 		// shared across requests.
 		models = anthropicListing(snap)
@@ -465,7 +532,7 @@ func (g *Gateway) modelByID(w http.ResponseWriter, r *http.Request) {
 		if m.ID != id {
 			continue
 		}
-		if anthropicShapeRequest(r) {
+		if anthropicShape {
 			body := map[string]any{
 				"type": "model", "id": m.ID,
 				"display_name":      orDefault(m.DisplayName, m.ID),
@@ -491,7 +558,7 @@ func (g *Gateway) modelByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proto := protocolOpenAI
-	if anthropicShapeRequest(r) {
+	if anthropicShape {
 		proto = protocolAnthropic
 	}
 	writeModelNotFound(w, r, proto, id)
@@ -513,13 +580,31 @@ func modelDescription(m engine.ModelEntry) string {
 
 // anthropicListing merges the plain list with the [1m] context variants and
 // the claude-* discovery variants for the Anthropic-shaped surface. Returns a
-// fresh slice: the snapshot fields are shared across requests.
+// fresh slice: the snapshot fields are shared across requests. A model whose
+// [1m] variant exists lists only the marked forms — the plain id and its
+// claude-* mirror are superseded (the marked id routes to the same identity
+// via suffix stripping).
 func anthropicListing(snap *engine.Snapshot) []engine.ModelEntry {
+	marked := make(map[string]bool, len(snap.ContextVariants))
+	for _, m := range snap.ContextVariants {
+		marked[strings.TrimSuffix(m.ID, engine.Context1mSuffix)] = true
+	}
 	out := make([]engine.ModelEntry, 0,
 		len(snap.Models)+len(snap.ContextVariants)+len(snap.DiscoveryVariants))
-	out = append(out, snap.Models...)
+	for _, m := range snap.Models {
+		if marked[m.ID] {
+			continue
+		}
+		out = append(out, m)
+	}
 	out = append(out, snap.ContextVariants...)
-	out = append(out, snap.DiscoveryVariants...)
+	for _, m := range snap.DiscoveryVariants {
+		if !strings.HasSuffix(m.ID, engine.Context1mSuffix) &&
+			marked[strings.TrimPrefix(strings.TrimSuffix(m.ID, engine.Context1mSuffix), "claude-")] {
+			continue // plain mirror of a [1m]-marked model
+		}
+		out = append(out, m)
+	}
 	return out
 }
 

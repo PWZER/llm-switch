@@ -62,10 +62,10 @@ type Candidate struct {
 }
 
 const (
-	// context1mSuffix is Claude Code's 1M-context marker: listed ids carry it,
+	// Context1mSuffix is Claude Code's 1M-context marker: listed ids carry it,
 	// but clients strip it before requesting, so it is never part of a
 	// routing identity — Resolve normalizes it away.
-	context1mSuffix = "[1m]"
+	Context1mSuffix = "[1m]"
 	// context1mThreshold is the registry context window from which a listed
 	// model also gets a "<id>[1m]" listing entry.
 	context1mThreshold int64 = 1_000_000
@@ -287,7 +287,7 @@ func (p *Provider) account(id int64) *Account {
 // claude-* mirrors, prefix-stripped) row name for row hits — for attribution
 // and usage logging; empty when not found.
 func (s *Snapshot) Resolve(requested, preferProtocol string) ([]Candidate, string, bool) {
-	requested = strings.TrimSuffix(requested, context1mSuffix)
+	requested = strings.TrimSuffix(requested, Context1mSuffix)
 	if rt, ok := s.Routes[requested]; ok {
 		if cands := s.routeChain(rt, preferProtocol); len(cands) > 0 {
 			return cands, rt.Name, true
@@ -486,13 +486,13 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	// providers: listed ⇔ routable. Rows arrive ORDER BY id, provider_id, and
 	// later duplicates only fill fields the first row left blank —
 	// deterministic.
-	// describe renders the entry description as "{provider}/{account}({endpoint})",
-	// using the channel that would serve the name first (route target, else
-	// top row candidate — same precedence as Resolve) and the account that
-	// would serve first: the route target's pinned account, else the first
-	// enabled account of the channel's provider. A provider without enabled
-	// accounts degrades to "{provider}({endpoint})"; names no channel serves
-	// fall back to the row's provider name, then "".
+	// describe renders the entry description as "{provider}/{account}" using
+	// the account that would serve first: the route target's pinned account,
+	// else the first enabled account of the serving provider. The channel
+	// name is deliberately omitted — every live channel of the provider can
+	// serve the name, so naming the first one reads as a protocol mark. A
+	// provider without enabled accounts degrades to "{provider}"; names no
+	// channel serves fall back to the row's provider name, then "".
 	describe := func(name string, providerID int64) string {
 		render := func(ch *Channel, pinned *Account) string {
 			p := ch.Provider
@@ -504,9 +504,9 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 				acc = &p.Accounts[0]
 			}
 			if acc == nil {
-				return p.Name + "(" + ch.Name + ")"
+				return p.Name
 			}
-			return p.Name + "/" + acc.DisplayName() + "(" + ch.Name + ")"
+			return p.Name + "/" + acc.DisplayName()
 		}
 		if rt, ok := snap.Routes[name]; ok {
 			for _, tgt := range rt.Targets {
@@ -599,10 +599,10 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 		if !snap.anthropicServed(e.ID) {
 			continue
 		}
-		if strings.HasSuffix(e.ID, context1mSuffix) {
+		if strings.HasSuffix(e.ID, Context1mSuffix) {
 			continue // already decorated; never double-mark
 		}
-		id := e.ID + context1mSuffix
+		id := e.ID + Context1mSuffix
 		if existingIDs[id] {
 			continue
 		}
@@ -612,7 +612,7 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 		// distinguishable from the plain one in pickers that render it; an
 		// empty name falls back to the (already suffixed) id at render time.
 		if e.DisplayName != "" {
-			e.DisplayName += context1mSuffix
+			e.DisplayName += Context1mSuffix
 		}
 		snap.ContextVariants = append(snap.ContextVariants, e)
 	}
@@ -635,7 +635,7 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	for _, e := range mirrored {
 		// Gating keys on the bare (routable) name: marked ids are not in the
 		// routing maps themselves.
-		if !snap.anthropicServed(strings.TrimSuffix(e.ID, context1mSuffix)) {
+		if !snap.anthropicServed(strings.TrimSuffix(e.ID, Context1mSuffix)) {
 			continue
 		}
 		lower := strings.ToLower(e.ID)

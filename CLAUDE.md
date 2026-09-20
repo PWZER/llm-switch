@@ -5,7 +5,9 @@ Guidance for Claude Code sessions working in this repository.
 ## Project Overview
 
 llm-switch is a self-hosted unified LLM API gateway. It exposes OpenAI chat, OpenAI
-Responses, and Anthropic API surfaces on one port, routes requests to upstream vendors
+Responses, and Anthropic API surfaces on one port under explicit protocol base_url
+prefixes (`/openai/v1/*`, `/anthropic/v1/*`; unprefixed `/v1/*` kept for existing
+clients), routes requests to upstream vendors
 (DeepSeek, Zhipu GLM, Kimi/Moonshot, Kimi For Coding, or any generic OpenAI/Anthropic-compatible
 endpoint), converts across protocols when needed, transparently passes bytes through when
 wire shapes match, and records usage stats for every request. It also probes per-account
@@ -133,18 +135,28 @@ no enabled row and no route is neither listed nor routable. Model routes are
 listed in `GET /v1/models` on both surfaces; route
 names are canonical — the admin API rejects the `[1m]` suffix.
 
+Protocol surfaces mount under explicit base_url prefixes: `/anthropic/v1/*`
+(messages, count_tokens, models) and `/openai/v1/*` (chat/completions, responses,
+embeddings, models) pin both the `/v1/models` listing shape and the auth-failure
+error shape to the prefix (`Gateway.MountAnthropic` / `MountOpenAI` +
+`ClientKeyAuthFor` in the gateway package) — the base_url, not request headers,
+is the shape control point (Claude Code only exposes `ANTHROPIC_BASE_URL`, so
+its models URL is always `<base_url>/v1/models`). The unprefixed `/v1` mount
+keeps serving every endpoint with the historical header-sniffed models shape
+(`anthropicShapeRequest`: `x-api-key` or `anthropic-version` → Anthropic shape).
+
 GET /v1/models visibility rules: listed ⇔ routable — the merged list dedupes
 by name over enabled models rows on live providers (later duplicates only fill
 blank metadata), plus model route names. Disabling a row removes both its
 list entry and its candidacy. Each entry carries `description` =
-`{[route] |[model] }{provider}/{account}({endpoint})` — an explicit source
+`{[route] |[model] }{provider}/{account}` — an explicit source
 marker (`[route] ` for model-route entries, including names that also have a
 models row since the route wins at resolve time; `[model] ` for plain
-registry rows), the provider, the account that would serve
+registry rows), the provider, and the account that would serve
 first (route-pinned, else the first enabled account; omitted when the provider
-has none), and the channel that would serve
-the name first (route target, else top row candidate, same precedence as
-Resolve); names no channel serves fall back to the row's provider
+has none). The channel name is deliberately omitted — every live channel of
+the provider can serve the name, so naming the first one reads as a protocol
+mark; names no channel serves fall back to the row's provider
 name — Claude Code's /model picker renders it instead of
 "From gateway". Claude Code's gateway discovery
 silently drops ids without a claude/anthropic substring (verified on 2.1.273),
@@ -152,10 +164,15 @@ so the Anthropic-shaped /v1/models additionally lists synthetic `claude-<id>`
 mirrors (`snap.DiscoveryVariants`, provider + limits copied, collisions
 skipped). Both decoration families — `claude-<id>` mirrors and `<id>[1m]`
 context entries (`snap.ContextVariants`, derived from the merged
-`context_window >= 1,000,000`; both plain and decorated ids stay listed) —
+`context_window >= 1,000,000`) —
 are generated only for **anthropic-served** names (>= 1 live anthropic
 channel via models rows or route targets) and emitted only on the Anthropic
-shape; `context_window` on the models row is the only control point.
+shape; `context_window` on the models row is the only control point. The
+`claude-` mirror and the `[1m]` marker are independent: every anthropic-served
+name is mirrored, and a 1m-capable name lists **only the marked forms** —
+`anthropicListing` drops the plain id and its plain `claude-<id>` mirror once
+the `[1m]` variant exists (the marked id routes to the same identity via
+suffix stripping, and by-id lookups follow the listing).
 Routing accepts `claude-<name>` by stripping the prefix as the last fallback
 (after literal `claude-*` routes and rows) so client caches keep
 working. `request_logs.model` records the canonical resolved name (post
