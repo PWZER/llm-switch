@@ -233,14 +233,16 @@ func TestSnapshotContext1mMarkers(t *testing.T) {
 func TestResolveBaseline(t *testing.T) {
 	snap := newTestSnapshot(t)
 
-	// The model route resolves with its name; model rows resolve without.
+	// Every found branch returns the canonical client-facing name: the
+	// route's own name for route hits, the bare (marker/prefix-stripped)
+	// row name for row hits.
 	if cands, name, ok := snap.Resolve("my-route", "anthropic"); !ok || name != "my-route" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
 		t.Fatalf("route resolve broken: %v %q %v", cands, name, ok)
 	}
-	if cands, _, ok := snap.Resolve("test-model", "anthropic"); !ok ||
+	if cands, name, ok := snap.Resolve("test-model", "anthropic"); !ok || name != "test-model" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
-		t.Fatalf("row resolve broken: %v %v", cands, ok)
+		t.Fatalf("row resolve broken: %v %q %v", cands, name, ok)
 	}
 
 	// A disabled row is unroutable: listed ⇔ routable.
@@ -251,13 +253,13 @@ func TestResolveBaseline(t *testing.T) {
 	// claude-* requests route to the stripped row name (client caches that
 	// learned claude-* naming keep working), while claude-* must never invent
 	// a route for an unknown base name.
-	if cands, _, ok := snap.Resolve("claude-test", "anthropic"); !ok ||
+	if cands, name, ok := snap.Resolve("claude-test", "anthropic"); !ok || name != "claude-test" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
-		t.Fatalf("literal claude row must win: %v %v", cands, ok)
+		t.Fatalf("literal claude row must win: %v %q %v", cands, name, ok)
 	}
-	if cands, _, ok := snap.Resolve("claude-test-model", "anthropic"); !ok ||
+	if cands, name, ok := snap.Resolve("claude-test-model", "anthropic"); !ok || name != "test-model" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
-		t.Fatalf("stripped row must route: %v %v", cands, ok)
+		t.Fatalf("stripped row must route: %v %q %v", cands, name, ok)
 	}
 	if _, _, ok := snap.Resolve("claude-nope", "anthropic"); ok {
 		t.Fatal("stripped unknown name must not resolve")
@@ -273,13 +275,13 @@ func TestResolveBaseline(t *testing.T) {
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
 		t.Fatalf("[1m]-suffixed route resolve broken: %v %q %v", cands, name, ok)
 	}
-	if cands, _, ok := snap.Resolve("test-model[1m]", "anthropic"); !ok ||
+	if cands, name, ok := snap.Resolve("test-model[1m]", "anthropic"); !ok || name != "test-model" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
-		t.Fatalf("[1m]-suffixed row resolve broken: %v %v", cands, ok)
+		t.Fatalf("[1m]-suffixed row resolve broken: %v %q %v", cands, name, ok)
 	}
-	if cands, _, ok := snap.Resolve("claude-test[1m]", "anthropic"); !ok ||
+	if cands, name, ok := snap.Resolve("claude-test[1m]", "anthropic"); !ok || name != "claude-test" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
-		t.Fatalf("literal claude row must win after marker strip: %v %v", cands, ok)
+		t.Fatalf("literal claude row must win after marker strip: %v %q %v", cands, name, ok)
 	}
 
 	// claude- stripping now checks routes before rows, so the listed

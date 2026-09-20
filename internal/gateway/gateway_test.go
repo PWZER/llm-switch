@@ -265,6 +265,95 @@ func TestRoutePinnedAccount(t *testing.T) {
 
 func boolp(b bool) *bool { return &b }
 
+// TestLogModelCanonicalization: request_logs.model records the canonical
+// resolved identity — the bare row name for models rows (claude-* mirrors
+// and [1m] markers normalized away), the route's own name for route hits
+// (literal claude-* routes keep their name) — while unroutable names log
+// verbatim for debugging.
+func TestLogModelCanonicalization(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	// A literal claude-* route and a plain route, both on the openai fake.
+	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name:    "claude-special",
+		Targets: []store.ModelRouteTarget{{ChannelID: 1, UpstreamModel: "fake-chat"}},
+	}))
+	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name:    "my-route",
+		Targets: []store.ModelRouteTarget{{ChannelID: 1, UpstreamModel: "fake-chat"}},
+	}))
+	h.rebuild()
+
+	anthroHeaders := map[string]string{"anthropic-version": "2023-06-01"}
+	type req struct {
+		path, body string
+		headers    map[string]string
+	}
+	requests := []req{
+		// Row hit, literal name.
+		{"/v1/chat/completions", `{"model":"test-model","stream":false}`, nil},
+		// Row hits via the claude-* mirror and via the [1m] marker.
+		{"/v1/messages", `{"model":"claude-test-model","max_tokens":16,"stream":false}`, anthroHeaders},
+		{"/v1/messages", `{"model":"test-model[1m]","max_tokens":16,"stream":false}`, anthroHeaders},
+		// Literal claude-* route keeps its own name; the claude-<route>
+		// mirror resolves to the bare route name.
+		{"/v1/chat/completions", `{"model":"claude-special","stream":false}`, nil},
+		{"/v1/chat/completions", `{"model":"claude-my-route","stream":false}`, nil},
+		// Unroutable: the raw name is logged as sent.
+		{"/v1/messages", `{"model":"claude-nonexistent","max_tokens":16,"stream":false}`, anthroHeaders},
+	}
+	for _, rq := range requests {
+		wantStatus := 200
+		if strings.Contains(rq.body, "nonexistent") {
+			wantStatus = 404
+		}
+		resp, raw := h.post(rq.path, rq.body, rq.headers)
+		if resp.StatusCode != wantStatus {
+			t.Fatalf("%s %s: status %d: %s", rq.path, rq.body, resp.StatusCode, raw)
+		}
+	}
+
+	// Log writes flush on a 200ms batch — poll briefly for all six rows.
+	var total int
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var err error
+		_, total, err = h.st.Logs.QueryLogs(ctx, store.LogFilter{})
+		must(t, err)
+		if total == len(requests) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if total != len(requests) {
+		t.Fatalf("expected %d log rows, got %d", len(requests), total)
+	}
+
+	for _, want := range []struct {
+		model         string
+		count         int
+		success       bool
+		upstreamModel string
+	}{
+		{"test-model", 3, true, "fake-chat"},
+		{"claude-special", 1, true, "fake-chat"},
+		{"my-route", 1, true, "fake-chat"},
+		{"claude-nonexistent", 1, false, ""},
+	} {
+		rows, _, err := h.st.Logs.QueryLogs(ctx, store.LogFilter{Model: want.model})
+		must(t, err)
+		if len(rows) != want.count {
+			t.Fatalf("model %q: expected %d log rows, got %d", want.model, want.count, len(rows))
+		}
+		for _, l := range rows {
+			if l.Model != want.model || l.Success != want.success || l.UpstreamModel != want.upstreamModel {
+				t.Fatalf("model %q: log row wrong: %+v", want.model, l)
+			}
+		}
+	}
+}
+
 func TestOpenAIPassthroughStream(t *testing.T) {
 	h := newHarness(t)
 	resp, raw := h.post("/v1/chat/completions", `{"model":"test-model","stream":true}`, nil)

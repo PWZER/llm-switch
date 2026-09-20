@@ -149,11 +149,15 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			return
 		}
 		ck, _ := ClientKeyFrom(r.Context())
-		cands, _, found := snap.Resolve(model, surfaceProtocol(clientProtocol))
+		cands, canonical, found := snap.Resolve(model, surfaceProtocol(clientProtocol))
+		// request_logs.model records the canonical resolved identity so
+		// decorated discovery ids (claude-* mirrors, [1m] markers) coalesce;
+		// client-facing strings keep the raw name.
+		logModel := orDefault(canonical, model)
 		if !found {
 			slog.Warn("model not found",
 				"model", model, "protocol", clientProtocol, "client_key", ck.Name)
-			g.recordFailure(r, start, ck, model, "", clientProtocol, stream, http.StatusNotFound, "model_not_found", 1, nil)
+			g.recordFailure(r, start, ck, logModel, "", clientProtocol, stream, http.StatusNotFound, "model_not_found", 1, nil)
 			writeModelNotFound(w, r, clientProtocol, model)
 			return
 		}
@@ -185,7 +189,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				continue
 			}
 			if err != nil {
-				g.recordFailure(r, start, ck, model, cand.UpstreamModel, clientProtocol, stream,
+				g.recordFailure(r, start, ck, logModel, cand.UpstreamModel, clientProtocol, stream,
 					http.StatusServiceUnavailable, "no_accounts", i+1, nil)
 				writeProtocolError(w, r, clientProtocol, http.StatusServiceUnavailable,
 					"api_error", "provider "+prov.Name+" has no enabled accounts")
@@ -204,7 +208,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			if perr != nil {
 				slog.Warn("request preparation failed", "channel", cand.Channel.Name,
 					"model", model, "err", perr)
-				g.recordFailure(r, start, ck, model, cand.UpstreamModel, clientProtocol, stream,
+				g.recordFailure(r, start, ck, logModel, cand.UpstreamModel, clientProtocol, stream,
 					http.StatusBadRequest, "invalid_request", i+1, lastAccount)
 				status := http.StatusBadRequest
 				_, isBad := perr.(errBadRequest)
@@ -255,7 +259,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				continue
 			default:
 				// Committed: 2xx relayed, non-retriable 4xx/5xx passed through.
-				g.commit(w, r, start, resp, cand, account, ck, model,
+				g.commit(w, r, start, resp, cand, account, ck, model, logModel,
 					clientProtocol, stream, lastStatus, lastErrType, i+1)
 				return
 			}
@@ -269,7 +273,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 		slog.Error("all upstream candidates failed", "model", model,
 			"client_key", ck.Name, "attempts", maxAttempts,
 			"last_status", status, "error_type", orDefault(lastErrType, "upstream_error"))
-		g.recordFailure(r, start, ck, model, lastUpstream, clientProtocol, stream, status, orDefault(lastErrType, "upstream_error"), maxAttempts, lastAccount)
+		g.recordFailure(r, start, ck, logModel, lastUpstream, clientProtocol, stream, status, orDefault(lastErrType, "upstream_error"), maxAttempts, lastAccount)
 		writeUpstreamError(w, r, clientProtocol, status, lastErrBody)
 	}
 }
@@ -308,10 +312,11 @@ func responsesPassthroughPath(clientProtocol string, ch *engine.Channel) string 
 }
 
 // commit relays a successful (or non-retriable) upstream response to the client
-// and records the request log entry.
+// and records the request log entry. model seeds the client-facing echo in
+// converted relays; logModel (the canonical resolved name) feeds the log.
 func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time,
 	resp *http.Response, cand engine.Candidate, acc engine.Account, ck engine.ClientKey,
-	model, clientProtocol string, stream bool,
+	model, logModel, clientProtocol string, stream bool,
 	prevStatus int, prevErrType string, attempts int) {
 
 	var (
@@ -350,7 +355,7 @@ func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time
 		errType = prevErrType + "+" + errType
 	}
 	_ = prevStatus
-	g.logRequest(r, start, ck, model, cand, &acc, clientProtocol, stream,
+	g.logRequest(r, start, ck, logModel, cand, &acc, clientProtocol, stream,
 		resp.StatusCode, success, errType, attempts, usage, ttft)
 	g.Pool.Report(acc.ID, OutcomeOK, 0)
 }
@@ -619,7 +624,8 @@ func (g *Gateway) embeddings(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "gateway is starting")
 		return
 	}
-	cands, _, found := snap.Resolve(model, protocolOpenAI)
+	cands, canonical, found := snap.Resolve(model, protocolOpenAI)
+	logModel := orDefault(canonical, model)
 	if !found {
 		writeModelNotFound(w, r, protocolOpenAI, model)
 		return
@@ -655,7 +661,7 @@ func (g *Gateway) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	usage, rerr := relayNonStream(w, r, resp, protocolOpenAI)
 	ck, _ := ClientKeyFrom(r.Context())
-	g.logRequest(r, start, ck, model, *cand, &account, protocolOpenAI, false,
+	g.logRequest(r, start, ck, logModel, *cand, &account, protocolOpenAI, false,
 		resp.StatusCode, rerr == nil && resp.StatusCode < 400, errorTypeFor(rerr, resp.StatusCode), 1, usage, nil)
 }
 

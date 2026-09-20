@@ -382,19 +382,25 @@ func TestContext1mMarker(t *testing.T) {
 		t.Fatalf("marked get-by-id wrong: %d %s", resp.StatusCode, raw)
 	}
 
-	// The log records the name as received, with the routed upstream model
+	// The log records the canonical bare identity, so the decorated request
+	// forms (claude-* mirror, [1m] marker) coalesce into one model row
 	// (log writes flush on a 200ms batch — poll briefly).
 	var logs []store.RequestLog
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		logs, _, err = h.st.Logs.QueryLogs(ctx, store.LogFilter{Model: "claude-kimi-k3"})
+		logs, _, err = h.st.Logs.QueryLogs(ctx, store.LogFilter{Model: "kimi-k3"})
 		must(h.t, err)
-		if len(logs) == 1 {
+		if len(logs) == 2 {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if len(logs) != 1 || logs[0].UpstreamModel != "fake-chat" {
-		t.Fatalf("log row wrong: %+v", logs)
+	if len(logs) != 2 {
+		t.Fatalf("expected 2 canonical log rows, got %d", len(logs))
+	}
+	for _, l := range logs {
+		if l.UpstreamModel != "fake-chat" || !l.Success {
+			t.Fatalf("log row wrong: %+v", l)
+		}
 	}
 }
