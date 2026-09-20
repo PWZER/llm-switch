@@ -232,3 +232,103 @@ export interface RequestLog {
   latency_ms: number;
   first_token_ms: number | null;
 }
+
+// — configuration export / import -------------------------------------------
+
+export const CONFIG_EXPORT_SECTIONS = ['providers', 'model_routes', 'api_keys', 'settings'] as const;
+export type ConfigSection = (typeof CONFIG_EXPORT_SECTIONS)[number];
+
+export interface ExportAccount {
+  label: string;
+  /** Plaintext upstream key; omitted when the export excluded account keys. */
+  api_key?: string;
+  weight: number;
+  enabled: boolean;
+  usage_probes: UsageProbe[];
+}
+
+export interface ExportChannel {
+  name: string;
+  protocol: 'openai' | 'anthropic';
+  base_url: string;
+  chat_path: string;
+  responses_path: string | null;
+  auth_style: 'bearer' | 'x-api-key';
+  extra_headers: string;
+  enabled: boolean;
+  priority: number;
+  weight: number;
+  supports_embeddings: boolean;
+  passthrough: boolean;
+  force_upstream_stream: boolean;
+}
+
+export interface ExportModel {
+  id: string;
+  upstream_model: string;
+  display_name: string;
+  context_window: number | null;
+  max_output_tokens: number | null;
+  enabled: boolean;
+}
+
+/** One provider with its full dependency subtree (accounts/channels/models). */
+export interface ExportProvider {
+  name: string;
+  models_url: string | null;
+  enabled: boolean;
+  /** Empty subtrees are omitted by the exporter. */
+  accounts?: ExportAccount[];
+  channels?: ExportChannel[];
+  models?: ExportModel[];
+}
+
+export interface ExportRouteTarget {
+  /** Provider name; channel/account pins reference names within it. */
+  provider: string;
+  channel: string | null;
+  account_label: string | null;
+  upstream_model: string;
+}
+
+export interface ExportRoute {
+  name: string;
+  targets: ExportRouteTarget[];
+}
+
+export interface ExportAPIKey {
+  name: string;
+  /** Stored sha256 hex; re-importing it keeps the client key valid. */
+  key_hash: string;
+  prefix: string;
+  enabled: boolean;
+  token_limit: number | null;
+  expires_at: number | null;
+}
+
+/** Whole export document: natural names only, no DB-local ids. */
+export interface ConfigExport {
+  version: number;
+  exported_at?: string;
+  providers?: ExportProvider[];
+  model_routes?: ExportRoute[];
+  api_keys?: ExportAPIKey[];
+  settings?: Record<string, string>;
+}
+
+export interface ImportCounts {
+  created: number;
+  updated: number;
+  skipped: number;
+}
+
+export interface ImportResult {
+  providers: ImportCounts;
+  accounts: ImportCounts;
+  channels: ImportCounts;
+  models: ImportCounts;
+  model_routes: ImportCounts;
+  api_keys: ImportCounts;
+  settings: ImportCounts;
+  warnings: string[];
+}

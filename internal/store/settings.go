@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 )
 
 // SettingsRepo manages the flat key/value settings table.
@@ -80,4 +81,51 @@ func (r *SettingsRepo) SetMany(ctx context.Context, kv map[string]string) error 
 		}
 	}
 	return tx.Commit()
+}
+
+// AdminSettingKeys is the admin-editable allowlist: key -> value kind.
+// The admin password and anything secret deliberately live outside this
+// table; internal keys (seeded_providers, auto_bind_new_models) are not in
+// the allowlist and can never pass through SanitizeAdminSettings.
+var AdminSettingKeys = map[string]string{
+	"retention_days":        "int",
+	"max_failover_attempts": "int",
+	"default_max_tokens":    "int",
+	"stream_idle_timeout_s": "int",
+	"log_bodies":            "bool",
+}
+
+// SanitizeAdminSettings filters raw key/value pairs down to the allowlist.
+// Known keys with values of the right kind pass through unchanged; unknown
+// (or internal) keys are dropped and reported in the returned warnings; a
+// known key with a value of the wrong kind is a hard error. Warnings are
+// emitted in sorted key order for deterministic output.
+func SanitizeAdminSettings(values map[string]string) (map[string]string, []string, error) {
+	clean := map[string]string{}
+	var warnings []string
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := values[k]
+		kind, ok := AdminSettingKeys[k]
+		if !ok {
+			warnings = append(warnings, fmt.Sprintf("setting %q is not importable — skipped", k))
+			continue
+		}
+		var err error
+		switch kind {
+		case "int":
+			_, err = strconv.Atoi(v)
+		case "bool":
+			_, err = strconv.ParseBool(v)
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("setting %q must be a %s", k, kind)
+		}
+		clean[k] = v
+	}
+	return clean, warnings, nil
 }

@@ -2,20 +2,10 @@ package api
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/PWZER/llm-switch/internal/httpx"
+	"github.com/PWZER/llm-switch/internal/store"
 )
-
-// settingKeys is the editable allowlist. admin password and anything secret
-// deliberately live outside this table.
-var settingKeys = map[string]string{
-	"retention_days":        "int",
-	"max_failover_attempts": "int",
-	"default_max_tokens":    "int",
-	"stream_idle_timeout_s": "int",
-	"log_bodies":            "bool",
-}
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, req *http.Request) {
 	all, err := s.St.Settings.GetAll(req.Context())
@@ -25,7 +15,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, req *http.Request) {
 	}
 	// Only expose the allowlisted, non-secret settings.
 	out := map[string]string{}
-	for k := range settingKeys {
+	for k := range store.AdminSettingKeys {
 		if v, ok := all[k]; ok {
 			out[k] = v
 		}
@@ -38,26 +28,16 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, req *http.Request) {
 	if !readJSON(w, req, &body) {
 		return
 	}
-	filtered := map[string]string{}
-	for k, v := range body {
-		kind, ok := settingKeys[k]
-		if !ok {
+	for k := range body {
+		if _, ok := store.AdminSettingKeys[k]; !ok {
 			httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40003, "unknown setting: "+k)
 			return
 		}
-		switch kind {
-		case "int":
-			if _, err := strconv.Atoi(v); err != nil {
-				httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, k+" must be an integer")
-				return
-			}
-		case "bool":
-			if _, err := strconv.ParseBool(v); err != nil {
-				httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, k+" must be a boolean")
-				return
-			}
-		}
-		filtered[k] = v
+	}
+	filtered, _, err := store.SanitizeAdminSettings(body)
+	if err != nil {
+		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, err.Error())
+		return
 	}
 	if len(filtered) == 0 {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40001, "no settings provided")

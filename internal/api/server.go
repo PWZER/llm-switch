@@ -178,6 +178,9 @@ func (s *Server) mountProtected(pr chi.Router) {
 	pr.Put("/client-keys/{id}", s.handleUpdateClientKey)
 	pr.Delete("/client-keys/{id}", s.handleDeleteClientKey)
 
+	pr.Post("/config/export", s.handleConfigExport)
+	pr.Post("/config/import", s.handleConfigImport)
+
 	pr.Get("/logs", s.handleListLogs)
 	pr.Get("/stats/overview", s.handleStatsOverview)
 	pr.Get("/stats/timeseries", s.handleStatsTimeseries)
@@ -191,7 +194,12 @@ func mapStoreErr(w http.ResponseWriter, req *http.Request, err error) {
 
 // readJSON decodes a JSON request body into v with a sane size limit.
 func readJSON(w http.ResponseWriter, req *http.Request, v any) bool {
-	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, 1<<20))
+	return readJSONLimit(w, req, v, 1<<20)
+}
+
+// readJSONLimit decodes a JSON request body into v with an explicit size cap.
+func readJSONLimit(w http.ResponseWriter, req *http.Request, v any, maxBytes int64) bool {
+	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxBytes))
 	if err != nil {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40001, "read body: "+err.Error())
 		return false
