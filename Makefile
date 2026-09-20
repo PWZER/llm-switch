@@ -14,6 +14,9 @@ frontend:
 build: frontend
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/llm-switch ./cmd/llm-switch
 
+install: build
+	cp -rf bin/llm-switch ~/.local/bin/llm-switch
+
 test:
 	go test ./... -race
 
