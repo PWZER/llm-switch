@@ -4,21 +4,11 @@ import {
   Table, Tag, Typography,
 } from 'antd';
 import { PlusOutlined, SyncOutlined } from '@ant-design/icons';
-import { api, Account, Channel, Model, Provider } from '../api/client';
+import { api, Channel, Model, Provider } from '../api/client';
 import { useLang } from '../i18n/i18n';
 import { ProviderLogo } from '../components/logo';
-
-// Token counts render in compact K/M units (1024-base, the convention for
-// context windows: 131072 -> 128K, 1048576 -> 1M). Display only — the raw
-// value stays editable in the form.
-const formatTokens = (v: number | null): string => {
-  if (v == null) return '-';
-  const trim = (n: number): string =>
-    Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
-  if (v >= 1024 * 1024) return `${trim(v / (1024 * 1024))}M`;
-  if (v >= 1024) return `${trim(v / 1024)}K`;
-  return String(v);
-};
+import ModelPickerDrawer from '../components/ModelPickerDrawer';
+import { formatTokens } from '../components/ModelSelectList';
 
 interface ModelFormValues {
   id: string;
@@ -83,46 +73,9 @@ export default function Models() {
     load();
   };
 
-  // Fetch a provider's upstream model list. The account authenticating the
-  // upstream call is chosen explicitly — there is no silent default.
-  const [fetchOpen, setFetchOpen] = useState(false);
-  const [fetching, setFetching] = useState(false);
-  const [fetchProvider, setFetchProvider] = useState<number | undefined>();
-  const [fetchAccounts, setFetchAccounts] = useState<Account[]>([]);
-  const [fetchAccount, setFetchAccount] = useState<number | undefined>();
-
-  useEffect(() => {
-    if (fetchProvider == null) {
-      setFetchAccounts([]);
-      setFetchAccount(undefined);
-      return;
-    }
-    api.get<Account[]>(`/api/v1/providers/${fetchProvider}/accounts`)
-      .then((list) => {
-        const enabled = (list ?? []).filter((a) => a.enabled);
-        setFetchAccounts(list ?? []);
-        setFetchAccount(enabled[0]?.id);
-      })
-      .catch(() => {});
-  }, [fetchProvider]);
-
-  const refreshUpstream = async () => {
-    if (fetchProvider == null || fetchAccount == null) return;
-    setFetching(true);
-    try {
-      const r = await api.post<{ models_added: number }>(
-        `/api/v1/providers/${fetchProvider}/refresh-models`,
-        { account_id: fetchAccount },
-      );
-      message.success(`${t('models.fetched')} (${r.models_added} ${t('models.new')})`);
-      setFetchOpen(false);
-      load();
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : 'failed');
-    } finally {
-      setFetching(false);
-    }
-  };
+  // Fetch a provider's upstream model list: the picker drawer handles
+  // account selection, listing, and the add/remove sync commit.
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   // Enabled first, then name; fuzzy name search + provider filter applied
   // client-side.
@@ -177,7 +130,7 @@ export default function Models() {
         <Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>
           {t('models.add')}
         </Button>
-        <Button icon={<SyncOutlined />} onClick={() => setFetchOpen(true)}>
+        <Button icon={<SyncOutlined />} onClick={() => setPickerOpen(true)}>
           {t('models.fetch')}
         </Button>
         <Button onClick={load}>{t('common.refresh')}</Button>
@@ -297,38 +250,11 @@ export default function Models() {
           },
         ]}
       />
-      <Modal
-        title={t('models.fetch')}
-        open={fetchOpen}
-        onCancel={() => setFetchOpen(false)}
-        onOk={refreshUpstream}
-        okButtonProps={{ loading: fetching, disabled: fetchProvider == null || fetchAccount == null }}
-        destroyOnClose
-      >
-        <Form layout="vertical">
-          <Form.Item label={t('acct.provider')} required>
-            <Select
-              value={fetchProvider}
-              onChange={setFetchProvider}
-              options={providers.map((p) => ({ value: p.id, label: p.name }))}
-              placeholder={t('acct.provider')}
-            />
-          </Form.Item>
-          <Form.Item label={t('models.fetchAccount')} required tooltip={t('models.fetchAccountTip')}>
-            <Select
-              value={fetchAccount}
-              onChange={setFetchAccount}
-              options={fetchAccounts.map((a) => ({
-                value: a.id,
-                label: `${a.label || a.api_key_mask} (${a.api_key_mask})${a.enabled ? '' : ' (off)'}`,
-                disabled: !a.enabled,
-              }))}
-              placeholder={t('models.fetchAccount')}
-              notFoundContent={t('acct.noAccounts')}
-            />
-          </Form.Item>
-        </Form>
-      </Modal>
+      <ModelPickerDrawer
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        onRegistered={load}
+      />
       <Modal
         title={t('models.add')}
         open={open}

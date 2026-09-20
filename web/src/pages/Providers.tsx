@@ -5,11 +5,12 @@ import {
 } from 'antd';
 import { PlusOutlined, SettingOutlined, SyncOutlined, DownOutlined } from '@ant-design/icons';
 import {
-  api, Channel, Provider,
+  api, Channel, Model, Provider,
 } from '../api/client';
 import { useLang } from '../i18n/i18n';
 import { AccountPickerModal } from '../components/account';
 import { ProviderLogo } from '../components/logo';
+import ModelSelectList, { ModelSelectItem } from '../components/ModelSelectList';
 
 // Merged provider management: one provider (vendor account + endpoints) hosts
 // one or more protocol endpoints, each with its own failover priority. The
@@ -176,6 +177,16 @@ function ProviderDrawer({
   const [localEndpoints, setLocalEndpoints] = useState<EndpointForm[]>([]);
   const [creating, setCreating] = useState(false);
 
+  // Fetched-preview selection state (both modes): the fetched ids are shown
+  // for per-model choice; registeredIds marks rows this provider already has
+  // (rendered checked + locked, never re-staged).
+  const [previewItems, setPreviewItems] = useState<ModelSelectItem[]>([]);
+  const [registeredIds, setRegisteredIds] = useState<Set<string>>(new Set());
+  const [savingModels, setSavingModels] = useState(false);
+  // The staged ids that would actually register: registered rows are locked
+  // in the list and excluded from register_models.
+  const stagedCount = stagedModels.filter((id) => !registeredIds.has(id)).length;
+
   // Manage-mode buffers.
   const [editName, setEditName] = useState('');
   const [editModelsUrl, setEditModelsUrl] = useState('');
@@ -189,6 +200,8 @@ function ProviderDrawer({
     setName('');
     setModelsUrl('');
     setStagedModels([]);
+    setPreviewItems([]);
+    setRegisteredIds(new Set());
     setLocalEndpoints([]);
     setEditName(provider?.name ?? '');
     setEditModelsUrl(provider?.models_url ?? '');
@@ -220,7 +233,17 @@ function ProviderDrawer({
         `/api/v1/providers/${provider?.id ?? 0}/models-preview`,
         { models_url: currentModelsUrl.trim(), auth_style: providerAuthStyle, ...cred },
       );
-      setStagedModels(r.models);
+      // Nothing is staged automatically: the fetched list is presented for
+      // selection; only the checked (and not-yet-registered) ids register at
+      // save time.
+      setStagedModels([]);
+      let regSet = new Set<string>();
+      if (provider) {
+        const rows = await api.get<Model[]>('/api/v1/models');
+        regSet = new Set((rows ?? []).filter((m) => m.provider_id === provider.id).map((m) => m.id));
+      }
+      setRegisteredIds(regSet);
+      setPreviewItems(r.models.map((id) => ({ id, registered: regSet.has(id), stale: false })));
       message.success(`${r.models.length} ${t('prov.fetchedPreview')}`);
     } catch (e) {
       message.error(e instanceof Error ? e.message : 'failed');
@@ -241,19 +264,25 @@ function ProviderDrawer({
   };
 
   // Manage mode: persist models_url (empty string clears) and register the
-  // staged model ids in one provider update.
+  // checked model ids in one provider update (registered rows are locked in
+  // the list and never re-staged).
   const saveModels = async () => {
     if (!provider) return;
+    setSavingModels(true);
+    const toRegister = stagedModels.filter((id) => !registeredIds.has(id));
     try {
       await api.put(`/api/v1/providers/${provider.id}`, {
         models_url: editModelsUrl.trim(),
-        register_models: stagedModels.length > 0 ? stagedModels : undefined,
+        register_models: toRegister.length > 0 ? toRegister : undefined,
       });
       setStagedModels([]);
+      setPreviewItems([]);
       message.success(t('prov.saved'));
       onChanged();
     } catch (e) {
       message.error(e instanceof Error ? e.message : 'failed');
+    } finally {
+      setSavingModels(false);
     }
   };
 
@@ -267,7 +296,7 @@ function ProviderDrawer({
       const created = await api.post<{ id: number }>('/api/v1/providers', {
         name: name.trim(),
         models_url: modelsUrl.trim() || undefined,
-        register_models: stagedModels.length > 0 ? stagedModels : undefined,
+        register_models: stagedCount > 0 ? stagedModels.filter((id) => !registeredIds.has(id)) : undefined,
       });
       let partial = false;
       for (const ep of localEndpoints) {
@@ -303,13 +332,6 @@ function ProviderDrawer({
       open={open}
       onClose={onClose}
       width={960}
-      extra={
-        isCreate && (
-          <Button type="primary" loading={creating} onClick={submitCreate}>
-            {t('common.create')}
-          </Button>
-        )
-      }
     >
       {open && (
         <>
@@ -351,8 +373,9 @@ function ProviderDrawer({
             {!isCreate && (
               <Button
                 size="small"
+                loading={savingModels}
                 disabled={
-                  editModelsUrl.trim() === (provider.models_url ?? '') && stagedModels.length === 0
+                  editModelsUrl.trim() === (provider.models_url ?? '') && stagedCount === 0
                 }
                 onClick={saveModels}
               >
@@ -366,18 +389,17 @@ function ProviderDrawer({
           <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: 4 }}>
             {t('prov.modelsUrlTip')}
           </Typography.Paragraph>
-          {stagedModels.length > 0 && (
+          {previewItems.length > 0 && (
             <>
               <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
                 {t('prov.registerModelsTip')}
               </Typography.Paragraph>
-              <div style={{ maxHeight: 160, overflow: 'auto', marginBottom: 8 }}>
-                <Space wrap size={4}>
-                  {stagedModels.map((id) => (
-                    <Tag key={id}>{id}</Tag>
-                  ))}
-                </Space>
-              </div>
+              <ModelSelectList
+                items={previewItems}
+                value={stagedModels}
+                onChange={setStagedModels}
+                disableRegistered
+              />
             </>
           )}
 
@@ -405,6 +427,13 @@ function ProviderDrawer({
               fetchModelsPreview(cred);
             }}
           />
+          {isCreate && (
+            <div style={{ marginTop: 24 }}>
+              <Button type="primary" loading={creating} onClick={submitCreate}>
+                {t('common.create')}
+              </Button>
+            </div>
+          )}
         </>
       )}
     </Drawer>

@@ -152,6 +152,7 @@ func (s *Server) mountProtected(pr chi.Router) {
 	pr.Post("/accounts/{id}/test", s.handleTestAccount)
 	pr.Post("/accounts/{id}/usage", s.handleAccountUsage)
 	pr.Post("/providers/{id}/refresh-models", s.handleRefreshModels)
+	pr.Post("/providers/{id}/sync-models", s.handleSyncModels)
 	pr.Post("/providers/{id}/probe", s.handleProbeEndpoint)
 	pr.Post("/providers/{id}/models-preview", s.handlePreviewModels)
 

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -57,21 +56,21 @@ func TestGetModelsURLParsesOptionalLimits(t *testing.T) {
 	}
 }
 
-func TestRefreshModelsBackfillsLimits(t *testing.T) {
-	// First refresh answers with a plain vendor shape (ids only); the second
-	// one starts returning limits, like an aggregator endpoint would.
-	var calls int32
+// refresh-models only fetches and returns the upstream list (with optional
+// aggregator limits) — nothing is registered. Registration and cleanup go
+// through sync-models: register entries EnsureModel (identity alias, limits
+// backfilled, manual edits survive), remove entries delete provider-scoped
+// rows — including rows that never appeared in any fetch.
+func TestRefreshAndSyncModels(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-test" {
 			t.Errorf("Authorization = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		body := `{"data":[{"id":"model-a","context_length":65536},{"id":"model-b"}]}`
-		if atomic.AddInt32(&calls, 1) >= 2 {
-			body = `{"data":[{"id":"model-a","context_length":65536},` +
-				`{"id":"model-b","context_length":32768,"max_output_tokens":4096}]}`
-		}
-		_, _ = w.Write([]byte(body))
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"model-a","context_length":65536},
+			{"id":"model-b","context_length":32768,"max_output_tokens":4096}
+		]}`))
 	}))
 	defer srv.Close()
 
@@ -95,30 +94,68 @@ func TestRefreshModelsBackfillsLimits(t *testing.T) {
 	s := &Server{St: st}
 	r := chi.NewRouter()
 	r.Post("/providers/{id}/refresh-models", s.handleRefreshModels)
+	r.Post("/providers/{id}/sync-models", s.handleSyncModels)
 
-	refresh := func() (int, int) {
+	post := func(path, body string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost,
-			"/providers/"+strconv.FormatInt(pid, 10)+"/refresh-models",
-			strings.NewReader(`{"account_id":`+strconv.FormatInt(aid, 10)+`}`))
+			"/providers/"+strconv.FormatInt(pid, 10)+"/"+path, strings.NewReader(body))
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("refresh status = %d: %s", rec.Code, rec.Body.String())
+			t.Fatalf("%s status = %d: %s", path, rec.Code, rec.Body.String())
 		}
-		var env struct {
-			Data struct {
-				ModelsAdded int `json:"models_added"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		return rec.Code, env.Data.ModelsAdded
+		return rec
 	}
 
-	if _, added := refresh(); added != 2 {
-		t.Fatalf("added = %d, want 2", added)
+	// Refresh returns the fetched list with limits and registers nothing.
+	rec := post("refresh-models", `{"account_id":`+strconv.FormatInt(aid, 10)+`}`)
+	var env struct {
+		Data struct {
+			Provider  string `json:"provider"`
+			AccountID int64  `json:"account_id"`
+			Models    []struct {
+				ID              string `json:"id"`
+				ContextLength   *int64 `json:"context_length"`
+				MaxOutputTokens *int64 `json:"max_output_tokens"`
+			} `json:"models"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if env.Data.Provider != "p" || env.Data.AccountID != aid || len(env.Data.Models) != 2 {
+		t.Fatalf("refresh payload wrong: %s", rec.Body.String())
+	}
+	if env.Data.Models[0].ID != "model-a" || env.Data.Models[0].ContextLength == nil ||
+		*env.Data.Models[0].ContextLength != 65536 || env.Data.Models[0].MaxOutputTokens != nil {
+		t.Fatalf("model-a entry wrong: %+v", env.Data.Models[0])
+	}
+	if env.Data.Models[1].ID != "model-b" || env.Data.Models[1].ContextLength == nil ||
+		*env.Data.Models[1].ContextLength != 32768 ||
+		env.Data.Models[1].MaxOutputTokens == nil || *env.Data.Models[1].MaxOutputTokens != 4096 {
+		t.Fatalf("model-b entry wrong: %+v", env.Data.Models[1])
+	}
+	if rows, err := st.Models.List(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("refresh must not register rows: %v %v", rows, err)
+	}
+
+	// Sync registers the selected subset with backfilled limits.
+	rec = post("sync-models", `{"register":[
+		{"id":"model-a","context_length":65536},
+		{"id":"model-b","context_length":32768,"max_output_tokens":4096}
+	]}`)
+	var syncEnv struct {
+		Data struct {
+			ModelsAdded   int `json:"models_added"`
+			ModelsRemoved int `json:"models_removed"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &syncEnv); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if syncEnv.Data.ModelsAdded != 2 || syncEnv.Data.ModelsRemoved != 0 {
+		t.Fatalf("sync counts wrong: %s", rec.Body.String())
 	}
 	models, err := st.Models.List(ctx)
 	if err != nil {
@@ -128,38 +165,54 @@ func TestRefreshModelsBackfillsLimits(t *testing.T) {
 	for _, m := range models {
 		byID[m.ID] = m
 	}
-	a := byID["model-a"]
-	if a.ContextWindow == nil || *a.ContextWindow != 65536 || a.ProviderID != pid {
+	if a := byID["model-a"]; a.ProviderID != pid || a.UpstreamModel != "model-a" ||
+		a.ContextWindow == nil || *a.ContextWindow != 65536 {
 		t.Fatalf("model-a not stored with limits: %+v", a)
 	}
-	if b := byID["model-b"]; b.ContextWindow != nil {
-		t.Fatalf("model-b must have nil context_window: %+v", b)
+	if b := byID["model-b"]; b.ContextWindow == nil || *b.ContextWindow != 32768 ||
+		b.MaxOutputTokens == nil || *b.MaxOutputTokens != 4096 {
+		t.Fatalf("model-b not stored with limits: %+v", b)
 	}
 
-	// A manual context_window survives the next refresh; the NULL row is
-	// backfilled from the now-richer upstream payload.
-	ma := a
+	// A manual context_window survives re-registering the same id; nothing
+	// new is added (insert-if-missing).
+	ma := byID["model-a"]
 	manual := int64(123456)
 	ma.ContextWindow = &manual
 	if err := st.Models.Update(ctx, &ma); err != nil {
 		t.Fatalf("manual edit: %v", err)
 	}
-	if _, added := refresh(); added != 1 { // only model-b gets enriched
-		t.Fatalf("second added = %d, want 1", added)
+	rec = post("sync-models", `{"register":[{"id":"model-a","context_length":65536}]}`)
+	if err := json.Unmarshal(rec.Body.Bytes(), &syncEnv); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if syncEnv.Data.ModelsAdded != 0 {
+		t.Fatalf("re-sync must not re-add: %s", rec.Body.String())
 	}
 	models, _ = st.Models.List(ctx)
 	for _, m := range models {
-		switch m.ID {
-		case "model-a":
-			if m.ContextWindow == nil || *m.ContextWindow != 123456 {
-				t.Fatalf("manual context_window clobbered: %+v", m)
-			}
-		case "model-b":
-			if m.ContextWindow == nil || *m.ContextWindow != 32768 ||
-				m.MaxOutputTokens == nil || *m.MaxOutputTokens != 4096 {
-				t.Fatalf("model-b not backfilled: %+v", m)
-			}
+		if m.ID == "model-a" && (m.ContextWindow == nil || *m.ContextWindow != 123456) {
+			t.Fatalf("manual context_window clobbered: %+v", m)
 		}
+	}
+
+	// Removal deletes rows by (provider, id) — including a row that never
+	// appeared in any fetch (historical entry the upstream no longer lists).
+	if _, err := st.Models.EnsureModel(ctx, &store.Model{
+		ID: "manual-only", ProviderID: pid, UpstreamModel: "manual-only",
+	}); err != nil {
+		t.Fatalf("seed manual row: %v", err)
+	}
+	rec = post("sync-models", `{"remove":["model-b","manual-only"]}`)
+	if err := json.Unmarshal(rec.Body.Bytes(), &syncEnv); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if syncEnv.Data.ModelsRemoved != 2 || syncEnv.Data.ModelsAdded != 0 {
+		t.Fatalf("remove counts wrong: %s", rec.Body.String())
+	}
+	models, _ = st.Models.List(ctx)
+	if len(models) != 1 || models[0].ID != "model-a" {
+		t.Fatalf("only model-a must remain: %+v", models)
 	}
 }
 

@@ -163,12 +163,11 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, req *http.Request) 
 
 // handleRefreshModels fetches the upstream model list from the provider's
 // configured models_url (provider-level, absolute — never derived from
-// endpoint URLs) and registers unknown entries as provider-scoped rows: every
-// live endpoint of the provider can then serve them. Manual edits survive:
-// EnsureModel only backfills NULL limits.
-// The account to authenticate with is chosen explicitly: account_id is
-// required and must name an enabled account of this provider — there is no
-// silent fallback.
+// endpoint URLs) and returns it WITHOUT registering anything: the admin UI
+// presents the list for selection and commits the chosen subset through
+// sync-models. The account to authenticate with is chosen explicitly:
+// account_id is required and must name an enabled account of this provider —
+// there is no silent fallback.
 func (s *Server) handleRefreshModels(w http.ResponseWriter, req *http.Request) {
 	id, ok := pathID(req)
 	if !ok {
@@ -221,8 +220,40 @@ func (s *Server) handleRefreshModels(w http.ResponseWriter, req *http.Request) {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadGateway, 60001, "fetch models: "+err.Error())
 		return
 	}
+	httpx.WriteEnvelope(w, req, map[string]any{
+		"provider": p.Name, "account_id": account.ID, "models": models,
+	})
+}
+
+// handleSyncModels applies an explicit add/remove diff of model rows for one
+// provider — the commit step behind the admin UI's model picker. register
+// entries EnsureModel provider-scoped identity rows (insert-if-missing, NULL
+// limits backfilled — manual edits survive); remove entries delete rows by
+// (provider_id, id), including historical rows the upstream list no longer
+// carries. Both lists are explicit from the client, so removal is not
+// limited to ids seen in the last fetch.
+func (s *Server) handleSyncModels(w http.ResponseWriter, req *http.Request) {
+	id, ok := pathID(req)
+	if !ok {
+		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "invalid id")
+		return
+	}
+	if _, err := s.St.Providers.Get(req.Context(), id); err != nil {
+		mapStoreErr(w, req, err)
+		return
+	}
+	var body struct {
+		Register []upstreamModel `json:"register"`
+		Remove   []string        `json:"remove"`
+	}
+	if !readJSON(w, req, &body) {
+		return
+	}
 	added := 0
-	for _, m := range models {
+	for _, m := range body.Register {
+		if m.ID == "" {
+			continue
+		}
 		inserted, err := s.St.Models.EnsureModel(req.Context(), &store.Model{
 			ID:              m.ID,
 			ProviderID:      id,
@@ -239,8 +270,20 @@ func (s *Server) handleRefreshModels(w http.ResponseWriter, req *http.Request) {
 			added++
 		}
 	}
-	httpx.WriteEnvelope(w, req, map[string]any{
-		"provider": p.Name, "account_id": account.ID, "models_added": added,
+	removed := 0
+	for _, modelID := range body.Remove {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			continue
+		}
+		if err := s.St.Models.Delete(req.Context(), id, modelID); err != nil {
+			mapStoreErr(w, req, err)
+			return
+		}
+		removed++
+	}
+	httpx.WriteEnvelope(w, req, map[string]int{
+		"models_added": added, "models_removed": removed,
 	})
 }
 

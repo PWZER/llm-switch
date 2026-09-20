@@ -99,10 +99,16 @@ the provider strips its targets.
 Model rows reach a provider only through explicit admin action:
 **refresh-models** fetches the provider's `models_url` once (auth style from
 its first enabled channel, openai preferred; a missing `models_url` is a
-40901 telling the admin to configure it first) and registers the fetched ids
-as provider-scoped rows (identity alias, NULL-limit backfill only — manual
-edits survive refreshes); **models-preview** is display-only — the UI shows
-the fetched ids and sends them as `register_models` on provider save; the
+40901 telling the admin to configure it first) and returns the fetched list
+WITHOUT registering — nothing is added; **sync-models** (`POST
+/providers/{id}/sync-models`, body `{register: [{id, context_length?,
+max_output_tokens?}], remove: [id...]}`) commits the admin UI's selection as
+an explicit diff: register entries EnsureModel provider-scoped identity rows
+(insert-if-missing, NULL-limit backfill only — manual edits survive), remove
+entries delete rows by (provider_id, id) including historical rows the
+upstream no longer lists; **models-preview** is display-only — the provider
+drawer shows the fetched ids for per-model selection and sends the checked
+ones as `register_models` on provider save; the
 **Models page** creates rows directly (provider multi-select: one row per
 selected provider). New providers start with an empty registry by design.
 
@@ -131,7 +137,10 @@ GET /v1/models visibility rules: listed ⇔ routable — the merged list dedupes
 by name over enabled models rows on live providers (later duplicates only fill
 blank metadata), plus model route names. Disabling a row removes both its
 list entry and its candidacy. Each entry carries `description` =
-`{provider}/{account}({endpoint})` — the provider, the account that would serve
+`{[route] |[model] }{provider}/{account}({endpoint})` — an explicit source
+marker (`[route] ` for model-route entries, including names that also have a
+models row since the route wins at resolve time; `[model] ` for plain
+registry rows), the provider, the account that would serve
 first (route-pinned, else the first enabled account; omitted when the provider
 has none), and the channel that would serve
 the name first (route target, else top row candidate, same precedence as

@@ -311,13 +311,6 @@ function ModelRouteDrawer({
       open={open}
       onClose={onClose}
       width={960}
-      extra={
-        isCreate && (
-          <Button type="primary" loading={creating} onClick={submitCreate}>
-            {t('common.create')}
-          </Button>
-        )
-      }
     >
       {open && (
         <>
@@ -414,6 +407,13 @@ function ModelRouteDrawer({
             }}
             onClose={() => setModalOpen(false)}
           />
+          {isCreate && (
+            <div style={{ marginTop: 24 }}>
+              <Button type="primary" loading={creating} onClick={submitCreate}>
+                {t('common.create')}
+              </Button>
+            </div>
+          )}
         </>
       )}
     </Drawer>

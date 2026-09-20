@@ -116,9 +116,10 @@ func TestModelsPaginationAndContext(t *testing.T) {
 		!strings.Contains(string(raw), `"max_output_tokens":8192`) {
 		t.Fatalf("openai shape missing context fields: %s", raw)
 	}
-	// The description names the account that would serve first:
-	// "{provider}/{account}({endpoint})".
-	if !strings.Contains(string(raw), `"description":"fake/k1(fake-openai)"`) {
+	// The description marks the source ("[model]" for registry rows) and
+	// names the account that would serve first:
+	// "[model] {provider}/{account}({endpoint})".
+	if !strings.Contains(string(raw), `"description":"[model] fake/k1(fake-openai)"`) {
 		t.Fatalf("openai shape missing provider/account description: %s", raw)
 	}
 	if strings.Contains(string(raw), `"claude-zzz-model"`) {
@@ -132,6 +133,71 @@ func TestModelsPaginationAndContext(t *testing.T) {
 	_, raw = h.getModels(t, "", true)
 	if !strings.Contains(string(raw), `"claude-zzz-model"`) {
 		t.Fatalf("anthropic shape missing discovery variant: %s", raw)
+	}
+}
+
+// TestModelsDescriptionSourceMarker: the description marks where a listed
+// name comes from — "[model] " for provider registry rows, "[route] " for
+// model routes. A name backed by both (a route wins at resolve time) is
+// marked as a route; the claude-* discovery mirrors inherit the marker.
+func TestModelsDescriptionSourceMarker(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	// Dual existence: a models row AND a route on the same name.
+	ch, err := h.st.Channels.Get(ctx, 1)
+	must(t, err)
+	pid := ch.ProviderID
+	_, err = h.st.Models.EnsureModel(ctx, &store.Model{
+		ID: "dual-model", ProviderID: pid, UpstreamModel: "fake-chat",
+	})
+	must(t, err)
+	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name:    "dual-model",
+		Targets: []store.ModelRouteTarget{{ChannelID: int64p(1), UpstreamModel: "fake-chat"}},
+	}))
+	// Pure route: no models row backs the name.
+	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name:    "route-only",
+		Targets: []store.ModelRouteTarget{{ChannelID: int64p(1), UpstreamModel: "fake-chat"}},
+	}))
+	h.rebuild()
+
+	// OpenAI shape: rows carry "[model] ", route names (pure or dual) "[route] ".
+	_, raw := h.getModels(t, "", false)
+	for _, want := range []string{
+		`"description":"[model] fake/k1(fake-openai)"`,
+		`"description":"[route] fake/k1(fake-openai)"`,
+		`"dual-model"`, `"route-only"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("openai shape missing %s: %s", want, raw)
+		}
+	}
+
+	// Anthropic shape: the claude-* discovery mirrors inherit the marker.
+	_, raw = h.getModels(t, "", true)
+	if !strings.Contains(string(raw), `"description":"[route] fake/k1(fake-openai)"`) {
+		t.Fatalf("anthropic shape missing [route] description: %s", raw)
+	}
+
+	// By-id lookups carry the marker on both shapes.
+	for _, shape := range []struct {
+		anthropic bool
+		want      string
+	}{{false, `"description":"[route] fake/k1(fake-openai)"`}, {true, `"description":"[route] fake/k1(fake-openai)"`}} {
+		req, err := http.NewRequest(http.MethodGet, h.srv.URL+"/v1/models/route-only", nil)
+		must(t, err)
+		req.Header.Set("Authorization", "Bearer "+h.key)
+		if shape.anthropic {
+			req.Header.Set("anthropic-version", "2023-06-01")
+		}
+		resp, err := h.client.Do(req)
+		must(t, err)
+		rawID := readAll(t, resp)
+		if resp.StatusCode != 200 || !strings.Contains(string(rawID), shape.want) {
+			t.Fatalf("by-id (anthropic=%v) wrong: %d %s", shape.anthropic, resp.StatusCode, rawID)
+		}
 	}
 }
 

@@ -566,6 +566,14 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	}
 	for name := range snap.Routes {
 		if seen[name] {
+			// The name also has a models row: the route still wins at resolve
+			// time, so the listing entry is marked as route-sourced.
+			for i := range snap.Models {
+				if snap.Models[i].ID == name {
+					snap.Models[i].Source = "route"
+					snap.Models[i].IsRoute = true
+				}
+			}
 			continue
 		}
 		e := ModelEntry{ID: name, DisplayName: name, Source: "route", IsRoute: true, Provider: describe(name, 0)}

@@ -413,7 +413,7 @@ func (g *Gateway) models(w http.ResponseWriter, r *http.Request) {
 		for i, m := range page {
 			out.Data = append(out.Data, anthropicModel{
 				Type: "model", ID: m.ID, DisplayName: orDefault(m.DisplayName, m.ID), CreatedAt: nowRFC,
-				Description: m.Provider,
+				Description: modelDescription(m),
 				limits:      limits{ContextLength: m.ContextWindow, MaxOutputTokens: m.MaxOutputTokens},
 			})
 			if i == 0 {
@@ -435,7 +435,7 @@ func (g *Gateway) models(w http.ResponseWriter, r *http.Request) {
 	for i, m := range page {
 		out.Data = append(out.Data, openaiModel{
 			ID: m.ID, Object: "model", Created: nowS, OwnedBy: "llm-switch",
-			Description: m.Provider,
+			Description: modelDescription(m),
 			limits:      limits{ContextLength: m.ContextWindow, MaxOutputTokens: m.MaxOutputTokens},
 		})
 		if i == 0 {
@@ -474,7 +474,7 @@ func (g *Gateway) modelByID(w http.ResponseWriter, r *http.Request) {
 				"max_output_tokens": m.MaxOutputTokens,
 			}
 			if m.Provider != "" {
-				body["description"] = m.Provider
+				body["description"] = modelDescription(m)
 			}
 			writeJSON(w, http.StatusOK, body)
 			return
@@ -485,7 +485,7 @@ func (g *Gateway) modelByID(w http.ResponseWriter, r *http.Request) {
 			"max_output_tokens": m.MaxOutputTokens,
 		}
 		if m.Provider != "" {
-			body["description"] = m.Provider
+			body["description"] = modelDescription(m)
 		}
 		writeJSON(w, http.StatusOK, body)
 		return
@@ -495,6 +495,20 @@ func (g *Gateway) modelByID(w http.ResponseWriter, r *http.Request) {
 		proto = protocolAnthropic
 	}
 	writeModelNotFound(w, r, proto, id)
+}
+
+// modelDescription renders the entry description with an explicit source
+// marker: "[route]" for model-route entries (a route wins at resolve time
+// even when a models row shares the name), "[model]" for provider registry
+// rows. An empty base description stays empty (omitempty).
+func modelDescription(m engine.ModelEntry) string {
+	if m.Provider == "" {
+		return ""
+	}
+	if m.IsRoute {
+		return "[route] " + m.Provider
+	}
+	return "[model] " + m.Provider
 }
 
 // anthropicListing merges the plain list with the [1m] context variants and

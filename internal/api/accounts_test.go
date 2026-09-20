@@ -151,7 +151,8 @@ func TestRefreshModelsRequiresExplicitAccount(t *testing.T) {
 		t.Fatalf("re-enable account: %v", err)
 	}
 
-	// Success: the chosen account's key authenticates upstream.
+	// Success: the chosen account's key authenticates upstream; the fetched
+	// list comes back in the response and nothing is registered.
 	rec := postJSON(t, srv, pp, `{"account_id":`+strconv.FormatInt(aid, 10)+`}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("refresh status = %d: %s", rec.Code, rec.Body.String())
@@ -159,8 +160,21 @@ func TestRefreshModelsRequiresExplicitAccount(t *testing.T) {
 	if auth, _ := gotAuth.Load().(string); auth != "Bearer sk-chosen-account" {
 		t.Fatalf("upstream saw auth %q, want the chosen account's key", auth)
 	}
-	if _, err := st.Models.Get(ctx, pid, "m1"); err != nil {
-		t.Fatalf("model not upserted: %v", err)
+	var env struct {
+		Data struct {
+			Models []struct {
+				ID string `json:"id"`
+			} `json:"models"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(env.Data.Models) != 1 || env.Data.Models[0].ID != "m1" {
+		t.Fatalf("refresh must return the fetched list: %s", rec.Body.String())
+	}
+	if _, err := st.Models.Get(ctx, pid, "m1"); err == nil {
+		t.Fatalf("refresh must not register rows")
 	}
 }
 
