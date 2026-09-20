@@ -35,7 +35,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   });
   if (resp.status === 401) {
     clearToken();
-    window.location.hash = '#/login';
+    window.location.assign('/login');
     throw new ApiError(40101, 'unauthorized');
   }
   const env = (await resp.json()) as { code: number; msg: string; data: T };

@@ -1,7 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { App as AntApp, ConfigProvider, theme } from 'antd';
-import { HashRouter } from 'react-router-dom';
+import { BrowserRouter } from 'react-router-dom';
 import App from './App';
 import { LangProvider, useLang } from './i18n/i18n';
 import { ThemeProvider, useTheme } from './theme/theme';
@@ -28,9 +28,9 @@ function Shell() {
       }}
     >
       <AntApp>
-        <HashRouter>
+        <BrowserRouter>
           <App />
-        </HashRouter>
+        </BrowserRouter>
       </AntApp>
     </ConfigProvider>
   );
