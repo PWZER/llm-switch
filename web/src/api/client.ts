@@ -180,9 +180,12 @@ export interface Model {
 }
 
 export interface ModelRouteTarget {
-  channel_id: number;
+  /** The target's provider; always set. */
+  provider_id: number;
+  /** Pinned endpoint; null = auto-select among the provider's enabled endpoints. */
+  channel_id: number | null;
   upstream_model: string;
-  /** Pin the target to one account of the channel's provider; 0/absent = pool rotation. */
+  /** Pin the target to one account of the target's provider; 0/absent = pool rotation. */
   account_id?: number;
 }
 

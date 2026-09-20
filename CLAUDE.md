@@ -66,7 +66,7 @@ providers (vendor account: name, models_url + endpoints)   accounts are shared b
   └─ accounts (label, api_key, weight, enabled, usage_probes JSON)  weighted RR + in-memory cooldown
   └─ channels (protocol, base_url, chat_path, responses_path?, auth_style, priority, weight)
   └─ models (client-facing id + upstream_model alias, PK (provider_id, id))  ← registry = routing table
-model_routes (stable client-facing name → channel + upstream_model [+ account_id pin])  ← hot-switchable
+model_routes (client-facing name → provider + upstream_model [+ channel pin] [+ account_id pin])  ← hot-switchable
 api_keys (client-facing gateway keys, sha256-hashed, shown once)
 request_logs (one row per request, account_id/account_name attribution; async batched writes)
 ```
@@ -89,9 +89,12 @@ Accounts carry the API key: two-tier account test (`quick` = GET /models with th
 key, zero tokens; `deep` = real `max_tokens:1` mini chat), per-account usage/balance
 probes, and every key-consuming admin action (refresh-models / models-preview /
 form probe) requires an **explicit `account_id` or pasted `api_key`** — no silent
-first-enabled fallback. Model route targets may pin `account_id` (validated to
-belong to the target channel's provider); a disabled pinned account makes the
-target unroutable.
+first-enabled fallback. Model route targets always carry `provider_id`; `channel_id`
+is an optional endpoint pin (JSON `null` = auto-select among the provider's enabled
+channels), and `account_id` may pin one account (validated to belong to the target's
+provider); a disabled pinned account makes the target unroutable. Deleting a pinned
+channel degrades its target to provider auto-select (provider backfilled); deleting
+the provider strips its targets.
 
 Model rows reach a provider only through explicit admin action:
 **refresh-models** fetches the provider's `models_url` once (auth style from
@@ -116,7 +119,10 @@ DESC groups, weighted RR within group; each candidate carries the row's upstream
 protocol-shaped 404. Row-derived candidates are **protocol-filtered by the client
 surface** (`openai-responses` prefers `openai`): same-protocol candidates win
 outright, cross-protocol bridging serves only when no same-protocol candidate
-exists; route chains are explicit configuration and never filtered. A name with
+exists. Route targets pinning an explicit channel are explicit configuration and
+never filtered; a provider-scoped route target (no `channel_id`) expands to one
+candidate per live channel of its provider (priority DESC, weight DESC) with the
+same same-protocol-first preference applied within its own segment only. A name with
 no enabled row and no route is neither listed nor routable. Model routes are
 listed in `GET /v1/models` on both surfaces; route
 names are canonical — the admin API rejects the `[1m]` suffix.

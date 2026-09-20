@@ -140,7 +140,7 @@ api_key  = "sk-lsw-..."
 #   stateless only: store=false; previous_response_id / background are rejected
 ```
 
-Model names resolve after stripping the `[1m]` context marker: model route → channel binding → `claude-`-stripped retry → 404.
+Model names resolve after stripping the `[1m]` context marker: model route (provider + upstream model, with optional endpoint/account pins — no pin = auto-select among the provider's enabled endpoints) → models rows → `claude-`-stripped retry → 404.
 
 ## Development
 

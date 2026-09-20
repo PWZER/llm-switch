@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -20,6 +22,8 @@ func newTestStore(t *testing.T) *Store {
 	}
 	return st
 }
+
+func int64p(v int64) *int64 { return &v }
 
 func TestMigrationsIdempotent(t *testing.T) {
 	st := newTestStore(t)
@@ -204,14 +208,14 @@ func TestProviderChannelRouteRoundtrip(t *testing.T) {
 
 	// Model route upsert = hot-switch primitive with an ordered failover chain.
 	a := ModelRoute{Name: "main", Targets: []ModelRouteTarget{
-		{ChannelID: cid, UpstreamModel: "deepseek-flash"},
+		{ProviderID: pid, ChannelID: int64p(cid), UpstreamModel: "deepseek-flash"},
 	}}
 	if err := st.Routes.Upsert(ctx, &a); err != nil {
 		t.Fatalf("upsert model route: %v", err)
 	}
 	a.Targets = []ModelRouteTarget{
-		{ChannelID: cid, UpstreamModel: "deepseek-flash"},
-		{ChannelID: cid, UpstreamModel: "deepseek-v4-pro"},
+		{ProviderID: pid, ChannelID: int64p(cid), UpstreamModel: "deepseek-flash"},
+		{ProviderID: pid, ChannelID: int64p(cid), UpstreamModel: "deepseek-v4-pro"},
 	}
 	if err := st.Routes.Upsert(ctx, &a); err != nil {
 		t.Fatalf("re-upsert model route: %v", err)
@@ -242,6 +246,162 @@ func TestProviderChannelRouteRoundtrip(t *testing.T) {
 	if err := st.db.Read.QueryRow(`SELECT COUNT(*) FROM model_routes`).Scan(&routes); err != nil || routes != 0 {
 		t.Fatalf("model routes should cascade-delete, got %d (err=%v)", routes, err)
 	}
+}
+
+// Provider-scoped route targets: provider_id owns the target and channel_id
+// (JSON null when absent) optionally pins one endpoint. Deleting a pinned
+// endpoint degrades its target to provider auto-select (legacy rows get the
+// provider backfilled); deleting the provider removes its targets outright.
+func TestModelRouteProviderTargets(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	pid, err := st.Providers.Create(ctx, "p", nil)
+	if err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+	newChannel := func(name string) int64 {
+		t.Helper()
+		cid, err := st.Channels.Create(ctx, &Channel{
+			ProviderID: pid, Name: name, Protocol: "openai",
+			BaseURL: "http://127.0.0.1:1", ChatPath: "/chat/completions",
+			AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 1, Weight: 1,
+		})
+		if err != nil {
+			t.Fatalf("channel %s: %v", name, err)
+		}
+		return cid
+	}
+	cid := newChannel("c1")
+
+	// A provider-scoped (auto-select) target round-trips and stores an
+	// explicit JSON null channel_id.
+	a := &ModelRoute{Name: "auto", Targets: []ModelRouteTarget{
+		{ProviderID: pid, UpstreamModel: "m1"},
+	}}
+	if err := st.Routes.Upsert(ctx, a); err != nil {
+		t.Fatalf("upsert provider target: %v", err)
+	}
+	if got, err := st.Routes.Get(ctx, "auto"); err != nil || len(got.Targets) != 1 ||
+		got.Targets[0].ProviderID != pid || got.Targets[0].ChannelID != nil {
+		t.Fatalf("provider target round-trip: %+v err=%v", got, err)
+	}
+	var rawJSON string
+	if err := st.db.Read.QueryRow(`SELECT targets_json FROM model_routes WHERE name = 'auto'`).Scan(&rawJSON); err != nil {
+		t.Fatalf("read raw: %v", err)
+	}
+	if !strings.Contains(rawJSON, `"channel_id":null`) {
+		t.Fatalf("auto target must store an explicit null channel_id: %s", rawJSON)
+	}
+
+	// Channel-pinned targets round-trip; a provider-less (legacy) target is
+	// tolerated at the store layer.
+	a.Targets = []ModelRouteTarget{
+		{ProviderID: pid, ChannelID: int64p(cid), UpstreamModel: "m2"},
+		{ChannelID: int64p(cid), UpstreamModel: "legacy"},
+	}
+	if err := st.Routes.Upsert(ctx, a); err != nil {
+		t.Fatalf("upsert pinned targets: %v", err)
+	}
+	if got, err := st.Routes.Get(ctx, "auto"); err != nil || len(got.Targets) != 2 ||
+		got.Targets[0].ChannelID == nil || *got.Targets[0].ChannelID != cid ||
+		got.Targets[0].ProviderID != pid || got.Targets[1].ProviderID != 0 {
+		t.Fatalf("pinned targets round-trip: %+v err=%v", got, err)
+	}
+
+	// Guard: a target with neither id, or without an upstream model, is rejected.
+	for i, bad := range []ModelRouteTarget{
+		{UpstreamModel: "m"},
+		{ProviderID: pid},
+		{ChannelID: int64p(cid)},
+	} {
+		if err := st.Routes.Upsert(ctx, &ModelRoute{Name: "bad", Targets: []ModelRouteTarget{bad}}); err == nil {
+			t.Fatalf("invalid target %d must be rejected", i)
+		}
+	}
+
+	// A legacy stored row (no provider_id) still parses.
+	if _, err := st.db.Write.ExecContext(ctx,
+		`INSERT INTO model_routes (name, targets_json, updated_at) VALUES ('legacy-row', ?, 0)`,
+		`[{"channel_id":`+int64ToString(cid)+`,"upstream_model":"m"}]`); err != nil {
+		t.Fatalf("plant legacy row: %v", err)
+	}
+
+	// Deleting the pinned endpoint degrades both targets of "auto" to provider
+	// auto-select and backfills the legacy row.
+	if err := st.DeleteChannel(ctx, cid); err != nil {
+		t.Fatalf("delete channel: %v", err)
+	}
+	if got, err := st.Routes.Get(ctx, "auto"); err != nil || len(got.Targets) != 2 {
+		t.Fatalf("degraded route lost: %+v err=%v", got, err)
+	} else {
+		for i, tgt := range got.Targets {
+			if tgt.ChannelID != nil || tgt.ProviderID != pid {
+				t.Fatalf("target %d must degrade to provider auto: %+v", i, tgt)
+			}
+		}
+	}
+	if got, err := st.Routes.Get(ctx, "legacy-row"); err != nil || len(got.Targets) != 1 ||
+		got.Targets[0].ChannelID != nil || got.Targets[0].ProviderID != pid {
+		t.Fatalf("legacy row must degrade with provider backfill: %+v err=%v", got, err)
+	}
+
+	// Degrading onto an identical auto target dedupes instead of stacking a
+	// redundant failover copy.
+	cid2 := newChannel("c2")
+	a.Targets = []ModelRouteTarget{
+		{ProviderID: pid, ChannelID: int64p(cid2), UpstreamModel: "m"},
+		{ProviderID: pid, UpstreamModel: "m"},
+	}
+	if err := st.Routes.Upsert(ctx, a); err != nil {
+		t.Fatalf("upsert dedupe route: %v", err)
+	}
+	if err := st.DeleteChannel(ctx, cid2); err != nil {
+		t.Fatalf("delete channel 2: %v", err)
+	}
+	if got, err := st.Routes.Get(ctx, "auto"); err != nil || len(got.Targets) != 1 ||
+		got.Targets[0].ChannelID != nil || got.Targets[0].UpstreamModel != "m" {
+		t.Fatalf("degraded duplicate must dedupe: %+v err=%v", got, err)
+	}
+
+	// Deleting the provider removes its targets outright; other providers'
+	// targets survive (a channel pin on a deleted provider has nothing to
+	// degrade to).
+	pid2, err := st.Providers.Create(ctx, "p2", nil)
+	if err != nil {
+		t.Fatalf("provider2: %v", err)
+	}
+	cid3, err := st.Channels.Create(ctx, &Channel{
+		ProviderID: pid2, Name: "c3", Protocol: "openai",
+		BaseURL: "http://127.0.0.1:2", ChatPath: "/chat/completions",
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 1, Weight: 1,
+	})
+	if err != nil {
+		t.Fatalf("channel3: %v", err)
+	}
+	mix := &ModelRoute{Name: "mix", Targets: []ModelRouteTarget{
+		{ProviderID: pid, UpstreamModel: "m"},
+		{ProviderID: pid2, ChannelID: int64p(cid3), UpstreamModel: "m"},
+	}}
+	if err := st.Routes.Upsert(ctx, mix); err != nil {
+		t.Fatalf("upsert mix route: %v", err)
+	}
+	if err := st.DeleteProvider(ctx, pid); err != nil {
+		t.Fatalf("delete provider: %v", err)
+	}
+	if got, err := st.Routes.Get(ctx, "mix"); err != nil || len(got.Targets) != 1 ||
+		got.Targets[0].ProviderID != pid2 {
+		t.Fatalf("mix route must keep only the surviving provider target: %+v err=%v", got, err)
+	}
+	for _, gone := range []string{"auto", "legacy-row"} {
+		if _, err := st.Routes.Get(ctx, gone); err != ErrNotFound {
+			t.Fatalf("route %q should be gone, got %v", gone, err)
+		}
+	}
+}
+
+func int64ToString(v int64) string {
+	return strconv.FormatInt(v, 10)
 }
 
 func TestSettingsAndAPIKeys(t *testing.T) {

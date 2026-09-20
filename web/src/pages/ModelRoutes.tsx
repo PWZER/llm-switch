@@ -9,9 +9,10 @@ import {
 import { api, Account, Model, ModelRoute, ModelRouteTarget, Channel, Provider } from '../api/client';
 import { useLang } from '../i18n/i18n';
 
-// Form/preview state for one failover target. provider_id is a UI-only
-// cascading helper; only (channel_id, upstream_model, account_id) reaches
-// the API. account_id pins the target to one account of the channel's
+// Form/preview state for one failover target. provider_id owns the target;
+// channel_id (undefined in the form = JSON null on the wire) optionally pins
+// one endpoint — absent = auto-select among the provider's enabled
+// endpoints. account_id pins the target to one account of the target's
 // provider; absent = the provider's account pool rotates.
 interface TargetRow {
   provider_id?: number;
@@ -46,9 +47,23 @@ const accountLabel = (accounts: Account[], id?: number) => {
   return a ? (a.label || a.api_key_mask) : `#${id}`;
 };
 
+// One target's display label: the pinned endpoint, or "Auto (provider)"
+// for a provider-scoped auto-select target.
+const targetLabel = (
+  channels: Channel[],
+  providers: Provider[],
+  tgt: { provider_id?: number; channel_id?: number | null },
+  autoLabel: string,
+): string => {
+  if (tgt.channel_id) return channelLabel(channels, tgt.channel_id);
+  const p = providers.find((x) => x.id === tgt.provider_id);
+  return `${autoLabel} (${p ? p.name : `#${tgt.provider_id ?? '?'}`})`;
+};
+
 const toModelRouteTargets = (rows: TargetRow[]): ModelRouteTarget[] =>
-  rows.map(({ channel_id, upstream_model, account_id }) => ({
-    channel_id: channel_id as number,
+  rows.map(({ provider_id, channel_id, upstream_model, account_id }) => ({
+    provider_id: provider_id as number,
+    channel_id: channel_id ?? null,
     upstream_model: upstream_model as string,
     ...(account_id ? { account_id } : {}),
   }));
@@ -116,7 +131,7 @@ export default function ModelRoutes() {
                     <Tag color={i === 0 ? 'green' : 'default'}>
                       {i === 0 ? t('route.primary') : `#${i + 1}`}
                     </Tag>
-                    {channelLabel(channels, tgt.channel_id)} → <code>{tgt.upstream_model}</code>
+                    {targetLabel(channels, providers, tgt, t('route.autoTarget'))} → <code>{tgt.upstream_model}</code>
                     {tgt.account_id ? (
                       <Tag color="blue" style={{ marginInlineStart: 6 }}>
                         {t('route.pinnedAccount')}: {accountLabel(accounts, tgt.account_id)}
@@ -234,8 +249,8 @@ function ModelRouteDrawer({
   const targets: TargetRow[] = isCreate
     ? localTargets
     : (route?.targets ?? []).map((tgt) => ({
-        provider_id: channels.find((c) => c.id === tgt.channel_id)?.provider_id,
-        channel_id: tgt.channel_id,
+        provider_id: tgt.provider_id ?? channels.find((c) => c.id === tgt.channel_id)?.provider_id,
+        channel_id: tgt.channel_id ?? undefined,
         upstream_model: tgt.upstream_model,
         account_id: tgt.account_id,
       }));
@@ -346,7 +361,7 @@ function ModelRouteDrawer({
                     <Tag color={i === 0 ? 'green' : 'default'} style={{ marginInlineEnd: 0 }}>
                       {i === 0 ? t('route.primary') : `#${i + 1}`}
                     </Tag>
-                    <Typography.Text>{channelLabel(channels, tgt.channel_id)}</Typography.Text>
+                    <Typography.Text>{targetLabel(channels, providers, tgt, t('route.autoTarget'))}</Typography.Text>
                     <Typography.Text type="secondary">→</Typography.Text>
                     <Typography.Text code>{tgt.upstream_model}</Typography.Text>
                     {tgt.account_id ? (
@@ -467,11 +482,20 @@ function TargetModal({
             }}
           />
         </Form.Item>
-        <Form.Item name="channel_id" label={t('route.targetChannel')} rules={[{ required: true }]}>
+        <Form.Item
+          name="channel_id"
+          label={t('route.targetChannel')}
+          tooltip={t('route.autoChannel')}
+        >
           <Select
+            allowClear
             options={channelOptions}
-            placeholder={t('route.targetChannel')}
-            onChange={() => form.setFieldValue('upstream_model', '')}
+            placeholder={t('route.autoChannel')}
+            onChange={(v) => {
+              // Reset the model cascade only when an endpoint was actually
+              // picked — clearing back to auto keeps the typed model.
+              if (v != null) form.setFieldValue('upstream_model', '');
+            }}
           />
         </Form.Item>
         <Form.Item name="upstream_model" label={t('route.upstreamModel')} rules={[{ required: true }]}>

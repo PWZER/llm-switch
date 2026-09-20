@@ -188,6 +188,8 @@ export const en: Record<string, string> = {
   'route.namePlaceholder': 'main',
   'route.provider': 'Provider',
   'route.targetChannel': 'Target endpoint',
+  'route.autoChannel': 'Auto — the gateway picks among this provider\'s enabled endpoints',
+  'route.autoTarget': 'Auto',
   'route.upstreamModel': 'Upstream model',
   'route.switched': 'switched — next request uses the new target',
   'route.targets': 'Target chain (primary → failover)',
@@ -197,7 +199,7 @@ export const en: Record<string, string> = {
   'route.addTarget': 'Add target',
   'route.pinnedAccount': 'Pinned account',
   'route.pinnedAccountTip':
-    'Pin this target to one account of the endpoint\'s provider. Empty = the provider\'s account pool rotates (weighted).',
+    'Pin this target to one account of the target\'s provider. Empty = the provider\'s account pool rotates (weighted).',
   'route.poolRotation': 'Account pool rotation (default)',
 
   // Client keys
@@ -425,6 +427,8 @@ export const zh: Record<string, string> = {
   'route.namePlaceholder': 'main',
   'route.provider': '供应商',
   'route.targetChannel': '目标端点',
+  'route.autoChannel': '自动 — 网关在该供应商已启用的端点间自动选择',
+  'route.autoTarget': '自动',
   'route.upstreamModel': '上游模型',
   'route.switched': '已切换 — 下一次请求使用新目标',
   'route.targets': '目标链（主用 → 故障转移）',
@@ -433,7 +437,7 @@ export const zh: Record<string, string> = {
     '第一个健康的端点服务请求；它失败（429/5xx/网络错误）时自动切到下一个。用箭头调整顺序。',
   'route.addTarget': '添加目标',
   'route.pinnedAccount': '指定账号',
-  'route.pinnedAccountTip': '将该目标固定到端点所属供应商的某个账号。留空 = 供应商账号池按权重轮询。',
+  'route.pinnedAccountTip': '将该目标固定到所属供应商的某个账号。留空 = 供应商账号池按权重轮询。',
   'route.poolRotation': '账号池轮询（默认）',
 
   'keys.new': '新建密钥',

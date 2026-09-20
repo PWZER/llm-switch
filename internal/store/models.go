@@ -35,10 +35,14 @@ func (m *Model) Upstream() string {
 }
 
 // ModelRouteTarget is one entry of a model route's ordered failover chain.
-// AccountID optionally pins the target to one account of the target channel's
-// provider; 0/nil means the provider's account pool rotates as usual.
+// ProviderID owns the target; ChannelID optionally pins one of its endpoints
+// (nil = auto-select among the provider's enabled channels). AccountID
+// optionally pins one account of the target's provider; 0/nil means the
+// provider's account pool rotates as usual. Legacy rows carry only
+// ChannelID (ProviderID 0); the admin API backfills the provider on write.
 type ModelRouteTarget struct {
-	ChannelID     int64  `json:"channel_id"`
+	ProviderID    int64  `json:"provider_id,omitempty"`
+	ChannelID     *int64 `json:"channel_id"`
 	UpstreamModel string `json:"upstream_model"`
 	AccountID     *int64 `json:"account_id,omitempty"`
 }
@@ -178,6 +182,18 @@ func (r *ModelRouteRepo) Upsert(ctx context.Context, a *ModelRoute) error {
 	if len(a.Targets) == 0 {
 		return fmt.Errorf("model route %q needs at least one target", a.Name)
 	}
+	// Defensive guard: every target must name at least one routing id and an
+	// upstream model. This is deliberately lax about provider_id (legacy rows
+	// legitimately carry only a channel pin); the admin API enforces the full
+	// shape on write.
+	for i, tgt := range a.Targets {
+		if tgt.UpstreamModel == "" {
+			return fmt.Errorf("model route %q target %d needs upstream_model", a.Name, i+1)
+		}
+		if tgt.ProviderID <= 0 && (tgt.ChannelID == nil || *tgt.ChannelID <= 0) {
+			return fmt.Errorf("model route %q target %d needs provider_id or channel_id", a.Name, i+1)
+		}
+	}
 	targetsJSON, err := json.Marshal(a.Targets)
 	if err != nil {
 		return fmt.Errorf("marshal model route targets: %w", err)
@@ -245,10 +261,61 @@ func (r *ModelRouteRepo) Delete(ctx context.Context, name string) error {
 	return checkAffected(res, err, "delete model route")
 }
 
-// RemoveChannel strips a channel from every model route's target chain and
-// deletes routes left with no targets. Called when a channel (or its
-// provider) is removed, so no route silently holds dangling targets.
-func (r *ModelRouteRepo) RemoveChannel(ctx context.Context, channelID int64) error {
+// RemoveChannel degrades every target pinned to channelID into a
+// provider-scoped auto-select target: the pinned endpoint is gone, the
+// provider's remaining live endpoints take over. providerID backfills
+// legacy targets that never carried one. Fully-duplicate targets produced
+// by the degrade are collapsed. Called when a channel (or its provider) is
+// removed; routes are never emptied by the degrade, so the empty-route
+// delete below is purely defensive.
+func (r *ModelRouteRepo) RemoveChannel(ctx context.Context, channelID, providerID int64) error {
+	routes, err := r.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, a := range routes {
+		changed := false
+		kept := a.Targets[:0:0]
+		for _, tgt := range a.Targets {
+			if tgt.ChannelID != nil && *tgt.ChannelID == channelID {
+				tgt.ChannelID = nil
+				if tgt.ProviderID <= 0 {
+					tgt.ProviderID = providerID
+				}
+				changed = true
+			}
+			kept = append(kept, tgt)
+		}
+		// Only rewritten routes are deduped: leave routes untouched by this
+		// deletion exactly as stored.
+		if changed {
+			kept = dedupeRouteTargets(kept)
+		}
+		switch {
+		case len(kept) == len(a.Targets) && !changed:
+			// untouched
+		case len(kept) == 0:
+			if err := r.Delete(ctx, a.Name); err != nil {
+				return err
+			}
+		default:
+			if err := r.Upsert(ctx, &ModelRoute{Name: a.Name, Targets: kept, UpdatedAt: now()}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// RemoveProvider strips every target of providerID — both provider-scoped
+// targets and channel pins on its channels (the channels cascade-delete
+// with the provider, so there is nothing to degrade to). Routes left with
+// no targets are deleted.
+func (r *ModelRouteRepo) RemoveProvider(ctx context.Context, providerID int64, channelIDs []int64) error {
+	chanSet := make(map[int64]bool, len(channelIDs))
+	for _, id := range channelIDs {
+		chanSet[id] = true
+	}
 	routes, err := r.List(ctx)
 	if err != nil {
 		return err
@@ -256,7 +323,11 @@ func (r *ModelRouteRepo) RemoveChannel(ctx context.Context, channelID int64) err
 	for _, a := range routes {
 		kept := a.Targets[:0:0]
 		for _, tgt := range a.Targets {
-			if tgt.ChannelID != channelID {
+			var cid int64
+			if tgt.ChannelID != nil {
+				cid = *tgt.ChannelID
+			}
+			if tgt.ProviderID != providerID && !chanSet[cid] {
 				kept = append(kept, tgt)
 			}
 		}
@@ -274,4 +345,33 @@ func (r *ModelRouteRepo) RemoveChannel(ctx context.Context, channelID int64) err
 		}
 	}
 	return nil
+}
+
+// dedupeRouteTargets collapses fully-identical entries (same provider,
+// channel pin, upstream model and account pin) so a degraded pin never
+// stacks onto an equal auto-select target.
+func dedupeRouteTargets(targets []ModelRouteTarget) []ModelRouteTarget {
+	type key struct {
+		provider, channel int64
+		pinned            bool
+		upstream          string
+		account           int64
+	}
+	seen := make(map[key]bool, len(targets))
+	kept := targets[:0:0]
+	for _, tgt := range targets {
+		k := key{provider: tgt.ProviderID, upstream: tgt.UpstreamModel}
+		if tgt.ChannelID != nil {
+			k.channel, k.pinned = *tgt.ChannelID, true
+		}
+		if tgt.AccountID != nil {
+			k.account = *tgt.AccountID
+		}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		kept = append(kept, tgt)
+	}
+	return kept
 }

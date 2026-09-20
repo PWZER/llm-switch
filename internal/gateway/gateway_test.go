@@ -240,7 +240,7 @@ func TestRoutePinnedAccount(t *testing.T) {
 	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
 		Name: "pinned-route",
 		Targets: []store.ModelRouteTarget{
-			{ChannelID: 1, UpstreamModel: "fake-chat", AccountID: &aid},
+			{ProviderID: pid, ChannelID: int64p(1), UpstreamModel: "fake-chat", AccountID: &aid},
 		},
 	}))
 	h.rebuild()
@@ -264,6 +264,8 @@ func TestRoutePinnedAccount(t *testing.T) {
 }
 
 func boolp(b bool) *bool { return &b }
+
+func int64p(v int64) *int64 { return &v }
 
 func TestOpenAIPassthroughStream(t *testing.T) {
 	h := newHarness(t)
@@ -441,8 +443,9 @@ func TestModelRouteHotSwitch(t *testing.T) {
 			anthroID = c.ID
 		}
 	}
+	pid := ch[0].ProviderID
 	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{Name: "main", Targets: []store.ModelRouteTarget{
-		{ChannelID: anthroID, UpstreamModel: "fake-chat"},
+		{ProviderID: pid, ChannelID: &anthroID, UpstreamModel: "fake-chat"},
 	}}))
 	h.rebuild()
 
@@ -463,7 +466,7 @@ func TestModelRouteHotSwitch(t *testing.T) {
 		}
 	}
 	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{Name: "main", Targets: []store.ModelRouteTarget{
-		{ChannelID: openaiID, UpstreamModel: "fake-chat"},
+		{ProviderID: pid, ChannelID: &openaiID, UpstreamModel: "fake-chat"},
 	}}))
 	h.rebuild()
 	before := h.openai.Requests()
@@ -490,11 +493,12 @@ func TestModelRouteMultiTargetFailover(t *testing.T) {
 			openaiID = c.ID
 		}
 	}
+	pid := chs[0].ProviderID
 
 	// Route chain: primary = anthropic channel, failover = openai channel.
 	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{Name: "chain", Targets: []store.ModelRouteTarget{
-		{ChannelID: anthroID, UpstreamModel: "fake-chat"},
-		{ChannelID: openaiID, UpstreamModel: "fake-chat"},
+		{ProviderID: pid, ChannelID: &anthroID, UpstreamModel: "fake-chat"},
+		{ProviderID: pid, ChannelID: &openaiID, UpstreamModel: "fake-chat"},
 	}}))
 	h.rebuild()
 
@@ -514,5 +518,126 @@ func TestModelRouteMultiTargetFailover(t *testing.T) {
 		map[string]string{"anthropic-version": "2023-06-01"})
 	if !strings.Contains(string(raw), "Hello from fake OpenAI") {
 		t.Fatalf("failover target did not serve: %s", raw)
+	}
+}
+
+// A provider-scoped route target (no channel pin) auto-selects among the
+// provider's live endpoints: each client surface is served by its own
+// protocol endpoint with no bridging.
+func TestRouteProviderTargetAutoSelect(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	ch, err := h.st.Channels.Get(ctx, 1)
+	must(t, err)
+	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name:    "auto",
+		Targets: []store.ModelRouteTarget{{ProviderID: ch.ProviderID, UpstreamModel: "fake-chat"}},
+	}))
+	h.rebuild()
+
+	_, raw := h.post("/v1/messages", `{"model":"auto","max_tokens":16,"stream":false}`,
+		map[string]string{"anthropic-version": "2023-06-01"})
+	if !strings.Contains(string(raw), "Hello from fake Anthropic") {
+		t.Fatalf("anthropic surface must hit the anthropic endpoint: %s", raw)
+	}
+	_, raw = h.post("/v1/chat/completions", `{"model":"auto","stream":false}`, nil)
+	if !strings.Contains(string(raw), "Hello from fake OpenAI") {
+		t.Fatalf("openai surface must hit the openai endpoint: %s", raw)
+	}
+}
+
+// Cross-protocol fallback: with the provider's anthropic endpoint disabled,
+// the anthropic surface still serves the provider-scoped target via the
+// openai endpoint (bridged).
+func TestRouteProviderTargetCrossProtocolFallback(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	ch, err := h.st.Channels.Get(ctx, 1)
+	must(t, err)
+	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name:    "auto",
+		Targets: []store.ModelRouteTarget{{ProviderID: ch.ProviderID, UpstreamModel: "fake-chat"}},
+	}))
+	h.disableHarnessProtocol("anthropic")
+
+	_, raw := h.post("/v1/messages", `{"model":"auto","max_tokens":16,"stream":false}`,
+		map[string]string{"anthropic-version": "2023-06-01"})
+	if !strings.Contains(string(raw), "Hello from fake OpenAI") {
+		t.Fatalf("anthropic surface must fall back to the openai endpoint: %s", raw)
+	}
+}
+
+// In-segment failover: a provider-scoped target fails over across the
+// provider's own endpoints (two openai endpoints; the anthropic one is
+// protocol-filtered away for the openai surface).
+func TestRouteProviderSegmentFailover(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	ch, err := h.st.Channels.Get(ctx, 1)
+	must(t, err)
+	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name:    "auto",
+		Targets: []store.ModelRouteTarget{{ProviderID: ch.ProviderID, UpstreamModel: "fake-chat"}},
+	}))
+	// A second openai endpoint of the same provider at lower priority.
+	_, err = h.st.Channels.Create(ctx, &store.Channel{
+		ProviderID: ch.ProviderID, Name: "fake-openai-2", Protocol: "openai",
+		BaseURL: h.openai.URL(), ChatPath: "/chat/completions",
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 5, Weight: 1,
+		Passthrough: true,
+	})
+	must(t, err)
+	h.rebuild()
+
+	// First openai call 429s; the segment's next candidate (the second openai
+	// endpoint of the same provider) must take over.
+	h.openai.FailFirstN(1)
+	resp, raw := h.post("/v1/chat/completions", `{"model":"auto","stream":false}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("segment failover failed, status %d: %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "Hello from fake OpenAI") {
+		t.Fatalf("unexpected body: %s", raw)
+	}
+	if h.openai.Requests() != 2 { // first 429'd, second succeeded
+		t.Fatalf("unexpected request count: %d", h.openai.Requests())
+	}
+}
+
+// A provider-scoped target with a pinned account authenticates upstream with
+// exactly that key; disabling the account skips the whole segment (the route
+// has nothing else to fall through to -> 404).
+func TestRouteProviderTargetPinnedAccount(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	ch, err := h.st.Channels.Get(ctx, 1)
+	must(t, err)
+	aid, err := h.st.Accounts.Create(ctx, ch.ProviderID, "pinned", "pinned-secret", 1, "")
+	must(t, err)
+	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name: "auto-pin",
+		Targets: []store.ModelRouteTarget{
+			{ProviderID: ch.ProviderID, UpstreamModel: "fake-chat", AccountID: &aid},
+		},
+	}))
+	h.rebuild()
+
+	resp, raw := h.post("/v1/chat/completions", `{"model":"auto-pin","stream":false}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	if got := h.openai.LastAuthorization(); got != "Bearer pinned-secret" {
+		t.Fatalf("pinned account key not used upstream: %q", got)
+	}
+
+	must(t, h.st.Accounts.Update(ctx, aid, nil, nil, boolp(false)))
+	h.rebuild()
+	resp, raw = h.post("/v1/chat/completions", `{"model":"auto-pin","stream":false}`, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("disabled pinned account should unroutable the segment, got %d: %s", resp.StatusCode, raw)
 	}
 }

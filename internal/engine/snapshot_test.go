@@ -83,10 +83,19 @@ func newTestSnapshot(t *testing.T) *Snapshot {
 	seed(pid2, "oai-model", true, 2097152) // ≥ 1M but openai-served: never marked
 
 	if err := st.Routes.Upsert(ctx, &store.ModelRoute{
-		Name:    "my-route",
-		Targets: []store.ModelRouteTarget{{ChannelID: cid, UpstreamModel: "fake-chat"}},
+		Name: "my-route",
+		// Channel-pinned target (explicit admin configuration).
+		Targets: []store.ModelRouteTarget{{ProviderID: pid, ChannelID: &cid, UpstreamModel: "fake-chat"}},
 	}); err != nil {
 		t.Fatalf("model route: %v", err)
+	}
+	// Provider-scoped target: channel omitted — the gateway auto-selects
+	// among the provider's live endpoints (same expansion as rows).
+	if err := st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name:    "auto-route",
+		Targets: []store.ModelRouteTarget{{ProviderID: pid, UpstreamModel: "fake-chat"}},
+	}); err != nil {
+		t.Fatalf("auto route: %v", err)
 	}
 
 	snap, err := buildSnapshot(ctx, st)
@@ -108,8 +117,8 @@ func findEntry(snap *Snapshot, id string) *ModelEntry {
 func TestSnapshotListFilteringAndProviders(t *testing.T) {
 	snap := newTestSnapshot(t)
 
-	// Listed: every enabled row's name plus the model route.
-	for _, id := range []string{"reg-model", "test-model", "claude-test", "big-model", "oai-model", "my-route"} {
+	// Listed: every enabled row's name plus both model routes.
+	for _, id := range []string{"reg-model", "test-model", "claude-test", "big-model", "oai-model", "my-route", "auto-route"} {
 		if findEntry(snap, id) == nil {
 			t.Fatalf("missing %q in snapshot list", id)
 		}
@@ -121,8 +130,9 @@ func TestSnapshotListFilteringAndProviders(t *testing.T) {
 	}
 
 	// Description renders as "{provider}({endpoint})" — the serving channel
-	// that would handle the name first.
-	for _, id := range []string{"reg-model", "test-model", "my-route"} {
+	// that would handle the name first. A provider-scoped route target
+	// describes the provider's build-order top channel.
+	for _, id := range []string{"reg-model", "test-model", "my-route", "auto-route"} {
 		if e := findEntry(snap, id); e != nil && e.Provider != "fake(fake-anthropic)" {
 			t.Fatalf("%s provider = %q, want %q", id, e.Provider, "fake(fake-anthropic)")
 		}
@@ -152,7 +162,7 @@ func TestSnapshotDiscoveryVariants(t *testing.T) {
 
 	// One variant per anthropic-served listed name lacking claude/anthropic;
 	// none for ids that already match the filter or are disabled.
-	for _, want := range []string{"claude-reg-model", "claude-test-model", "claude-my-route"} {
+	for _, want := range []string{"claude-reg-model", "claude-test-model", "claude-my-route", "claude-auto-route"} {
 		if !variantIDs[want] {
 			t.Fatalf("missing discovery variant %q in %v", want, variantIDs)
 		}
@@ -208,7 +218,7 @@ func TestSnapshotContext1mMarkers(t *testing.T) {
 	}
 
 	// Below threshold, no limits, or openai-served: never marked.
-	for _, absent := range []string{"reg-model[1m]", "test-model[1m]", "my-route[1m]", "oai-model[1m]", "big-model[1m][1m]"} {
+	for _, absent := range []string{"reg-model[1m]", "test-model[1m]", "my-route[1m]", "auto-route[1m]", "oai-model[1m]", "big-model[1m][1m]"} {
 		if findVariant(absent) != nil || findEntry(snap, absent) != nil {
 			t.Fatalf("unexpected marked entry %q", absent)
 		}
@@ -326,9 +336,190 @@ func TestResolveProtocolPreference(t *testing.T) {
 		t.Fatalf("openai-only provider must fall back to cross-protocol: %v %v", cands, ok)
 	}
 
-	// Route targets are explicit admin configuration: no protocol filtering.
+	// Route targets pinning an explicit channel are explicit admin
+	// configuration: no protocol filtering.
 	cands, _, ok = snap.Resolve("my-route", "openai")
 	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "anthropic" {
 		t.Fatalf("route chain must not be protocol-filtered: %v %v", cands, ok)
+	}
+
+	// A provider-scoped route target behaves like a row: same-protocol first.
+	cands, _, ok = snap.Resolve("auto-route", "anthropic")
+	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "anthropic" {
+		t.Fatalf("provider target must prefer same protocol: %v %v", cands, ok)
+	}
+	cands, _, ok = snap.Resolve("auto-route", "openai")
+	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "openai" {
+		t.Fatalf("provider target must prefer same protocol (openai): %v %v", cands, ok)
+	}
+}
+
+func idp(v int64) *int64 { return &v }
+
+func boolp(b bool) *bool { return &b }
+
+// TestResolveProviderTarget: a provider-scoped route target expands to one
+// candidate per live channel of its provider (priority DESC, weight DESC),
+// with same-protocol-first preference applied per segment only — an explicit
+// channel pin in the same chain is never filtered. A dead pinned account
+// skips the whole segment (fall-through), and disabled channels or providers
+// never expand.
+func TestResolveProviderTarget(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db, err := store.Open(dir, filepath.Join(dir, "route.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	st, err := store.New(db)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	pid, err := st.Providers.Create(ctx, "p", nil)
+	if err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+	mkChannel := func(name, protocol string, priority, weight int, enabled bool) int64 {
+		t.Helper()
+		cid, err := st.Channels.Create(ctx, &store.Channel{
+			ProviderID: pid, Name: name, Protocol: protocol,
+			BaseURL: "http://127.0.0.1:1", ChatPath: "/x",
+			AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: enabled, Priority: priority, Weight: weight,
+		})
+		if err != nil {
+			t.Fatalf("channel %s: %v", name, err)
+		}
+		return cid
+	}
+	anthroLo := mkChannel("a-lo", "anthropic", 5, 1, true)  // lower priority
+	oaiHi := mkChannel("o-hi", "openai", 10, 5, true)       // highest priority overall
+	anthroHi := mkChannel("a-hi", "anthropic", 10, 3, true) // top anthropic by weight
+	mkChannel("o-hi2", "openai", 10, 7, true)               // top openai by weight
+
+	upsert := func(name string, targets []store.ModelRouteTarget) {
+		t.Helper()
+		if err := st.Routes.Upsert(ctx, &store.ModelRoute{Name: name, Targets: targets}); err != nil {
+			t.Fatalf("route %s: %v", name, err)
+		}
+	}
+	build := func() *Snapshot {
+		t.Helper()
+		snap, err := buildSnapshot(ctx, st)
+		if err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		return snap
+	}
+	summary := func(cands []Candidate) string {
+		out := make([]string, 0, len(cands))
+		for _, c := range cands {
+			out = append(out, c.Channel.Name+"("+c.UpstreamModel+")")
+		}
+		return strings.Join(out, ",")
+	}
+
+	upsert("auto", []store.ModelRouteTarget{{ProviderID: pid, UpstreamModel: "up"}})
+
+	// In-segment order: priority DESC then weight DESC; protocol preference
+	// beats priority (a-lo's protocol wins over o-hi's priority for the
+	// anthropic surface). Candidates carry the target's upstream model.
+	snap := build()
+	cands, _, ok := snap.Resolve("auto", "anthropic")
+	if !ok || summary(cands) != "a-hi(up),a-lo(up)" {
+		t.Fatalf("anthropic segment wrong: %q %v", summary(cands), ok)
+	}
+	cands, _, ok = snap.Resolve("auto", "openai")
+	if !ok || summary(cands) != "o-hi2(up),o-hi(up)" {
+		t.Fatalf("openai segment wrong: %q %v", summary(cands), ok)
+	}
+
+	// No same-protocol channel left: the whole segment falls back to
+	// cross-protocol, in priority order.
+	mustDisable := func(cid int64) {
+		t.Helper()
+		ch, err := st.Channels.Get(ctx, cid)
+		if err != nil {
+			t.Fatalf("get channel: %v", err)
+		}
+		ch.Enabled = false
+		if err := st.Channels.Update(ctx, &ch); err != nil {
+			t.Fatalf("disable channel: %v", err)
+		}
+	}
+	mustDisable(anthroLo)
+	mustDisable(anthroHi)
+	cands, _, ok = build().Resolve("auto", "anthropic")
+	if !ok || summary(cands) != "o-hi2(up),o-hi(up)" {
+		t.Fatalf("cross-protocol fallback wrong: %q %v", summary(cands), ok)
+	}
+	mustEnable := func(cid int64) {
+		t.Helper()
+		ch, err := st.Channels.Get(ctx, cid)
+		if err != nil {
+			t.Fatalf("get channel: %v", err)
+		}
+		ch.Enabled = true
+		if err := st.Channels.Update(ctx, &ch); err != nil {
+			t.Fatalf("enable channel: %v", err)
+		}
+	}
+	mustEnable(anthroLo)
+	mustEnable(anthroHi)
+
+	// Mixed chain: the provider segment comes first (protocol-preferred), the
+	// explicit pin follows unfiltered — an openai pin is listed for the
+	// anthropic surface even though same-protocol channels exist.
+	upsert("mixed", []store.ModelRouteTarget{
+		{ProviderID: pid, UpstreamModel: "up"},
+		{ProviderID: pid, ChannelID: idp(oaiHi), UpstreamModel: "pin"},
+	})
+	cands, _, ok = build().Resolve("mixed", "anthropic")
+	if !ok || summary(cands) != "a-hi(up),a-lo(up),o-hi(pin)" {
+		t.Fatalf("mixed chain wrong: %q %v", summary(cands), ok)
+	}
+
+	// A dead pinned account skips the whole segment; the chain falls through
+	// to the next target.
+	aid, err := st.Accounts.Create(ctx, pid, "a1", "k", 1, "")
+	if err != nil {
+		t.Fatalf("account: %v", err)
+	}
+	upsert("pinacc", []store.ModelRouteTarget{
+		{ProviderID: pid, UpstreamModel: "up", AccountID: &aid},
+		{ProviderID: pid, ChannelID: idp(oaiHi), UpstreamModel: "pin"},
+	})
+	cands, _, ok = build().Resolve("pinacc", "anthropic")
+	if !ok || len(cands) != 3 {
+		t.Fatalf("live pinned account must serve the segment: %q %v", summary(cands), ok)
+	}
+	if err := st.Accounts.Update(ctx, aid, nil, nil, boolp(false)); err != nil {
+		t.Fatalf("disable account: %v", err)
+	}
+	cands, _, ok = build().Resolve("pinacc", "anthropic")
+	if !ok || len(cands) != 1 || cands[0].Channel.Name != "o-hi" {
+		t.Fatalf("dead pinned account must skip the segment: %q %v", summary(cands), ok)
+	}
+
+	// A provider with no live channels expands to nothing.
+	if err := st.Providers.SetEnabled(ctx, pid, false); err != nil {
+		t.Fatalf("disable provider: %v", err)
+	}
+	if _, _, ok := build().Resolve("auto", "anthropic"); ok {
+		t.Fatal("disabled provider must not expand")
+	}
+	if err := st.Providers.SetEnabled(ctx, pid, true); err != nil {
+		t.Fatalf("enable provider: %v", err)
+	}
+
+	// Legacy stored target (ProviderID 0 + channel pin) still resolves via
+	// the pin, unfiltered.
+	upsert("legacy", []store.ModelRouteTarget{
+		{ChannelID: idp(oaiHi), UpstreamModel: "pin"},
+	})
+	cands, _, ok = build().Resolve("legacy", "anthropic")
+	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "openai" {
+		t.Fatalf("legacy channel pin must resolve unfiltered: %q %v", summary(cands), ok)
 	}
 }

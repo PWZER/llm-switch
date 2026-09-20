@@ -224,7 +224,7 @@ func (s *Server) handleUpsertRoute(w http.ResponseWriter, req *http.Request) {
 	case body.Targets != nil:
 		targets = *body.Targets
 	case body.ChannelID != nil && body.UpstreamModel != nil:
-		targets = []store.ModelRouteTarget{{ChannelID: *body.ChannelID, UpstreamModel: *body.UpstreamModel}}
+		targets = []store.ModelRouteTarget{{ChannelID: body.ChannelID, UpstreamModel: *body.UpstreamModel}}
 	default:
 		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002,
 			`provide "targets" (ordered list) or legacy "channel_id"+"upstream_model"`)
@@ -235,18 +235,53 @@ func (s *Server) handleUpsertRoute(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	// Validate every target eagerly so a typo cannot silently black-hole
-	// agent traffic. A pinned account must belong to the target channel's
-	// provider.
-	for i, tgt := range targets {
-		if tgt.ChannelID <= 0 || tgt.UpstreamModel == "" {
+	// agent traffic. provider_id owns the target; channel_id optionally pins
+	// one endpoint (null = auto-select among the provider's enabled
+	// channels). A pinned account must belong to the target's provider.
+	// Legacy payloads without provider_id are backfilled from the channel,
+	// so stored targets always carry it.
+	for i := range targets {
+		tgt := &targets[i]
+		if tgt.ProviderID <= 0 && (tgt.ChannelID == nil || *tgt.ChannelID <= 0) {
 			httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002,
-				fmt.Sprintf("target %d needs channel_id and upstream_model", i+1))
+				fmt.Sprintf("target %d needs provider_id (or channel_id)", i+1))
 			return
 		}
-		ch, err := s.St.Channels.Get(req.Context(), tgt.ChannelID)
-		if err != nil {
-			mapStoreErr(w, req, err)
+		if tgt.ChannelID != nil && *tgt.ChannelID <= 0 {
+			httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002,
+				fmt.Sprintf("target %d: invalid channel_id %d", i+1, *tgt.ChannelID))
 			return
+		}
+		if tgt.UpstreamModel == "" {
+			httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002,
+				fmt.Sprintf("target %d needs upstream_model", i+1))
+			return
+		}
+		if tgt.ProviderID <= 0 {
+			// Legacy target: derive the provider from the pinned channel.
+			ch, err := s.St.Channels.Get(req.Context(), *tgt.ChannelID)
+			if err != nil {
+				mapStoreErr(w, req, err)
+				return
+			}
+			tgt.ProviderID = ch.ProviderID
+		} else {
+			if _, err := s.St.Providers.Get(req.Context(), tgt.ProviderID); err != nil {
+				mapStoreErr(w, req, err)
+				return
+			}
+			if tgt.ChannelID != nil {
+				ch, err := s.St.Channels.Get(req.Context(), *tgt.ChannelID)
+				if err != nil {
+					mapStoreErr(w, req, err)
+					return
+				}
+				if ch.ProviderID != tgt.ProviderID {
+					httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002,
+						fmt.Sprintf("target %d: channel %d does not belong to provider %d", i+1, *tgt.ChannelID, tgt.ProviderID))
+					return
+				}
+			}
 		}
 		if tgt.AccountID != nil && *tgt.AccountID > 0 {
 			account, err := s.St.Accounts.Get(req.Context(), *tgt.AccountID)
@@ -254,9 +289,9 @@ func (s *Server) handleUpsertRoute(w http.ResponseWriter, req *http.Request) {
 				mapStoreErr(w, req, err)
 				return
 			}
-			if account.ProviderID != ch.ProviderID {
+			if account.ProviderID != tgt.ProviderID {
 				httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002,
-					fmt.Sprintf("target %d: account %d does not belong to the channel's provider", i+1, *tgt.AccountID))
+					fmt.Sprintf("target %d: account %d does not belong to provider %d", i+1, *tgt.AccountID, tgt.ProviderID))
 				return
 			}
 		}

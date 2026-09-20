@@ -72,9 +72,13 @@ const (
 )
 
 // RouteTarget is one entry of a model route's ordered failover chain.
-// AccountID optionally pins the target to one account of the target channel's
-// provider; 0 means the provider's account pool rotates as usual.
+// ProviderID owns the target; ChannelID pins one of its endpoints (0 =
+// auto-select among the provider's live channels — the JSON-level nil
+// flattens to 0 here). AccountID optionally pins the target to one account
+// of the target's provider; 0 means the provider's account pool rotates as
+// usual.
 type RouteTarget struct {
+	ProviderID    int64
 	ChannelID     int64
 	UpstreamModel string
 	AccountID     int64
@@ -109,13 +113,17 @@ type ModelEntry struct {
 
 // Snapshot is an immutable view of routing configuration.
 type Snapshot struct {
-	Version    int64
-	Providers  map[int64]*Provider
-	Channels   map[int64]*Channel
-	ByModel    map[string][]Candidate // failover-ordered
-	Routes     map[string]Route
-	ClientKeys map[string]ClientKey // sha256(key) -> record
-	Models     []ModelEntry         // merged registry, sorted by id
+	Version   int64
+	Providers map[int64]*Provider
+	Channels  map[int64]*Channel
+	// channelsByProvider groups the live channels (enabled channel of an
+	// enabled provider) per provider, each slice sorted priority DESC then
+	// weight DESC — the same expansion order as ByModel candidates.
+	channelsByProvider map[int64][]*Channel
+	ByModel            map[string][]Candidate // failover-ordered
+	Routes             map[string]Route
+	ClientKeys         map[string]ClientKey // sha256(key) -> record
+	Models             []ModelEntry         // merged registry, sorted by id
 	// DiscoveryVariants holds "claude-<id>" mirrors of Models for ids lacking
 	// a claude/anthropic substring. Claude Code's gateway model discovery only
 	// accepts such ids, so the Anthropic-shaped /v1/models lists them; the
@@ -161,33 +169,76 @@ func (s *Snapshot) anthropicServed(name string) bool {
 	}
 	if rt, ok := s.Routes[name]; ok {
 		for _, tgt := range rt.Targets {
-			if ch := s.Channels[tgt.ChannelID]; ch != nil && ch.Protocol == "anthropic" {
-				return true
+			for _, ch := range s.targetLiveChannels(tgt) {
+				if ch.Protocol == "anthropic" {
+					return true
+				}
 			}
 		}
 	}
 	return false
 }
 
-// routeChain materializes a route's target chain against the live channel
-// set; empty when no target is currently routable. A target pinning an account
-// is skipped when the account is not in the provider's enabled pool.
-func (s *Snapshot) routeChain(rt Route) []Candidate {
-	var cands []Candidate
-	for _, tgt := range rt.Targets {
+// targetLiveChannels returns the channels one route target expands to: the
+// pinned channel (nil when disabled or deleted), or every live channel of
+// the target's provider in build order (priority DESC, weight DESC; empty
+// when it has none). Account pins are the caller's concern.
+func (s *Snapshot) targetLiveChannels(tgt RouteTarget) []*Channel {
+	if tgt.ChannelID != 0 {
 		ch := s.Channels[tgt.ChannelID]
 		if ch == nil {
+			return nil
+		}
+		return []*Channel{ch}
+	}
+	return s.channelsByProvider[tgt.ProviderID]
+}
+
+// routeChain materializes a route's target chain against the live channel
+// set; empty when no target is currently routable. Channel-pinned targets
+// are explicit admin configuration and are never protocol-filtered; a
+// provider-scoped target expands to the provider's live channels with the
+// same same-protocol preference as row-derived candidates. A target pinning
+// an account is skipped when the account is not in the provider's enabled
+// pool.
+func (s *Snapshot) routeChain(rt Route, preferProtocol string) []Candidate {
+	var cands []Candidate
+	for _, tgt := range rt.Targets {
+		if tgt.ChannelID != 0 {
+			ch := s.Channels[tgt.ChannelID]
+			if ch == nil {
+				continue
+			}
+			cand := Candidate{Channel: ch, UpstreamModel: tgt.UpstreamModel}
+			if tgt.AccountID != 0 {
+				acc := ch.Provider.account(tgt.AccountID)
+				if acc == nil {
+					continue // pinned account disabled or gone: target unroutable
+				}
+				cand.Account = acc
+			}
+			cands = append(cands, cand)
 			continue
 		}
-		cand := Candidate{Channel: ch, UpstreamModel: tgt.UpstreamModel}
+		// Provider-scoped target: auto-select among the provider's live
+		// endpoints. A dead pinned account skips the whole segment — never
+		// silently rotate onto accounts the admin excluded.
+		var pinned *Account
 		if tgt.AccountID != 0 {
-			acc := ch.Provider.account(tgt.AccountID)
-			if acc == nil {
-				continue // pinned account disabled or gone: target unroutable
+			pinned = s.Providers[tgt.ProviderID].account(tgt.AccountID)
+			if pinned == nil {
+				continue
 			}
-			cand.Account = acc
 		}
-		cands = append(cands, cand)
+		live := s.targetLiveChannels(tgt)
+		if len(live) == 0 {
+			continue
+		}
+		seg := make([]Candidate, 0, len(live))
+		for _, ch := range live {
+			seg = append(seg, Candidate{Channel: ch, UpstreamModel: tgt.UpstreamModel, Account: pinned})
+		}
+		cands = append(cands, preferSameProtocol(seg, preferProtocol)...)
 	}
 	return cands
 }
@@ -226,12 +277,14 @@ func (p *Provider) account(id int64) *Account {
 // preferProtocol is the client surface's wire protocol ("openai" |
 // "anthropic"): row-derived candidates matching it win outright, and
 // cross-protocol candidates serve only when no same-protocol candidate
-// exists (bridging costs a conversion). Route chains are explicit admin
-// configuration and are never filtered.
+// exists (bridging costs a conversion). Route targets pinning an explicit
+// channel are explicit admin configuration and are never filtered;
+// provider-scoped route targets apply the same same-protocol preference
+// within their own segment only.
 func (s *Snapshot) Resolve(requested, preferProtocol string) ([]Candidate, string, bool) {
 	requested = strings.TrimSuffix(requested, context1mSuffix)
 	if rt, ok := s.Routes[requested]; ok {
-		if cands := s.routeChain(rt); len(cands) > 0 {
+		if cands := s.routeChain(rt, preferProtocol); len(cands) > 0 {
 			return cands, rt.Name, true
 		}
 		// Route exists but every target is disabled/deleted: fall through so
@@ -244,7 +297,7 @@ func (s *Snapshot) Resolve(requested, preferProtocol string) ([]Candidate, strin
 	// prefix stripping apply.
 	if rest, ok := strings.CutPrefix(requested, "claude-"); ok {
 		if rt, ok := s.Routes[rest]; ok {
-			if cands := s.routeChain(rt); len(cands) > 0 {
+			if cands := s.routeChain(rt, preferProtocol); len(cands) > 0 {
 				return cands, rt.Name, true
 			}
 		}
@@ -303,12 +356,13 @@ func (h *Holder) Rebuild(ctx context.Context, st *store.Store) error {
 
 func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	snap := &Snapshot{
-		Providers:  map[int64]*Provider{},
-		Channels:   map[int64]*Channel{},
-		ByModel:    map[string][]Candidate{},
-		Routes:     map[string]Route{},
-		ClientKeys: map[string]ClientKey{},
-		Settings:   map[string]string{},
+		Providers:          map[int64]*Provider{},
+		Channels:           map[int64]*Channel{},
+		channelsByProvider: map[int64][]*Channel{},
+		ByModel:            map[string][]Candidate{},
+		Routes:             map[string]Route{},
+		ClientKeys:         map[string]ClientKey{},
+		Settings:           map[string]string{},
 	}
 	if all, err := st.Settings.GetAll(ctx); err == nil {
 		for k, v := range all {
@@ -338,7 +392,6 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	channelsByProvider := map[int64][]*Channel{}
 	for _, c := range channels {
 		if !c.Enabled {
 			continue
@@ -358,7 +411,18 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 			continue // provider disabled or missing: channel unroutable
 		}
 		snap.Channels[nc.ID] = nc
-		channelsByProvider[nc.ProviderID] = append(channelsByProvider[nc.ProviderID], nc)
+		snap.channelsByProvider[nc.ProviderID] = append(snap.channelsByProvider[nc.ProviderID], nc)
+	}
+	// Segment order for provider-scoped route targets must match the row
+	// expansion below: priority DESC, then weight DESC (the store's SQL
+	// ordering breaks ties by id instead of weight).
+	for _, chs := range snap.channelsByProvider {
+		sort.SliceStable(chs, func(i, j int) bool {
+			if chs[i].Priority != chs[j].Priority {
+				return chs[i].Priority > chs[j].Priority
+			}
+			return chs[i].Weight > chs[j].Weight
+		})
 	}
 
 	// Model rows are the routing table: each enabled row yields one candidate
@@ -374,7 +438,7 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 		if !m.Enabled {
 			continue
 		}
-		for _, ch := range channelsByProvider[m.ProviderID] {
+		for _, ch := range snap.channelsByProvider[m.ProviderID] {
 			snap.ByModel[m.ID] = append(snap.ByModel[m.ID],
 				Candidate{Channel: ch, UpstreamModel: m.Upstream()})
 		}
@@ -396,11 +460,19 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	for _, a := range routes {
 		targets := make([]RouteTarget, 0, len(a.Targets))
 		for _, tgt := range a.Targets {
-			var accountID int64
+			var accountID, channelID int64
 			if tgt.AccountID != nil {
 				accountID = *tgt.AccountID
 			}
-			targets = append(targets, RouteTarget{ChannelID: tgt.ChannelID, UpstreamModel: tgt.UpstreamModel, AccountID: accountID})
+			if tgt.ChannelID != nil {
+				channelID = *tgt.ChannelID
+			}
+			targets = append(targets, RouteTarget{
+				ProviderID:    tgt.ProviderID,
+				ChannelID:     channelID,
+				UpstreamModel: tgt.UpstreamModel,
+				AccountID:     accountID,
+			})
 		}
 		snap.Routes[a.Name] = Route{Name: a.Name, Targets: targets}
 	}
@@ -433,13 +505,17 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 		}
 		if rt, ok := snap.Routes[name]; ok {
 			for _, tgt := range rt.Targets {
-				if ch := snap.Channels[tgt.ChannelID]; ch != nil && ch.Provider != nil {
-					var pinned *Account
-					if tgt.AccountID != 0 {
-						pinned = ch.Provider.account(tgt.AccountID)
-					}
-					return render(ch, pinned)
+				chs := snap.targetLiveChannels(tgt)
+				if len(chs) == 0 || chs[0].Provider == nil {
+					continue
 				}
+				// chs[0] is the target's build-order top channel: the pinned
+				// endpoint, or the provider's highest-priority live one.
+				var pinned *Account
+				if tgt.AccountID != 0 {
+					pinned = chs[0].Provider.account(tgt.AccountID)
+				}
+				return render(chs[0], pinned)
 			}
 		}
 		if cands := snap.ByModel[name]; len(cands) > 0 && cands[0].Channel != nil && cands[0].Channel.Provider != nil {
@@ -456,7 +532,7 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 		if !m.Enabled {
 			continue
 		}
-		if len(channelsByProvider[m.ProviderID]) == 0 {
+		if len(snap.channelsByProvider[m.ProviderID]) == 0 {
 			continue // dead provider (disabled or no live channel): neither routable nor listed (route names still list below)
 		}
 		if e, ok := merged[m.ID]; ok {

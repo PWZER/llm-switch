@@ -143,3 +143,127 @@ func TestModelRouteNameCanonical(t *testing.T) {
 		t.Fatalf("plain name status = %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// Provider-scoped route targets: provider_id owns the target and channel_id
+// (JSON null when absent) optionally pins one endpoint. Legacy payloads
+// carrying only channel_id are accepted and backfilled with the channel's
+// provider; mismatches (channel/account not on the target's provider) are
+// rejected.
+func TestUpsertRouteProviderTarget(t *testing.T) {
+	st := newRefreshTestStore(t)
+	ctx := context.Background()
+
+	pid, err := st.Providers.Create(ctx, "p1", nil)
+	if err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+	mkChannel := func(providerID int64, name string) int64 {
+		t.Helper()
+		cid, err := st.Channels.Create(ctx, &store.Channel{
+			ProviderID: providerID, Name: name, Protocol: "openai",
+			BaseURL: "http://127.0.0.1:1", ChatPath: "/chat/completions",
+			AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 1, Weight: 1,
+		})
+		if err != nil {
+			t.Fatalf("channel %s: %v", name, err)
+		}
+		return cid
+	}
+	cid1 := mkChannel(pid, "c1")
+	pid2, err := st.Providers.Create(ctx, "p2", nil)
+	if err != nil {
+		t.Fatalf("provider2: %v", err)
+	}
+	cid2 := mkChannel(pid2, "c2")
+	aid1, err := st.Accounts.Create(ctx, pid, "a1", "k1", 1, "")
+	if err != nil {
+		t.Fatalf("account: %v", err)
+	}
+	aid2, err := st.Accounts.Create(ctx, pid2, "a2", "k2", 1, "")
+	if err != nil {
+		t.Fatalf("account2: %v", err)
+	}
+
+	s := &Server{St: st}
+	r := chi.NewRouter()
+	r.Put("/model-routes/{name}", s.handleUpsertRoute)
+	call := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/model-routes/r1", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+	decode := func(rec *httptest.ResponseRecorder) (code int, route store.ModelRoute) {
+		t.Helper()
+		var env struct {
+			Code int              `json:"code"`
+			Data store.ModelRoute `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode envelope: %v (%s)", err, rec.Body.String())
+		}
+		return env.Code, env.Data
+	}
+
+	// Provider-scoped target (explicit null channel): stored verbatim.
+	if rec := call(`{"targets":[{"provider_id":` + strconv.FormatInt(pid, 10) + `,"channel_id":null,"upstream_model":"m"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("provider target status = %d: %s", rec.Code, rec.Body.String())
+	} else if code, route := decode(rec); code != 0 || len(route.Targets) != 1 ||
+		route.Targets[0].ProviderID != pid || route.Targets[0].ChannelID != nil {
+		t.Fatalf("provider target stored wrong: %+v", route)
+	}
+
+	// Provider + channel pin: stored.
+	if rec := call(`{"targets":[{"provider_id":` + strconv.FormatInt(pid, 10) + `,"channel_id":` + strconv.FormatInt(cid1, 10) + `,"upstream_model":"m"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("pinned target status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Pinned account on a provider target: stored.
+	if rec := call(`{"targets":[{"provider_id":` + strconv.FormatInt(pid, 10) + `,"account_id":` + strconv.FormatInt(aid1, 10) + `,"upstream_model":"m"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("pinned account status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Legacy targets[] row without provider_id: accepted, provider backfilled.
+	if rec := call(`{"targets":[{"channel_id":` + strconv.FormatInt(cid1, 10) + `,"upstream_model":"m"}]}`); rec.Code != http.StatusOK {
+		t.Fatalf("legacy row status = %d: %s", rec.Code, rec.Body.String())
+	} else if code, route := decode(rec); code != 0 || len(route.Targets) != 1 || route.Targets[0].ProviderID != pid {
+		t.Fatalf("legacy row provider not backfilled: %+v", route)
+	}
+
+	// Legacy flat body: accepted, provider backfilled.
+	if rec := call(`{"channel_id":` + strconv.FormatInt(cid1, 10) + `,"upstream_model":"m"}`); rec.Code != http.StatusOK {
+		t.Fatalf("legacy flat body status = %d: %s", rec.Code, rec.Body.String())
+	} else if code, route := decode(rec); code != 0 || len(route.Targets) != 1 || route.Targets[0].ProviderID != pid {
+		t.Fatalf("legacy flat provider not backfilled: %+v", route)
+	}
+
+	// Rejections.
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"explicit channel 0", `{"targets":[{"provider_id":` + strconv.FormatInt(pid, 10) + `,"channel_id":0,"upstream_model":"m"}]}`, http.StatusBadRequest},
+		{"neither id", `{"targets":[{"upstream_model":"m"}]}`, http.StatusBadRequest},
+		{"channel 0 only", `{"targets":[{"channel_id":0,"upstream_model":"m"}]}`, http.StatusBadRequest},
+		{"empty upstream model", `{"targets":[{"provider_id":` + strconv.FormatInt(pid, 10) + `,"upstream_model":""}]}`, http.StatusBadRequest},
+		{"unknown provider", `{"targets":[{"provider_id":424242,"upstream_model":"m"}]}`, http.StatusNotFound},
+		{"unknown channel", `{"targets":[{"provider_id":` + strconv.FormatInt(pid, 10) + `,"channel_id":424242,"upstream_model":"m"}]}`, http.StatusNotFound},
+		{"channel of another provider", `{"targets":[{"provider_id":` + strconv.FormatInt(pid, 10) + `,"channel_id":` + strconv.FormatInt(cid2, 10) + `,"upstream_model":"m"}]}`, http.StatusBadRequest},
+		{"account of another provider", `{"targets":[{"provider_id":` + strconv.FormatInt(pid, 10) + `,"account_id":` + strconv.FormatInt(aid2, 10) + `,"upstream_model":"m"}]}`, http.StatusBadRequest},
+	} {
+		rec := call(tc.body)
+		if rec.Code != tc.want {
+			t.Fatalf("%s: status = %d, want %d: %s", tc.name, rec.Code, tc.want, rec.Body.String())
+		}
+		if code, _ := decode(rec); code == 0 {
+			t.Fatalf("%s: must return an error envelope", tc.name)
+		}
+	}
+
+	// A rejected upsert must not clobber the stored route.
+	if got, err := st.Routes.Get(ctx, "r1"); err != nil || got.Targets[0].ProviderID != pid {
+		t.Fatalf("rejected upsert must not store: %+v err=%v", got, err)
+	}
+}
