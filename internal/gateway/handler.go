@@ -146,7 +146,7 @@ func (g *Gateway) Mount(r chi.Router) { g.mountRoutes(r, shapeAuto) }
 
 // MountAnthropic registers the Anthropic-protocol surface (messages,
 // count_tokens, models) for the /anthropic base_url prefix; /models always
-// renders the Anthropic shape (claude-* mirrors and [1m] entries included).
+// renders the Anthropic shape (claude-prefixed forms only).
 func (g *Gateway) MountAnthropic(r chi.Router) { g.mountRoutes(r, shapeAnthropic) }
 
 // MountOpenAI registers the OpenAI-protocol surface (chat/completions,
@@ -458,10 +458,11 @@ func (g *Gateway) models(shape modelsShape, w http.ResponseWriter, r *http.Reque
 		Description string `json:"description,omitempty"`
 		limits
 	}
-	// The Anthropic surface additionally lists the [1m] context variants and
-	// the claude-* discovery variants (Claude Code's discovery only accepts
-	// ids containing claude/anthropic; the [1m] suffix is its 1M-context
-	// marker); the OpenAI surface stays with the plain list.
+	// The Anthropic surface lists every name only in its claude-discoverable
+	// form: claude-* mirrors supersede the plain ids they mirror (Claude
+	// Code's discovery only accepts ids containing claude/anthropic; the
+	// [1m] suffix is its 1M-context marker); the OpenAI surface stays with
+	// the plain list.
 	models := snap.Models
 	if anthropicShape {
 		models = anthropicListing(snap)
@@ -579,25 +580,38 @@ func modelDescription(m engine.ModelEntry) string {
 }
 
 // anthropicListing merges the plain list with the [1m] context variants and
-// the claude-* discovery variants for the Anthropic-shaped surface. Returns a
-// fresh slice: the snapshot fields are shared across requests. A model whose
-// [1m] variant exists lists only the marked forms — the plain id and its
-// claude-* mirror are superseded (the marked id routes to the same identity
-// via suffix stripping).
+// the claude-* discovery variants for the Anthropic-shaped surface, listing
+// each name only in its claude-discoverable form: a plain id (or [1m] id)
+// whose exact claude-* mirror exists is superseded by the mirror. Ids without
+// a mirror — already claude/anthropic-named, openai-only, or
+// collision-suppressed — list plainly. Returns a fresh slice: the snapshot
+// fields are shared across requests. A model whose [1m] variant exists lists
+// only the marked forms — the plain id and its claude-* mirror are
+// superseded (the marked id routes to the same identity via suffix
+// stripping).
 func anthropicListing(snap *engine.Snapshot) []engine.ModelEntry {
 	marked := make(map[string]bool, len(snap.ContextVariants))
 	for _, m := range snap.ContextVariants {
 		marked[strings.TrimSuffix(m.ID, engine.Context1mSuffix)] = true
 	}
+	mirrored := make(map[string]bool, len(snap.DiscoveryVariants))
+	for _, m := range snap.DiscoveryVariants {
+		mirrored[m.ID] = true
+	}
 	out := make([]engine.ModelEntry, 0,
 		len(snap.Models)+len(snap.ContextVariants)+len(snap.DiscoveryVariants))
 	for _, m := range snap.Models {
-		if marked[m.ID] {
+		if marked[m.ID] || mirrored["claude-"+m.ID] {
 			continue
 		}
 		out = append(out, m)
 	}
-	out = append(out, snap.ContextVariants...)
+	for _, m := range snap.ContextVariants {
+		if mirrored["claude-"+m.ID] {
+			continue
+		}
+		out = append(out, m)
+	}
 	for _, m := range snap.DiscoveryVariants {
 		if !strings.HasSuffix(m.ID, engine.Context1mSuffix) &&
 			marked[strings.TrimPrefix(strings.TrimSuffix(m.ID, engine.Context1mSuffix), "claude-")] {

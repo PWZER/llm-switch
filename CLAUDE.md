@@ -145,7 +145,10 @@ its models URL is always `<base_url>/v1/models`). The unprefixed `/v1` mount
 keeps serving every endpoint with the historical header-sniffed models shape
 (`anthropicShapeRequest`: `x-api-key` or `anthropic-version` → Anthropic shape).
 
-GET /v1/models visibility rules: listed ⇔ routable — the merged list dedupes
+GET /v1/models visibility rules: listed ⇔ routable (the invariant is exact on
+the OpenAI shape; on the Anthropic shape a mirrored name is listed — and
+by-id addressable — only in its claude-prefixed form, though it stays
+routable bare) — the merged list dedupes
 by name over enabled models rows on live providers (later duplicates only fill
 blank metadata), plus model route names. Disabling a row removes both its
 list entry and its candidacy. Each entry carries `description` =
@@ -160,18 +163,23 @@ mark; names no channel serves fall back to the row's provider
 name — Claude Code's /model picker renders it instead of
 "From gateway". Claude Code's gateway discovery
 silently drops ids without a claude/anthropic substring (verified on 2.1.273),
-so the Anthropic-shaped /v1/models additionally lists synthetic `claude-<id>`
-mirrors (`snap.DiscoveryVariants`, provider + limits copied, collisions
-skipped). Both decoration families — `claude-<id>` mirrors and `<id>[1m]`
+so the Anthropic-shaped /v1/models lists synthetic `claude-<id>` mirrors
+(`snap.DiscoveryVariants`, provider + limits copied, collisions
+skipped) **instead of** the plain ids they mirror: `anthropicListing` keeps
+every mirror and drops any plain id (plain or `<id>[1m]`) whose exact
+`claude-<id>` mirror exists. Ids without a mirror — already
+claude/anthropic-named, openai-only, or collision-suppressed by a hand-named
+`claude-<id>` row — list plainly. Both decoration families — `claude-<id>`
+mirrors and `<id>[1m]`
 context entries (`snap.ContextVariants`, derived from the merged
 `context_window >= 1,000,000`) —
 are generated only for **anthropic-served** names (>= 1 live anthropic
 channel via models rows or route targets) and emitted only on the Anthropic
 shape; `context_window` on the models row is the only control point. The
-`claude-` mirror and the `[1m]` marker are independent: every anthropic-served
-name is mirrored, and a 1m-capable name lists **only the marked forms** —
-`anthropicListing` drops the plain id and its plain `claude-<id>` mirror once
-the `[1m]` variant exists (the marked id routes to the same identity via
+`claude-` mirror and the `[1m]` marker are independent at generation time,
+and a 1m-capable name lists **only `claude-<id>[1m]`** — the plain id, its
+plain `claude-<id>` mirror, and the bare `<id>[1m]` id are all superseded
+once the `[1m]` variant exists (the marked id routes to the same identity via
 suffix stripping, and by-id lookups follow the listing).
 Routing accepts `claude-<name>` by stripping the prefix as the last fallback
 (after literal `claude-*` routes and rows) so client caches keep

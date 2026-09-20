@@ -73,17 +73,17 @@ func TestModelsPaginationAndContext(t *testing.T) {
 		HasMore bool   `json:"has_more"`
 	}
 	must(t, json.Unmarshal(raw, &p1))
-	if len(p1.Data) != 1 || p1.Data[0].ID != "aaa-model" || p1.Data[0].Type != "model" {
+	if len(p1.Data) != 1 || p1.Data[0].ID != "claude-aaa-model" || p1.Data[0].Type != "model" {
 		t.Fatalf("page 1 wrong: %s", raw)
 	}
-	if p1.FirstID != "aaa-model" || p1.LastID != "aaa-model" || !p1.HasMore {
+	if p1.FirstID != "claude-aaa-model" || p1.LastID != "claude-aaa-model" || !p1.HasMore {
 		t.Fatalf("page 1 envelope wrong: %s", raw)
 	}
 	if p1.Data[0].ContextLength == nil || *p1.Data[0].ContextLength != 32000 {
 		t.Fatalf("context_length missing: %s", raw)
 	}
 
-	_, raw = h.getModels(t, "?limit=1&after_id=aaa-model", true)
+	_, raw = h.getModels(t, "?limit=1&after_id=claude-aaa-model", true)
 	var p2 struct {
 		Data []struct {
 			ID string `json:"id"`
@@ -92,20 +92,35 @@ func TestModelsPaginationAndContext(t *testing.T) {
 		HasMore bool   `json:"has_more"`
 	}
 	must(t, json.Unmarshal(raw, &p2))
-	// The Anthropic surface lists discovery variants, so claude-aaa-model
-	// (variant of aaa-model) sorts right after aaa-model.
-	if len(p2.Data) != 1 || p2.Data[0].ID != "claude-aaa-model" || !p2.HasMore {
+	// The Anthropic surface lists only the claude-* discovery variants; the
+	// harness baseline's claude-test sorts next.
+	if len(p2.Data) != 1 || p2.Data[0].ID != "claude-test" || !p2.HasMore {
 		t.Fatalf("page 2 wrong: %s", raw)
 	}
 
-	// Cursor past the last entry: empty page, has_more false.
-	_, raw = h.getModels(t, "?after_id=zzz-model", true)
+	// The rest of the list after the baseline entry: the seeded mirrors, and
+	// has_more false at the end.
+	_, raw = h.getModels(t, "?after_id=claude-test", true)
 	var p3 struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		HasMore bool `json:"has_more"`
+	}
+	must(t, json.Unmarshal(raw, &p3))
+	if len(p3.Data) != 2 || p3.Data[0].ID != "claude-test-model" ||
+		p3.Data[1].ID != "claude-zzz-model" || p3.HasMore {
+		t.Fatalf("tail pages wrong: %s", raw)
+	}
+
+	// Cursor past the last entry: empty page, has_more false.
+	_, raw = h.getModels(t, "?after_id=claude-zzz-model", true)
+	var ptail struct {
 		Data    []json.RawMessage `json:"data"`
 		HasMore bool              `json:"has_more"`
 	}
-	must(t, json.Unmarshal(raw, &p3))
-	if len(p3.Data) != 0 || p3.HasMore {
+	must(t, json.Unmarshal(raw, &ptail))
+	if len(ptail.Data) != 0 || ptail.HasMore {
 		t.Fatalf("tail page wrong: %s", raw)
 	}
 
@@ -129,10 +144,16 @@ func TestModelsPaginationAndContext(t *testing.T) {
 		t.Fatalf("openai full list should not have more: %s", raw)
 	}
 
-	// The Anthropic surface lists the variants alongside the plain names.
+	// The Anthropic surface lists only the claude-* discovery variants — the
+	// plain names are superseded by their mirrors.
 	_, raw = h.getModels(t, "", true)
 	if !strings.Contains(string(raw), `"claude-zzz-model"`) {
 		t.Fatalf("anthropic shape missing discovery variant: %s", raw)
+	}
+	for _, gone := range []string{`"id":"aaa-model"`, `"id":"zzz-model"`} {
+		if strings.Contains(string(raw), gone) {
+			t.Fatalf("anthropic shape must not list the plain id %s: %s", gone, raw)
+		}
 	}
 }
 
@@ -181,7 +202,9 @@ func TestModelsDescriptionSourceMarker(t *testing.T) {
 		t.Fatalf("anthropic shape missing [route] description: %s", raw)
 	}
 
-	// By-id lookups carry the marker on both shapes.
+	// By-id lookups carry the marker on both shapes. route-only has no
+	// claude-* mirror (its pinned channel is openai-only), so the plain id
+	// stays listed and served on the Anthropic shape too.
 	for _, shape := range []struct {
 		anthropic bool
 		want      string
@@ -217,17 +240,17 @@ func TestModelsGetByID(t *testing.T) {
 		t.Fatalf("openai get-by-id wrong: %d %s", resp.StatusCode, raw)
 	}
 
-	// Anthropic shape.
+	// Anthropic shape: the plain id is superseded by its claude-* mirror and
+	// no longer resolves by id there.
 	req2, err := http.NewRequest(http.MethodGet, h.srv.URL+"/v1/models/zzz-model", nil)
 	must(t, err)
 	req2.Header.Set("Authorization", "Bearer "+h.key)
 	req2.Header.Set("anthropic-version", "2023-06-01")
 	resp2, err := h.client.Do(req2)
 	must(t, err)
-	raw2 := readAll(t, resp2)
-	if !strings.Contains(string(raw2), `"type":"model"`) ||
-		!strings.Contains(string(raw2), `"max_output_tokens":8192`) {
-		t.Fatalf("anthropic get-by-id wrong: %s", raw2)
+	readAll(t, resp2)
+	if resp2.StatusCode != 404 {
+		t.Fatalf("anthropic surface must not serve the superseded plain id, got %d", resp2.StatusCode)
 	}
 
 	// Discovery variants resolve by id on the Anthropic surface only.
@@ -264,8 +287,8 @@ func TestModelsGetByID(t *testing.T) {
 }
 
 // TestSurfacePrefixModelsShape: the prefixed mounts make the base_url the
-// shape control point. /anthropic/v1/models renders the full Anthropic shape
-// (decorations included) under bearer-only auth — the Claude Code
+// shape control point. /anthropic/v1/models renders the Anthropic shape
+// (claude-prefixed forms only) under bearer-only auth — the Claude Code
 // ANTHROPIC_AUTH_TOKEN case the bare /v1 header sniff mis-serves — and
 // /openai/v1/models stays plain even with sniffed headers present. Bare /v1
 // keeps header sniffing (covered by the other tests in this file).
@@ -285,6 +308,9 @@ func TestSurfacePrefixModelsShape(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"claude-zzz-model"`) {
 		t.Fatalf("anthropic prefix must list discovery variants: %s", raw)
+	}
+	if strings.Contains(string(raw), `"id":"zzz-model"`) {
+		t.Fatalf("anthropic prefix must not list the superseded plain id: %s", raw)
 	}
 	if strings.Contains(string(raw), `"object":"list"`) {
 		t.Fatalf("anthropic prefix must not render the openai envelope: %s", raw)
@@ -409,7 +435,8 @@ func TestModelsDuplicateNamesMerge(t *testing.T) {
 	}))
 	h.rebuild()
 
-	// Listed exactly once with metadata merged from both rows (Anthropic shape).
+	// Listed exactly once — as the claude-* mirror — with metadata merged
+	// from both rows (Anthropic shape).
 	_, raw := h.getModels(t, "", true)
 	var list struct {
 		Data []struct {
@@ -421,17 +448,17 @@ func TestModelsDuplicateNamesMerge(t *testing.T) {
 	must(t, json.Unmarshal(raw, &list))
 	dups := 0
 	for _, m := range list.Data {
-		if m.ID != "dup-model" {
+		if m.ID != "claude-dup-model" {
 			continue
 		}
 		dups++
 		if m.ContextLength == nil || *m.ContextLength != 32000 ||
 			m.MaxOutputTokens == nil || *m.MaxOutputTokens != 8192 {
-			t.Fatalf("dup-model metadata not merged: %s", raw)
+			t.Fatalf("claude-dup-model metadata not merged: %s", raw)
 		}
 	}
 	if dups != 1 {
-		t.Fatalf("want exactly one dup-model entry, got %d: %s", dups, raw)
+		t.Fatalf("want exactly one claude-dup-model entry, got %d: %s", dups, raw)
 	}
 
 	// OpenAI shape merged too, and get-by-id serves the merged entry.
@@ -486,9 +513,9 @@ func TestModelsDuplicateNamesMerge(t *testing.T) {
 }
 
 // TestContext1mMarker: an anthropic-served model with a 1M context window
-// lists a "<id>[1m]" entry (plus its claude-* mirror) on the Anthropic
-// surface only, and requests — marker stripped by the client or sent
-// verbatim — route to the bare identity.
+// lists only its claude-prefixed "<id>[1m]" mirror on the Anthropic surface,
+// and requests — marker stripped by the client or sent verbatim — route to
+// the bare identity.
 func TestContext1mMarker(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
@@ -521,19 +548,20 @@ func TestContext1mMarker(t *testing.T) {
 		t.Fatalf("kimi-k3[1m] did not route: %s", raw)
 	}
 
-	// Listing: a 1M-capable model lists only the [1m] forms on the Anthropic
-	// surface — the marked id and its claude-* mirror; the plain id and its
-	// mirror are superseded (the marked id routes to the same identity via
-	// suffix stripping). The marked entry's display name carries the suffix.
+	// Listing: a 1M-capable model lists only its claude-prefixed marked form
+	// on the Anthropic surface — claude-kimi-k3[1m]; the plain id, its
+	// mirror, and the bare [1m] id are all superseded (the marked id routes
+	// to the same identity via suffix stripping). The entry's display name
+	// carries the suffix.
 	_, raw = h.getModels(t, "", true)
-	for _, want := range []string{`"id":"kimi-k3[1m]"`, `"display_name":"kimi-k3[1m]"`, `"id":"claude-kimi-k3[1m]"`} {
+	for _, want := range []string{`"display_name":"kimi-k3[1m]"`, `"id":"claude-kimi-k3[1m]"`} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("anthropic listing missing %s: %s", want, raw)
 		}
 	}
-	for _, gone := range []string{`"id":"kimi-k3"`, `"id":"claude-kimi-k3"`} {
+	for _, gone := range []string{`"id":"kimi-k3"`, `"id":"claude-kimi-k3"`, `"id":"kimi-k3[1m]"`} {
 		if strings.Contains(string(raw), gone) {
-			t.Fatalf("anthropic listing must drop the plain 1m forms, found %s: %s", gone, raw)
+			t.Fatalf("anthropic listing must drop the superseded forms, found %s: %s", gone, raw)
 		}
 	}
 	_, raw = h.getModels(t, "", false)
@@ -544,8 +572,9 @@ func TestContext1mMarker(t *testing.T) {
 		t.Fatalf("openai surface must stay plain: %s", raw)
 	}
 
-	// By-id resolves the marked id (limits copied) on the Anthropic surface.
-	req, err := http.NewRequest(http.MethodGet, h.srv.URL+"/v1/models/kimi-k3[1m]", nil)
+	// By-id resolves the claude-prefixed marked id (limits copied) on the
+	// Anthropic surface.
+	req, err := http.NewRequest(http.MethodGet, h.srv.URL+"/v1/models/claude-kimi-k3[1m]", nil)
 	must(h.t, err)
 	req.Header.Set("Authorization", "Bearer "+h.key)
 	req.Header.Set("anthropic-version", "2023-06-01")
