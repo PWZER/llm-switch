@@ -149,7 +149,10 @@ channel via models rows or route targets) and emitted only on the Anthropic
 shape; `context_window` on the models row is the only control point.
 Routing accepts `claude-<name>` by stripping the prefix as the last fallback
 (after literal `claude-*` routes and rows) so client caches keep
-working.
+working. `request_logs.model` records the canonical resolved name (post
+`[1m]`/`claude-` normalization; the route's own name for route hits), so
+decorated discovery ids aggregate into one model in stats; unroutable names
+log verbatim.
 
 Admin API (`/api/v1`): envelope `{code, msg, data, request_id}` (ULID request id,
 echoable via `X-Request-Id`); action endpoints use plain path suffixes

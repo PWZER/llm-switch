@@ -281,6 +281,11 @@ func (p *Provider) account(id int64) *Account {
 // channel are explicit admin configuration and are never filtered;
 // provider-scoped route targets apply the same same-protocol preference
 // within their own segment only.
+//
+// The second return is the canonical client-facing name that matched — the
+// route's own name for route hits, the bare (marker-stripped and, for
+// claude-* mirrors, prefix-stripped) row name for row hits — for attribution
+// and usage logging; empty when not found.
 func (s *Snapshot) Resolve(requested, preferProtocol string) ([]Candidate, string, bool) {
 	requested = strings.TrimSuffix(requested, context1mSuffix)
 	if rt, ok := s.Routes[requested]; ok {
@@ -291,7 +296,7 @@ func (s *Snapshot) Resolve(requested, preferProtocol string) ([]Candidate, strin
 		// the model name itself can still resolve via models rows.
 	}
 	if cands, ok := s.ByModel[requested]; ok && len(cands) > 0 {
-		return preferSameProtocol(cands, preferProtocol), "", true
+		return preferSameProtocol(cands, preferProtocol), requested, true
 	}
 	// A literal claude-* route or row always wins above; only then does
 	// prefix stripping apply.
@@ -302,7 +307,7 @@ func (s *Snapshot) Resolve(requested, preferProtocol string) ([]Candidate, strin
 			}
 		}
 		if cands, ok := s.ByModel[rest]; ok && len(cands) > 0 {
-			return preferSameProtocol(cands, preferProtocol), "", true
+			return preferSameProtocol(cands, preferProtocol), rest, true
 		}
 	}
 	return nil, "", false
