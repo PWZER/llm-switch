@@ -59,8 +59,8 @@ Requirements: Go 1.25+ and Node 20+ (only for building the UI).
 
 ```bash
 make build          # builds the frontend, embeds it, produces bin/llm-switch
-LLM_SWITCH_ADMIN_PASSWORD=secret ./bin/llm-switch -addr 127.0.0.1:8080
-# open http://127.0.0.1:8080  (login with the admin password)
+LLM_SWITCH_ADMIN_PASSWORD=secret ./bin/llm-switch
+# open http://127.0.0.1:8901  (login with the admin password)
 ```
 
 On first boot, if `LLM_SWITCH_ADMIN_PASSWORD` is unset, a random password is generated and
@@ -68,6 +68,36 @@ logged once. First boot also seeds six built-in providers (Zhipu GLM, DeepSeek,
 Kimi/Moonshot, Kimi For Coding, OpenAI, Anthropic) with their docs-verified endpoints and
 identity model bindings — just add an API key on the Account Pool page to start routing.
 Deleting them is permanent (the seed runs once, tracked by the `seeded_providers` setting).
+
+### Run with Docker
+
+No local Go/Node toolchain needed — the image is a multi-stage build
+(Node 24 → Go → `alpine:latest`):
+
+```bash
+docker build -t llm-switch .
+docker run -d --name llm-switch -p 8901:8901 \
+  -e LLM_SWITCH_ADMIN_PASSWORD=secret \
+  -v llm-switch-data:/data \
+  llm-switch
+# open http://127.0.0.1:8901
+```
+
+The SQLite database lives in `/data` — keep the volume. The container runs the
+gateway in the foreground; `docker run -d` is the daemonization. Stamp a
+release version with `docker build --build-arg VERSION=1.2.3 .`.
+
+### Run as a daemon (bare metal)
+
+```bash
+./bin/llm-switch -daemon        # detaches; logs to <data-dir>/llm-switch.log
+kill $(cat ~/.llm-switch/llm-switch.pid)
+```
+
+Startup failures (port busy, already running) are reported on the terminal with
+a non-zero exit code. A single-instance flock (`<data-dir>/llm-switch.lock`) is
+held in every mode — foreground included — so a second process on the same data
+dir always fails with "already running".
 
 ### Configure in the Web UI
 
@@ -78,7 +108,7 @@ Deleting them is permanent (the seed runs once, tracked by the `seeded_providers
    | --- | --- | --- |
    | DeepSeek | `https://api.deepseek.com` (`/chat/completions`) | `https://api.deepseek.com/anthropic` (`/v1/messages`) |
    | Zhipu GLM | `https://open.bigmodel.cn/api/paas/v4` | `https://open.bigmodel.cn/api/anthropic` |
-   | Kimi/Moonshot | `https://api.moonshot.ai/v1` | `https://api.moonshot.ai/anthropic` |
+   | Kimi/Moonshot | `https://api.moonshot.cn/v1` | `https://api.moonshot.cn/anthropic` |
    | Kimi For Coding | `https://api.kimi.com/coding/v1` | `https://api.kimi.com/coding/` |
    Bind client-facing model names to upstream names on each channel. Optional per
    channel: a `responses_path` (e.g. `/responses`) marks the upstream as serving the
@@ -98,15 +128,15 @@ Deleting them is permanent (the seed runs once, tracked by the `seeded_providers
 
 ```bash
 # Claude Code / Anthropic SDK
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8901
 export ANTHROPIC_API_KEY=sk-lsw-...
 
 # OpenAI SDK
-base_url = "http://127.0.0.1:8080/v1"
+base_url = "http://127.0.0.1:8901/v1"
 api_key  = "sk-lsw-..."
 
 # Codex CLI (OpenAI Responses API)
-#   model provider: base_url http://127.0.0.1:8080/v1  (POST /v1/responses)
+#   model provider: base_url http://127.0.0.1:8901/v1  (POST /v1/responses)
 #   stateless only: store=false; previous_response_id / background are rejected
 ```
 
@@ -115,7 +145,7 @@ Model names resolve after stripping the `[1m]` context marker: model route → c
 ## Development
 
 ```bash
-make dev        # Go backend on :8080 + Vite dev server on :5173 (proxied, no CORS)
+make dev        # Go backend on :8901 + Vite dev server on :5173 (proxied, no CORS)
 make test       # go test ./... -race
 make mock       # canned OpenAI+Anthropic upstream on :9091 for manual e2e
 make build      # production single binary
@@ -125,10 +155,10 @@ End-to-end without real provider keys:
 
 ```bash
 make mock &                                        # fake upstream on :9091
-./bin/llm-switch -addr :8080 &
+./bin/llm-switch &
 # in the UI: provider (base_url http://127.0.0.1:9091) → channel → binding
 #            model "mock-chat" → client key
-curl -N localhost:8080/v1/chat/completions \
+curl -N localhost:8901/v1/chat/completions \
   -H "Authorization: Bearer sk-lsw-..." \
   -d '{"model":"mock-chat","stream":true}'
 ```
@@ -156,10 +186,12 @@ timeout (streams live as long as needed, bounded by an idle watchdog).
 ## Security notes
 
 - Account API keys are stored in SQLite (plaintext by necessity — they are sent
-  upstream). Keep the data directory permission-tight (the binary sets `0700`).
+  upstream). Keep the data directory permission-tight (`~/.llm-switch` by default;
+  the binary sets `0700`).
 - Client gateway keys are stored as SHA-256 hashes; the plaintext is shown exactly once.
-- The admin UI is a single password + bearer session. Run it on loopback or behind
-  authenticated TLS; the gateway makes no attempt to be multi-tenant.
+- The admin UI is a single password + bearer session. The default listen address
+  (`:8901`) binds all interfaces — restrict it with `-addr 127.0.0.1:8901` or run
+  behind authenticated TLS; the gateway makes no attempt to be multi-tenant.
 
 ## License
 

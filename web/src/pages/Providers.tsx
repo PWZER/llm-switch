@@ -8,7 +8,6 @@ import {
   api, Channel, Provider,
 } from '../api/client';
 import { useLang } from '../i18n/i18n';
-import { endpointPresets, presetKey } from '../data/presets';
 import { AccountPickerModal } from '../components/account';
 import { ProviderLogo } from '../components/logo';
 
@@ -230,14 +229,6 @@ function ProviderDrawer({
     }
   };
 
-  // EndpointModal preset picks prefill the drawer-level models_url and the
-  // staged register list — only when untouched, so editing never silently
-  // overwrites user work.
-  const applyPresetToProvider = (ids: string[], url: string) => {
-    if (stagedModels.length === 0 && ids.length > 0) setStagedModels(ids);
-    if (!currentModelsUrl.trim() && url) setCurrentModelsUrl(url);
-  };
-
   const rename = async () => {
     if (!provider || !editName.trim() || editName.trim() === provider.name) return;
     try {
@@ -280,9 +271,8 @@ function ProviderDrawer({
       });
       let partial = false;
       for (const ep of localEndpoints) {
-        const { presetKey: _preset, ...payload } = ep;
         try {
-          await api.post('/api/v1/channels', { ...payload, provider_id: created.id });
+          await api.post('/api/v1/channels', { ...ep, provider_id: created.id });
         } catch {
           partial = true;
         }
@@ -398,14 +388,12 @@ function ProviderDrawer({
             <LocalEndpoints
               value={localEndpoints}
               onChange={setLocalEndpoints}
-              onPresetModels={applyPresetToProvider}
             />
           ) : (
             <RemoteEndpoints
               providerId={provider.id}
               channels={channels}
               onChanged={onChanged}
-              onPresetModels={applyPresetToProvider}
             />
           )}
           <AccountPickerModal
@@ -429,12 +417,10 @@ function RemoteEndpoints({
   providerId,
   channels,
   onChanged,
-  onPresetModels,
 }: {
   providerId: number;
   channels: Channel[];
   onChanged: () => void;
-  onPresetModels?: (models: string[], modelsUrl: string) => void;
 }) {
   const { t } = useLang();
   const [adding, setAdding] = useState(false);
@@ -469,7 +455,6 @@ function RemoteEndpoints({
         open={adding || !!editing}
         editing={editing}
         providerId={providerId}
-        onPresetModels={onPresetModels}
         onClose={() => {
           setAdding(false);
           setEditing(null);
@@ -487,11 +472,9 @@ function RemoteEndpoints({
 function LocalEndpoints({
   value,
   onChange,
-  onPresetModels,
 }: {
   value: EndpointForm[];
   onChange: (eps: EndpointForm[]) => void;
-  onPresetModels?: (models: string[], modelsUrl: string) => void;
 }) {
   const { t } = useLang();
   const [modalOpen, setModalOpen] = useState(false);
@@ -533,7 +516,6 @@ function LocalEndpoints({
         editing={null}
         initial={editIdx != null ? value[editIdx] : null}
         providerId={0}
-        onPresetModels={onPresetModels}
         onLocalSubmit={(v) => {
           onChange(editIdx != null ? value.map((x, j) => (j === editIdx ? v : x)) : [...value, v]);
         }}
@@ -713,7 +695,6 @@ function EndpointCard({
 
 interface EndpointForm {
   name: string;
-  presetKey?: string;
   protocol: 'openai' | 'anthropic';
   base_url: string;
   chat_path: string;
@@ -732,7 +713,6 @@ function EndpointModal({
   initial,
   providerId,
   onLocalSubmit,
-  onPresetModels,
   onClose,
   onDone,
 }: {
@@ -743,8 +723,6 @@ function EndpointModal({
   providerId: number;
   /** Local mode: hand the form values to the parent (provider not persisted). */
   onLocalSubmit?: (v: EndpointForm) => void;
-  /** A preset pick also prefills the provider-level models_url + register list. */
-  onPresetModels?: (models: string[], modelsUrl: string) => void;
   onClose: () => void;
   onDone: () => void;
 }) {
@@ -839,25 +817,9 @@ function EndpointModal({
     }
   }, [open, editing, initial, form]);
 
-  const applyPreset = (key?: string) => {
-    const p = endpointPresets.find((x) => presetKey(x) === key) ?? null;
-    if (p) {
-      form.setFieldsValue({
-        protocol: p.protocol,
-        base_url: p.base_url,
-        chat_path: p.chat_path,
-        auth_style: p.auth_style,
-        responses_path: p.responses_path ?? '',
-      });
-      // The vendor's known models and fetch URL belong to the provider, not
-      // the endpoint — hand them up to the drawer.
-      onPresetModels?.(p.models, p.models_url);
-    }
-  };
-
   const submit = async (v: EndpointForm) => {
-    // Drop a stale responses_path left over from an openai preset/protocol
-    // switch — the backend rejects it on anthropic channels.
+    // Drop a stale responses_path left over from a protocol switch — the
+    // backend rejects it on anthropic channels.
     if (v.protocol !== 'openai') v.responses_path = undefined;
     if (onLocalSubmit) {
       onLocalSubmit(v);
@@ -889,14 +851,6 @@ function EndpointModal({
       destroyOnClose
     >
       <Form form={form} layout="vertical" onFinish={submit}>
-        <Form.Item name="presetKey" label={t('prov.preset')} tooltip={t('prov.presetTip')}>
-          <Select
-            allowClear
-            placeholder={t('prov.presetCustom')}
-            onChange={applyPreset}
-            options={endpointPresets.map((p) => ({ value: presetKey(p), label: presetKey(p) }))}
-          />
-        </Form.Item>
         <Space style={{ width: '100%' }} size="large">
           <Form.Item name="name" label={t('common.name')} rules={[{ required: true }]}>
             <Input placeholder="deepseek-openai" style={{ width: 200 }} />

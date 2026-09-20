@@ -24,8 +24,7 @@ type seedProvider struct {
 	Channels  []seedChannel
 }
 
-// defaultProviders mirrors the docs-verified endpoint presets in
-// web/src/data/presets.ts (frontend form prefill) — keep the two in sync.
+// defaultProviders holds the docs-verified built-in vendor endpoints.
 var defaultProviders = []seedProvider{
 	{
 		Name:      "OpenAI",

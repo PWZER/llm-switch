@@ -28,4 +28,4 @@ clean:
 	rm -rf bin internal/web/dist
 
 run: build
-	LLM_SWITCH_ADMIN_PASSWORD=test ./bin/llm-switch -addr :8090
+	LLM_SWITCH_ADMIN_PASSWORD=test ./bin/llm-switch

@@ -18,6 +18,11 @@ All code, comments, docs, commit messages, and API copy are **in English**. Keep
 names and protocol terms verbatim (DeepSeek, Zhipu, GLM, Kimi, Moonshot, Anthropic,
 chat.completion.chunk, tool_use, reasoning_content, ...).
 
+## Git Conventions
+
+- Commit messages are plain text: no attribution trailers (`Co-Authored-By`,
+  `Generated with ...`, etc.).
+
 ## Tech Stack (fixed by design — do not swap without strong reason)
 
 - **Go 1.25+**, module `github.com/PWZER/llm-switch`
@@ -202,26 +207,24 @@ reload (`reloadAfterMutation`) — read-only POST actions tolerate the rebuild c
     struct with Responses field names — that would silently start harvesting tokens
     from anthropic passthrough bodies.
 
-## Provider Presets (docs-verified base URLs)
+## Seeded Vendor Endpoints (docs-verified base URLs)
 
 | Vendor | OpenAI channel | Anthropic channel |
 | --- | --- | --- |
 | Zhipu (GLM) | `https://open.bigmodel.cn/api/paas/v4` | `https://open.bigmodel.cn/api/anthropic` |
 | DeepSeek | `https://api.deepseek.com` | `https://api.deepseek.com/anthropic` |
-| Kimi/Moonshot | `https://api.moonshot.ai/v1` (cn `api.moonshot.cn/v1`) | `https://api.moonshot.ai/anthropic` (cn mirror) |
+| Kimi/Moonshot | `https://api.moonshot.cn/v1` (cn `api.moonshot.cn/v1`) | `https://api.moonshot.cn/anthropic` (cn mirror) |
 | Kimi For Coding | `https://api.kimi.com/coding/v1` | `https://api.kimi.com/coding/` (trailing slash significant) |
 
-Presets are declarative data in `web/src/data/presets.ts` (form prefill only — all
-fields stay editable). Generic OpenAI/Anthropic-compatible types cover everything else.
-Explicit `chat_path` on channels avoids base-URL join ambiguity. The OpenAI preset
-prefills `responses_path: /responses`.
+Generic OpenAI/Anthropic-compatible types cover everything else.
+Explicit `chat_path` on channels avoids base-URL join ambiguity. The seeded OpenAI
+channel carries `responses_path: /responses`.
 
 First boot seeds six built-in vendors (Zhipu GLM, DeepSeek, Kimi/Moonshot, Kimi For
 Coding, OpenAI, Anthropic) with these endpoints, their provider-level `models_url`
 fetch URLs, and empty model lists —
 `store.SeedDefaultProviders` in `internal/store/seed.go`, guarded by the
-`seeded_providers` setting so user-deleted providers never resurrect. Keep the seed
-data in sync with `presets.ts`. Vendor logos in the admin UI are inline SVGs in
+`seeded_providers` setting so user-deleted providers never resurrect. Vendor logos in the admin UI are inline SVGs in
 `web/src/components/logo.tsx` (`vendorKeyOf` name matching; unknown names fall back
 to a monogram avatar).
 

@@ -84,13 +84,10 @@ export const en: Record<string, string> = {
   'prov.priorityTip': 'Higher priority is tried first (failover order)',
   'prov.registerModels': 'Models registered on save',
   'prov.registerModelsTip':
-    'Fetched (or preset) model ids register on this provider when saved — one row per id, identity alias. Manage them later on the Models page.',
+    'Fetched model ids register on this provider when saved — one row per id, identity alias. Manage them later on the Models page.',
   'prov.modelsUrl': 'Models URL',
   'prov.modelsUrlTip':
     'Absolute URL of the upstream models list (e.g. https://api.deepseek.com/models). Configured once per provider — never derived from endpoint URLs.',
-  'prov.preset': 'Preset',
-  'prov.presetCustom': 'Custom (fill manually)',
-  'prov.presetTip': 'Pick a vendor template to fill URL, path and auth style; everything stays editable.',
   'prov.endpointCount': 'Endpoints',
   'prov.saved': 'Saved (applied immediately)',
   'prov.namePlaceholder': 'deepseek / zhipu / my-local',
@@ -327,13 +324,10 @@ export const zh: Record<string, string> = {
   'prov.priorityTip': '优先级高者先被尝试（故障转移顺序）',
   'prov.registerModels': '保存时注册的模型',
   'prov.registerModelsTip':
-    '拉取（或模板预填）的模型 id 会在保存时注册到该供应商 — 每个 id 一行、同名映射。之后可在模型列表页管理。',
+    '拉取的模型 id 会在保存时注册到该供应商 — 每个 id 一行、同名映射。之后可在模型列表页管理。',
   'prov.modelsUrl': '模型列表 URL',
   'prov.modelsUrlTip':
     '上游模型列表的完整 URL（如 https://api.deepseek.com/models）。在供应商级别配置一次 — 不再从端点 URL 拼接。',
-  'prov.preset': '模板',
-  'prov.presetCustom': '自定义（手动填写）',
-  'prov.presetTip': '选择供应商模板自动填 URL、路径与认证方式；所有字段保持可编辑。',
   'prov.endpointCount': '端点',
   'prov.saved': '已保存（立即生效）',
   'prov.namePlaceholder': 'deepseek / zhipu / 本地服务',

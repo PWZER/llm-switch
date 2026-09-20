@@ -20,6 +20,7 @@ import (
 	"github.com/PWZER/llm-switch/internal/api"
 	"github.com/PWZER/llm-switch/internal/auth"
 	"github.com/PWZER/llm-switch/internal/config"
+	"github.com/PWZER/llm-switch/internal/daemon"
 	"github.com/PWZER/llm-switch/internal/engine"
 	"github.com/PWZER/llm-switch/internal/gateway"
 	"github.com/PWZER/llm-switch/internal/stats"
@@ -31,16 +32,29 @@ import (
 var version = "dev"
 
 func main() {
-	if err := run(); err != nil {
+	cfg := config.Load(version)
+	if cfg.Daemon && !daemon.IsChild() {
+		os.Exit(daemon.Spawn(cfg.DataDir))
+	}
+	if err := run(cfg); err != nil {
+		daemon.Notify(err)
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	cfg := config.Load(version)
+func run(cfg *config.Config) error {
 	logger := newLogger(cfg.LogFormat)
 	slog.SetDefault(logger)
+
+	// Single-instance lock, held for the process lifetime in every mode —
+	// it protects the single-writer SQLite database.
+	unlock, err := daemon.Lock(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	logger.Info("starting llm-switch", "version", version, "addr", cfg.Addr, "data_dir", cfg.DataDir)
 
 	db, err := store.Open(cfg.DataDir, cfg.DBPath)
@@ -154,9 +168,19 @@ func run() error {
 	}
 
 	errCh := make(chan error, 1)
+	ln, err := net.Listen("tcp", cfg.Addr)
+	if err != nil {
+		return err
+	}
+	// The socket is bound: report startup success to a daemon parent and
+	// drop the pid file used to stop the daemon.
+	daemon.Notify(nil)
+	if pidPath := daemon.WritePid(cfg.DataDir); pidPath != "" {
+		defer os.Remove(pidPath)
+	}
 	go func() {
 		logger.Info("http server listening", "addr", cfg.Addr, "web_dev", cfg.WebDev)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
