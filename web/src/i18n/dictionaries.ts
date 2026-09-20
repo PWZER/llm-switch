@@ -115,7 +115,6 @@ export const en: Record<string, string> = {
   'prov.responsesPathTip':
     'OpenAI channels only. Upstream OpenAI Responses API endpoint (e.g. /responses). Set it to relay /v1/responses byte-wise; empty = bridge via protocol conversion.',
   'prov.usage': 'Usage / Balance',
-  'prov.usageQuery': 'Query usage',
   'prov.usageQueriedAt': 'queried',
   'prov.usageNotConfigured':
     'No usage probes configured — add one below. Vendors with a known quota/balance endpoint are prefilled by preset.',
@@ -355,7 +354,6 @@ export const zh: Record<string, string> = {
   'prov.responsesPathTip':
     '仅 OpenAI 通道。上游 OpenAI Responses API 端点（如 /responses）。配置后 /v1/responses 流量按字节直通；留空则经协议转换桥接。',
   'prov.usage': '套餐用量 / 余额',
-  'prov.usageQuery': '查询用量',
   'prov.usageQueriedAt': '查询于',
   'prov.usageNotConfigured':
     '未配置用量探测 — 可在下方添加。已知配额/余额端点的厂商模板会自动预填。',

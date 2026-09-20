@@ -412,17 +412,21 @@ function AccountUsageModal({ account, onClose }: { account: Account; onClose: ()
   const [report, setReport] = useState<AccountUsageReport | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const query = async () => {
+  // Without refresh=1 the 60s TTL cache serves repeats; force bypasses it.
+  const query = useCallback(async (force: boolean) => {
     setLoading(true);
     try {
-      const r = await api.post<AccountUsageReport>(`/api/v1/accounts/${account.id}/usage?refresh=1`);
+      const r = await api.post<AccountUsageReport>(`/api/v1/accounts/${account.id}/usage${force ? '?refresh=1' : ''}`);
       setReport(r);
     } catch (e) {
       message.error(e instanceof Error ? e.message : 'failed');
     } finally {
       setLoading(false);
     }
-  };
+  }, [account.id, message]);
+
+  // Open = query immediately: results show without a second click.
+  useEffect(() => { query(false); }, [query]);
 
   return (
     <Modal
@@ -433,8 +437,8 @@ function AccountUsageModal({ account, onClose }: { account: Account; onClose: ()
       width={640}
     >
       <Space style={{ marginBottom: 12 }} align="center">
-        <Button type="primary" size="small" icon={<SyncOutlined spin={loading} />} onClick={query} disabled={loading}>
-          {loading ? t('prov.testing') : t('prov.usageQuery')}
+        <Button type="primary" size="small" icon={<SyncOutlined spin={loading} />} onClick={() => query(true)} disabled={loading}>
+          {loading ? t('prov.testing') : t('common.refresh')}
         </Button>
         {report && (
           <Typography.Text type="secondary">
