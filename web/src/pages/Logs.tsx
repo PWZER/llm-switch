@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
-import { App as AntApp, Button, DatePicker, Input, Select, Table, Tag, Tooltip } from 'antd';
+import { App as AntApp, Button, DatePicker, Input, Select, Space, Table, Tag, Tooltip } from 'antd';
 import dayjs from 'dayjs';
 import { api, RequestLog } from '../api/client';
 import { useLang } from '../i18n/i18n';
+import { ProtocolTag } from '../components/protocol';
 
 export default function Logs() {
   const { t } = useLang();
@@ -43,11 +44,16 @@ export default function Logs() {
     { title: t('logs.upstream'), dataIndex: 'upstream_model' },
     {
       title: t('logs.path'),
-      render: (_: unknown, l: RequestLog) => (
-        <Tag color={l.protocol_in === l.protocol_out ? 'blue' : 'purple'}>
-          {l.protocol_in === l.protocol_out ? l.protocol_in : `${l.protocol_in}→${l.protocol_out}`}
-        </Tag>
-      ),
+      render: (_: unknown, l: RequestLog) =>
+        l.protocol_in === l.protocol_out ? (
+          <ProtocolTag protocol={l.protocol_in} />
+        ) : (
+          <Space size={4} wrap>
+            <ProtocolTag protocol={l.protocol_in} />
+            <span style={{ opacity: 0.6 }}>→</span>
+            <ProtocolTag protocol={l.protocol_out} />
+          </Space>
+        ),
     },
     { title: t('logs.key'), dataIndex: 'api_key_name' },
     { title: t('logs.channel'), dataIndex: 'channel_name' },

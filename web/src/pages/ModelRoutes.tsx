@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   App as AntApp, AutoComplete, Button, Drawer, Form, Input, Modal, Popconfirm,
   Select, Space, Table, Tag, Typography, theme,
@@ -8,6 +8,7 @@ import {
 } from '@ant-design/icons';
 import { api, Account, Model, ModelRoute, ModelRouteTarget, Channel, Provider } from '../api/client';
 import { useLang } from '../i18n/i18n';
+import { ProtocolTag } from '../components/protocol';
 
 // Form/preview state for one failover target. provider_id owns the target;
 // channel_id (undefined in the form = JSON null on the wire) optionally pins
@@ -36,9 +37,14 @@ const upstreamModelOptions = (models: Model[], providerId?: number): { value: st
   return out;
 };
 
-const channelLabel = (channels: Channel[], id?: number) => {
+const channelLabel = (channels: Channel[], id?: number): ReactNode => {
   const c = channels.find((x) => x.id === id);
-  return c ? `${c.name} (${c.protocol})` : `#${id}`;
+  if (!c) return `#${id}`;
+  return (
+    <>
+      {c.name} <ProtocolTag protocol={c.protocol} />
+    </>
+  );
 };
 
 const accountLabel = (accounts: Account[], id?: number) => {
@@ -54,7 +60,7 @@ const targetLabel = (
   providers: Provider[],
   tgt: { provider_id?: number; channel_id?: number | null },
   autoLabel: string,
-): string => {
+): ReactNode => {
   if (tgt.channel_id) return channelLabel(channels, tgt.channel_id);
   const p = providers.find((x) => x.id === tgt.provider_id);
   return `${autoLabel} (${p ? p.name : `#${tgt.provider_id ?? '?'}`})`;
@@ -452,7 +458,15 @@ function TargetModal({
 
   const channelOptions = routableChannels
     .filter((c) => c.provider_id === providerId)
-    .map((c) => ({ value: c.id, label: `${c.name} (${c.protocol})` }));
+    .map((c) => ({
+      value: c.id,
+      label: (
+        <>
+          {c.name}{' '}
+          <ProtocolTag protocol={c.protocol} style={{ marginInlineEnd: 0 }} />
+        </>
+      ),
+    }));
   const modelOptions = upstreamModelOptions(models, providerId);
   const accountOptions = accounts
     .filter((a) => a.provider_id === providerId)

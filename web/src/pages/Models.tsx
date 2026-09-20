@@ -9,6 +9,7 @@ import { useLang } from '../i18n/i18n';
 import { ProviderLogo } from '../components/logo';
 import ModelPickerDrawer from '../components/ModelPickerDrawer';
 import { formatTokens } from '../components/ModelSelectList';
+import { ProtocolTag, protocolOrder } from '../components/protocol';
 
 interface ModelFormValues {
   id: string;
@@ -121,6 +122,8 @@ export default function Models() {
       else list.push({ name: c.protocol, live: c.enabled });
       map.set(c.provider_id, list);
     });
+    // Canonical display order: anthropic first, then openai.
+    map.forEach((list) => list.sort((a, b) => protocolOrder(a.name) - protocolOrder(b.name)));
     return map;
   }, [channels]);
 
@@ -183,13 +186,7 @@ export default function Models() {
               return (
                 <Space size={4} wrap>
                   {protocols.map((p) => (
-                    <Tag
-                      key={p.name}
-                      color={p.live ? (p.name === 'openai' ? 'green' : 'orange') : undefined}
-                      style={p.live ? undefined : { textDecoration: 'line-through', opacity: 0.6 }}
-                    >
-                      {p.name}
-                    </Tag>
+                    <ProtocolTag key={p.name} protocol={p.name} dead={!p.live} />
                   ))}
                 </Space>
               );

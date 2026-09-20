@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import {
   App as AntApp, Button, Drawer, Form, Input, InputNumber, Modal, Popconfirm,
-  Select, Space, Switch, Table, Tag, Typography, theme,
+  Select, Space, Switch, Table, Typography, theme,
 } from 'antd';
 import { PlusOutlined, SettingOutlined, SyncOutlined, DownOutlined } from '@ant-design/icons';
 import {
@@ -11,6 +11,7 @@ import { useLang } from '../i18n/i18n';
 import { AccountPickerModal } from '../components/account';
 import { ProviderLogo } from '../components/logo';
 import ModelSelectList, { ModelSelectItem } from '../components/ModelSelectList';
+import { ProtocolTag, protocolOrder } from '../components/protocol';
 
 // Merged provider management: one provider (vendor account + endpoints) hosts
 // one or more protocol endpoints, each with its own failover priority. The
@@ -92,16 +93,20 @@ export default function Providers() {
           {
             title: t('prov.endpoints'),
             render: (_, p) => {
-              const list = channels.filter((c) => c.provider_id === p.id);
+              // Compact overview chips in canonical protocol order; the manage
+              // drawer keeps API/priority order (meaningful for failover).
+              const list = channels
+                .filter((c) => c.provider_id === p.id)
+                .sort((a, b) => protocolOrder(a.protocol) - protocolOrder(b.protocol));
               if (list.length === 0) return <Typography.Text type="secondary">-</Typography.Text>;
               return (
                 <Space wrap>
                   {list.map((c) => (
                     <Tooltiped key={c.id} title={`${c.base_url}${c.chat_path}`}>
-                      <Tag color={c.protocol === 'openai' ? 'green' : 'orange'}>
+                      <ProtocolTag protocol={c.protocol}>
                         {c.protocol}
                         {!c.enabled ? ' (off)' : ''}
-                      </Tag>
+                      </ProtocolTag>
                     </Tooltiped>
                   ))}
                 </Space>
@@ -570,7 +575,7 @@ function LocalEndpointCard({
     <div style={{ border: `1px solid ${token.colorBorderSecondary}`, borderRadius: 8, padding: 12 }}>
       <Space style={{ width: '100%', justifyContent: 'space-between' }}>
         <Space>
-          <Tag color={endpoint.protocol === 'openai' ? 'green' : 'orange'}>{endpoint.protocol}</Tag>
+          <ProtocolTag protocol={endpoint.protocol} />
           <Typography.Text strong>{endpoint.name}</Typography.Text>
           <Typography.Text type="secondary" code>
             {endpoint.base_url}
@@ -680,7 +685,7 @@ function EndpointCard({
     <div style={{ border: `1px solid ${token.colorBorderSecondary}`, borderRadius: 8, padding: 12 }}>
       <Space style={{ width: '100%', justifyContent: 'space-between' }}>
         <Space>
-          <Tag color={channel.protocol === 'openai' ? 'green' : 'orange'}>{channel.protocol}</Tag>
+          <ProtocolTag protocol={channel.protocol} />
           <Typography.Text strong>{channel.name}</Typography.Text>
           <Typography.Text type="secondary" code>
             {channel.base_url}
@@ -888,8 +893,8 @@ function EndpointModal({
             <Select
               style={{ width: 180 }}
               options={[
-                { value: 'openai', label: t('prov.openaiCompat') },
                 { value: 'anthropic', label: t('prov.anthropicCompat') },
+                { value: 'openai', label: t('prov.openaiCompat') },
               ]}
             />
           </Form.Item>
