@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -124,10 +125,13 @@ func TestStopNotRunning(t *testing.T) {
 	if err := Stop(dir, time.Second, false); !errors.Is(err, ErrNotRunning) {
 		t.Fatalf("Stop with stale files = %v, want ErrNotRunning", err)
 	}
-	for _, f := range []string{PidFile, MetaFile} {
-		if _, err := os.Stat(filepath.Join(dir, f)); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("%s still present after Stop", f)
-		}
+	// The stale pid file is cleaned up; run-meta is kept so `restart` can
+	// start a stopped instance with its saved args.
+	if _, err := os.Stat(filepath.Join(dir, PidFile)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("%s still present after Stop", PidFile)
+	}
+	if _, err := os.Stat(filepath.Join(dir, MetaFile)); err != nil {
+		t.Fatalf("%s must survive Stop: %v", MetaFile, err)
 	}
 }
 
@@ -152,8 +156,8 @@ func TestStopForceKillsIgnorantInstance(t *testing.T) {
 }
 
 // stopTerminatesInstance spawns this test binary as a lock-holding child,
-// runs Stop against it, and asserts the instance is gone and its files
-// cleaned up.
+// runs Stop against it, and asserts the instance is gone and its pid file
+// cleaned up (run-meta survives by design: `restart` needs the saved args).
 func stopTerminatesInstance(t *testing.T, force bool) {
 	t.Helper()
 	dir := t.TempDir()
@@ -191,10 +195,12 @@ func stopTerminatesInstance(t *testing.T, force bool) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	for _, f := range []string{PidFile, MetaFile} {
-		if _, err := os.Stat(filepath.Join(dir, f)); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("%s still present after Stop", f)
-		}
+	if _, err := os.Stat(filepath.Join(dir, PidFile)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("%s still present after Stop", PidFile)
+	}
+	// Run-meta survives Stop by design (restart uses the saved args).
+	if _, err := os.Stat(filepath.Join(dir, MetaFile)); err != nil {
+		t.Fatalf("%s must survive Stop: %v", MetaFile, err)
 	}
 	unlock, err := Lock(dir)
 	if err != nil {
@@ -232,4 +238,50 @@ func holdLockChild(dir string, ignoreTerm bool) {
 	}
 	time.Sleep(30 * time.Second) // terminated by Stop
 	os.Exit(0)
+}
+
+func TestRunningInstance(t *testing.T) {
+	dead := 99999999 // beyond pid_max: cannot exist
+
+	// Empty dir: nothing running, no metadata.
+	if pid, _, metaOK := RunningInstance(t.TempDir()); pid != 0 || metaOK {
+		t.Fatalf("empty dir: pid=%d metaOK=%v, want 0/false", pid, metaOK)
+	}
+
+	// Meta with a live pid wins.
+	dir := t.TempDir()
+	meta := RunMeta{PID: os.Getpid(), Args: []string{"--daemon"}, Version: "v1.2.3"}
+	if WriteRunMeta(dir, meta) == "" {
+		t.Fatal("WriteRunMeta failed")
+	}
+	pid, got, metaOK := RunningInstance(dir)
+	if pid != os.Getpid() || !metaOK || !reflect.DeepEqual(got.Args, meta.Args) {
+		t.Fatalf("live meta: pid=%d meta=%+v metaOK=%v", pid, got, metaOK)
+	}
+
+	// Dead meta pid falls back to a live pid-file pid, without meta.
+	dir = t.TempDir()
+	meta.PID = dead
+	if WriteRunMeta(dir, meta) == "" {
+		t.Fatal("WriteRunMeta failed")
+	}
+	if err := os.WriteFile(filepath.Join(dir, PidFile), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pid, _, metaOK = RunningInstance(dir)
+	if pid != os.Getpid() || metaOK {
+		t.Fatalf("pid-file fallback: pid=%d metaOK=%v, want self/false", pid, metaOK)
+	}
+
+	// Both dead/missing: not running.
+	dir = t.TempDir()
+	if WriteRunMeta(dir, meta) == "" {
+		t.Fatal("WriteRunMeta failed")
+	}
+	if err := os.WriteFile(filepath.Join(dir, PidFile), []byte(strconv.Itoa(dead)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if pid, _, metaOK := RunningInstance(dir); pid != 0 || !metaOK {
+		t.Fatalf("all dead: pid=%d metaOK=%v, want 0/true (meta readable, instance gone)", pid, metaOK)
+	}
 }

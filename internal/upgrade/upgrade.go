@@ -367,19 +367,13 @@ func confirm(r io.Reader) bool {
 // restartDaemon stops a running instance and starts the freshly replaced
 // binary detached with its original flags. It is a no-op when nothing runs.
 func restartDaemon(opts Options) error {
-	meta, ok := daemon.ReadRunMeta(opts.DataDir)
-	pid := 0
-	if ok && daemon.Alive(meta.PID) {
-		pid = meta.PID
-	} else if candidate := daemon.ReadPid(opts.DataDir); daemon.Alive(candidate) {
-		pid = candidate
-	}
+	pid, meta, metaOK := daemon.RunningInstance(opts.DataDir)
 	if pid <= 0 {
 		fmt.Fprintln(opts.Stderr, "no running instance detected; start llm-switch to use the new version")
 		return nil
 	}
 	note := ""
-	if !ok {
+	if !metaOK {
 		note = " (no run metadata found; restarting with default flags)"
 	}
 	fmt.Fprintf(opts.Stderr, "stopping running instance (pid %d)%s...\n", pid, note)

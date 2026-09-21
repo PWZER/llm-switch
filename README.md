@@ -117,10 +117,11 @@ environment fallback (e.g. `--data-dir` / `LLM_SWITCH_DATA_DIR`):
 | `upgrade` | Self-update from GitHub Releases (see below) |
 | `status` | Show whether an instance is running (exit code 1 when not) |
 | `stop` | Stop the running instance; `--force` escalates to SIGKILL after the grace period |
+| `restart` | Restart the running instance detached with its original flags; a stopped instance is started from its saved run metadata; `--force` escalates the stop phase |
 
 Subcommand flags: `upgrade --check` (print versions only), `upgrade --yes`
-(skip confirmation), `stop --force`; every subcommand also accepts the
-persistent `--data-dir`.
+(skip confirmation), `stop --force`, `restart --force`; every subcommand also
+accepts the persistent `--data-dir`.
 
 ### Self-update (`upgrade`)
 

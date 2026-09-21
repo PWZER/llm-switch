@@ -98,10 +98,25 @@ func ReadPid(dataDir string) int {
 	return pid
 }
 
-// removeRunFiles clears pid and run-meta leftovers (best effort). Callers
-// must hold the single-instance lock so a concurrently starting instance's
-// files are not deleted.
+// RunningInstance probes the data dir for a live instance: the run-meta pid
+// wins, the plain pid file is the fallback (metaOK false in that case).
+// pid <= 0 means nothing is running.
+func RunningInstance(dataDir string) (pid int, meta RunMeta, metaOK bool) {
+	meta, metaOK = ReadRunMeta(dataDir)
+	if metaOK && Alive(meta.PID) {
+		return meta.PID, meta, true
+	}
+	if candidate := ReadPid(dataDir); Alive(candidate) {
+		return candidate, meta, false
+	}
+	return 0, meta, metaOK
+}
+
+// removeRunFiles clears the pid file (best effort); the run-meta file is
+// kept on purpose so `restart` can start a cleanly stopped instance with its
+// saved args (stale meta is harmless: probes verify the pid is alive).
+// Callers must hold the single-instance lock so a concurrently starting
+// instance's file is not deleted.
 func removeRunFiles(dataDir string) {
 	_ = os.Remove(filepath.Join(dataDir, PidFile))
-	_ = os.Remove(filepath.Join(dataDir, MetaFile))
 }

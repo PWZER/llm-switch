@@ -54,7 +54,9 @@ make mock      # go run ./cmd/mockupstream -addr :9091   (fake OpenAI+Anthropic 
 ## CLI shape
 
 The binary is a cobra command tree: the root command boots the server; subcommands
-`upgrade` (self-update from GitHub Releases, `internal/upgrade`), `status`, `stop`.
+`upgrade` (self-update from GitHub Releases, `internal/upgrade`), `status`, `stop`,
+`restart` (stop + detached start with the saved run-meta args; a stopped instance
+with metadata is started directly — instance probing shares `daemon.RunningInstance`).
 All long flags are double-dash pflag names with `LLM_SWITCH_*` env fallbacks
 (precedence flag > env > default, `internal/config.RegisterFlags`/`RegisterPersistentFlags`);
 `--data-dir` is persistent across subcommands. `main.version` is stamped at build

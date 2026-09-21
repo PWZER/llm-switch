@@ -45,7 +45,8 @@ func main() {
 }
 
 // newRootCommand assembles the CLI. The root command boots the server;
-// subcommands added here handle instance lifecycle (upgrade, status, stop).
+// subcommands added here handle instance lifecycle (upgrade, status, stop,
+// restart).
 func newRootCommand(cfg *config.Config) *cobra.Command {
 	root := &cobra.Command{
 		Use:     "llm-switch",
@@ -70,7 +71,7 @@ func newRootCommand(cfg *config.Config) *cobra.Command {
 	root.SetVersionTemplate("llm-switch {{.Version}}\n")
 	config.RegisterPersistentFlags(root.PersistentFlags(), cfg)
 	config.RegisterFlags(root.Flags(), cfg)
-	root.AddCommand(newUpgradeCommand(cfg), newStatusCommand(cfg), newStopCommand(cfg))
+	root.AddCommand(newUpgradeCommand(cfg), newStatusCommand(cfg), newStopCommand(cfg), newRestartCommand(cfg))
 	return root
 }
 
@@ -103,14 +104,7 @@ func newStatusCommand(cfg *config.Config) *cobra.Command {
 		Short:         "Show whether an llm-switch instance is running",
 		SilenceErrors: true, // the not-running case prints its own line
 		RunE: func(_ *cobra.Command, _ []string) error {
-			meta, metaOK := daemon.ReadRunMeta(cfg.DataDir)
-			pid := 0
-			if metaOK && daemon.Alive(meta.PID) {
-				pid = meta.PID
-			} else if candidate := daemon.ReadPid(cfg.DataDir); daemon.Alive(candidate) {
-				pid = candidate
-				metaOK = false
-			}
+			pid, meta, metaOK := daemon.RunningInstance(cfg.DataDir)
 			if pid <= 0 {
 				if daemon.ReadPid(cfg.DataDir) > 0 {
 					fmt.Fprintln(os.Stdout, "llm-switch is not running (stale pid file in "+cfg.DataDir+")")
@@ -152,6 +146,42 @@ func newStopCommand(cfg *config.Config) *cobra.Command {
 				return err
 			}
 			fmt.Fprintln(os.Stdout, "llm-switch stopped")
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "SIGKILL the instance if it does not exit within the grace period")
+	return cmd
+}
+
+// newRestartCommand restarts the running instance detached with its saved
+// args. A stopped instance with run metadata is started directly; with
+// neither, there is nothing to restart.
+func newRestartCommand(cfg *config.Config) *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "restart",
+		Short: "Restart the running llm-switch instance with its original flags",
+		// The not-running-without-metadata case prints its own line.
+		SilenceErrors: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			pid, meta, metaOK := daemon.RunningInstance(cfg.DataDir)
+			switch {
+			case pid > 0:
+				fmt.Fprintf(os.Stdout, "stopping running instance (pid %d)...\n", pid)
+				err := daemon.Stop(cfg.DataDir, stopGrace, force)
+				if err != nil && !errors.Is(err, daemon.ErrNotRunning) {
+					return err
+				}
+			case !metaOK || len(meta.Args) == 0:
+				fmt.Fprintln(os.Stdout, "llm-switch is not running and no saved run arguments found; start it with `llm-switch --daemon` first")
+				return errNotRunning
+			default:
+				fmt.Fprintln(os.Stdout, "llm-switch is not running; starting with the saved args")
+			}
+			if code := daemon.SpawnArgs(cfg.DataDir, meta.Args); code != 0 {
+				return fmt.Errorf("instance failed to start; see %s", filepath.Join(cfg.DataDir, daemon.LogFile))
+			}
+			fmt.Fprintf(os.Stdout, "llm-switch restarted detached; logs: %s\n", filepath.Join(cfg.DataDir, daemon.LogFile))
 			return nil
 		},
 	}
@@ -321,14 +351,15 @@ func run(cfg *config.Config) error {
 	daemon.Notify(nil)
 	if pidPath := daemon.WritePid(cfg.DataDir); pidPath != "" {
 		defer os.Remove(pidPath)
-		if metaPath := daemon.WriteRunMeta(cfg.DataDir, daemon.RunMeta{
+		// The run-meta file is deliberately not removed on shutdown: a
+		// stopped instance keeps its saved args so `restart` can start it
+		// again (stale meta is harmless — probes verify the pid is alive).
+		daemon.WriteRunMeta(cfg.DataDir, daemon.RunMeta{
 			PID:       os.Getpid(),
 			Args:      os.Args[1:],
 			Version:   version,
 			StartedAt: time.Now().Unix(),
-		}); metaPath != "" {
-			defer os.Remove(metaPath)
-		}
+		})
 	}
 	go func() {
 		logger.Info("http server listening", "addr", cfg.Addr, "web_dev", cfg.WebDev)
