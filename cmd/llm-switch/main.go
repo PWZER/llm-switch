@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/spf13/cobra"
 
 	"github.com/PWZER/llm-switch/internal/api"
 	"github.com/PWZER/llm-switch/internal/auth"
@@ -32,15 +33,39 @@ import (
 var version = "dev"
 
 func main() {
-	cfg := config.Load(version)
-	if cfg.Daemon && !daemon.IsChild() {
-		os.Exit(daemon.Spawn(cfg.DataDir))
-	}
-	if err := run(cfg); err != nil {
-		daemon.Notify(err)
-		slog.Error("fatal", "err", err)
+	cfg := &config.Config{}
+	if err := newRootCommand(cfg).Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// newRootCommand assembles the CLI. The root command boots the server;
+// subcommands added here handle instance lifecycle (upgrade, status, stop).
+func newRootCommand(cfg *config.Config) *cobra.Command {
+	root := &cobra.Command{
+		Use:     "llm-switch",
+		Short:   "Unified LLM API gateway: OpenAI- and Anthropic-compatible surfaces on one port",
+		Version: version,
+		// Run failures are runtime errors, not usage mistakes — keep the
+		// help text out of their output.
+		SilenceUsage: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			cfg.Finalize(version)
+			if cfg.Daemon && !daemon.IsChild() {
+				os.Exit(daemon.Spawn(cfg.DataDir))
+			}
+			if err := run(cfg); err != nil {
+				daemon.Notify(err)
+				slog.Error("fatal", "err", err)
+				os.Exit(1)
+			}
+			return nil
+		},
+	}
+	root.SetVersionTemplate("llm-switch {{.Version}}\n")
+	config.RegisterPersistentFlags(root.PersistentFlags(), cfg)
+	config.RegisterFlags(root.Flags(), cfg)
+	return root
 }
 
 func run(cfg *config.Config) error {

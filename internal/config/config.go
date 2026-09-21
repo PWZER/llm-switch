@@ -3,10 +3,11 @@
 package config
 
 import (
-	"flag"
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"github.com/spf13/pflag"
 )
 
 // Config holds everything resolved at boot. All remaining runtime settings
@@ -34,25 +35,30 @@ type Config struct {
 	Version string
 }
 
-// Load parses flags and environment variables into a Config.
-func Load(version string) *Config {
-	cfg := &Config{Version: version}
-
-	flag.StringVar(&cfg.Addr, "addr", envOr("LLM_SWITCH_ADDR", ":8901"), "HTTP listen address")
-	flag.StringVar(&cfg.DataDir, "data-dir", envOr("LLM_SWITCH_DATA_DIR", defaultDataDir()), "data directory for the SQLite database")
-	flag.StringVar(&cfg.AdminPassword, "admin-password", os.Getenv("LLM_SWITCH_ADMIN_PASSWORD"), "seed admin password on first boot (default: random, logged once)")
-	flag.StringVar(&cfg.LogFormat, "log-format", envOr("LLM_SWITCH_LOG_FORMAT", "text"), "log format: text|json")
-	flag.BoolVar(&cfg.WebDev, "web-dev", boolEnv("LLM_SWITCH_WEB_DEV", false), "serve UI from the Vite dev server (frontend development)")
-	flag.BoolVar(&cfg.Daemon, "daemon", boolEnv("LLM_SWITCH_DAEMON", false), "run detached in the background (logs to <data-dir>/llm-switch.log)")
-	flag.Parse()
-
-	cfg.DBPath = filepath.Join(cfg.DataDir, "llm-switch.db")
-	return cfg
+// RegisterPersistentFlags registers flags shared by the root command and every
+// subcommand (lifecycle commands locate the running instance through it).
+func RegisterPersistentFlags(fs *pflag.FlagSet, cfg *Config) {
+	fs.StringVar(&cfg.DataDir, "data-dir", envOr("LLM_SWITCH_DATA_DIR", DefaultDataDir()), "data directory for the SQLite database")
 }
 
-// defaultDataDir resolves the per-user data directory (~/.llm-switch),
+// RegisterFlags registers the server boot flags on the root command.
+func RegisterFlags(fs *pflag.FlagSet, cfg *Config) {
+	fs.StringVar(&cfg.Addr, "addr", envOr("LLM_SWITCH_ADDR", ":8901"), "HTTP listen address")
+	fs.StringVar(&cfg.AdminPassword, "admin-password", os.Getenv("LLM_SWITCH_ADMIN_PASSWORD"), "seed admin password on first boot (default: random, logged once)")
+	fs.StringVar(&cfg.LogFormat, "log-format", envOr("LLM_SWITCH_LOG_FORMAT", "text"), "log format: text|json")
+	fs.BoolVar(&cfg.WebDev, "web-dev", boolEnv("LLM_SWITCH_WEB_DEV", false), "serve UI from the Vite dev server (frontend development)")
+	fs.BoolVar(&cfg.Daemon, "daemon", boolEnv("LLM_SWITCH_DAEMON", false), "run detached in the background (logs to <data-dir>/llm-switch.log)")
+}
+
+// Finalize sets the fields derived after flag parsing.
+func (c *Config) Finalize(version string) {
+	c.Version = version
+	c.DBPath = filepath.Join(c.DataDir, "llm-switch.db")
+}
+
+// DefaultDataDir resolves the per-user data directory (~/.llm-switch),
 // falling back to ./data when the home directory is undeterminable.
-func defaultDataDir() string {
+func DefaultDataDir() string {
 	if home, err := os.UserHomeDir(); err == nil {
 		return filepath.Join(home, ".llm-switch")
 	}
