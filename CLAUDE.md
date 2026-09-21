@@ -36,17 +36,40 @@ chat.completion.chunk, tool_use, reasoning_content, ...).
   per-page `useCallback`+`useEffect` loaders (no React Query), embedded via `go:embed`
   into `internal/web/dist`
 
-Total Go deps stay minimal: chi, modernc.org/sqlite, golang.org/x/crypto (bcrypt).
+Total Go deps stay minimal: chi, modernc.org/sqlite, golang.org/x/crypto (bcrypt),
+spf13/cobra (CLI subcommands).
 
 ## Commands
 
 ```bash
-make dev       # go run ./cmd/llm-switch -web-dev  (+ cd web && npm run dev in a second terminal)
+make dev       # go run ./cmd/llm-switch --web-dev  (+ cd web && npm run dev in a second terminal)
 make frontend  # npm ci + build, copy web/dist → internal/web/dist
-make build     # frontend + CGO_ENABLED=0 go build -o bin/llm-switch ./cmd/llm-switch
+make build     # frontend + CGO_ENABLED=0 go build -o bin/llm-switch ./cmd/llm-switch (version stamped via git describe)
+make release   # frontend once + cross-compile bin/llm-switch-<goos>-<goarch> (linux/darwin × amd64/arm64)
+make compress  # UPX the release binaries (no-op without upx; Mach-O arm64 unsupported)
 make test      # go test ./... -race
 make mock      # go run ./cmd/mockupstream -addr :9091   (fake OpenAI+Anthropic upstream for e2e)
 ```
+
+## CLI shape
+
+The binary is a cobra command tree: the root command boots the server; subcommands
+`upgrade` (self-update from GitHub Releases, `internal/upgrade`), `status`, `stop`.
+All long flags are double-dash pflag names with `LLM_SWITCH_*` env fallbacks
+(precedence flag > env > default, `internal/config.RegisterFlags`/`RegisterPersistentFlags`);
+`--data-dir` is persistent across subcommands. `main.version` is stamped at build
+time via `-ldflags "-X main.version=$(git describe --tags --always)"` (CI checks out
+with `fetch-depth: 0` so tags are visible).
+
+Release assets are raw binaries named exactly `llm-switch-<goos>-<goarch>` (Makefile
+`release` target, uploaded by `.github/workflows/build.yaml` on `v*` tag pushes);
+`internal/upgrade` matches assets by that exact name — do not rename either side.
+
+The running instance records `<dataDir>/llm-switch.pid` (plain number —
+`kill $(cat ...)` must keep working) and `<dataDir>/llm-switch.meta` (JSON
+`RunMeta{pid, args, version, started_at}`) in every mode; `upgrade` restarts a
+running instance detached with the saved args after `daemon.Stop` (SIGTERM →
+poll the single-instance flock up to 45 s = 30 s HTTP drain + 10 s stats drain).
 
 ## Architecture Essentials
 

@@ -53,6 +53,21 @@ Agent (Claude Code, Codex CLI, OpenAI SDK, ...)   llm-switch                    
   writes never block the hot path.
 - **Client API keys**: issue gateway keys to agents; keys are stored hashed and shown once.
 
+## Install
+
+Prebuilt binaries are attached to every [GitHub release](https://github.com/PWZER/llm-switch/releases)
+(`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`), compressed with UPX
+except `darwin-arm64`, which UPX cannot pack:
+
+```bash
+curl -fsSLO https://github.com/PWZER/llm-switch/releases/latest/download/llm-switch-linux-amd64
+chmod +x llm-switch-linux-amd64 && mv llm-switch-linux-amd64 ~/.local/bin/llm-switch
+llm-switch --version
+```
+
+To update an installed binary in place (and restart a running instance), use the
+built-in self-update — see [CLI](#cli).
+
 ## Quick start
 
 Requirements: Go 1.25+ and Node 20+ (only for building the UI).
@@ -90,14 +105,54 @@ release version with `docker build --build-arg VERSION=1.2.3 .`.
 ### Run as a daemon (bare metal)
 
 ```bash
-./bin/llm-switch -daemon        # detaches; logs to <data-dir>/llm-switch.log
-kill $(cat ~/.llm-switch/llm-switch.pid)
+./bin/llm-switch --daemon       # detaches; logs to <data-dir>/llm-switch.log
+llm-switch status               # pid, version, args of the running instance
+llm-switch stop                 # graceful stop (SIGTERM, waits for drain)
+kill $(cat ~/.llm-switch/llm-switch.pid)   # still works: the pid file is a plain number
 ```
 
 Startup failures (port busy, already running) are reported on the terminal with
 a non-zero exit code. A single-instance flock (`<data-dir>/llm-switch.lock`) is
 held in every mode — foreground included — so a second process on the same data
 dir always fails with "already running".
+
+## CLI
+
+The binary is one command with subcommands. The root command (default) boots the
+server; all flags use the standard double-dash form, each with an `LLM_SWITCH_*`
+environment fallback (e.g. `--data-dir` / `LLM_SWITCH_DATA_DIR`):
+
+| Command | Purpose |
+| --- | --- |
+| *(root)* | Start the gateway (`--addr`, `--data-dir`, `--daemon`, `--log-format`, `--web-dev`, `--admin-password`) |
+| `--version`, `-v` | Print the stamped version |
+| `upgrade` | Self-update from GitHub Releases (see below) |
+| `status` | Show whether an instance is running (exit code 1 when not) |
+| `stop` | Stop the running instance; `--force` escalates to SIGKILL after the grace period |
+
+Subcommand flags: `upgrade --check` (print versions only), `upgrade --yes`
+(skip confirmation), `stop --force`; every subcommand also accepts the
+persistent `--data-dir`.
+
+### Self-update (`upgrade`)
+
+`llm-switch upgrade` resolves the latest GitHub release, downloads the asset
+matching this platform, verifies its size, and atomically renames it over the
+running binary:
+
+1. The latest tag is read from the `/releases/latest` redirect (no API rate
+   limit); the REST API is the fallback and honors `GITHUB_TOKEN` / `GH_TOKEN`
+   (useful on shared IPs, where the 60 req/h anonymous limit runs out).
+2. Version comparison is numeric semver; `dev` or commit-SHA builds always
+   proceed (with a warning).
+3. If an instance is running (pid file + live process in the data dir), it is
+   stopped gracefully (SIGTERM, up to 45 s for in-flight LLM streams to drain)
+   and restarted **detached** with its original flags — including an instance
+   that was running in the foreground. With no instance running, just start
+   `llm-switch` afterwards.
+4. The binary is replaced before the old instance is signaled; if the stop
+   times out, the new binary is already in place — stop the instance manually
+   and start it again.
 
 ### Configure in the Web UI
 
@@ -157,7 +212,9 @@ Model names resolve after stripping the `[1m]` context marker: model route (prov
 make dev        # Go backend on :8901 + Vite dev server on :5173 (proxied, no CORS)
 make test       # go test ./... -race
 make mock       # canned OpenAI+Anthropic upstream on :9091 for manual e2e
-make build      # production single binary
+make build      # production single binary (version stamped from git describe)
+make release    # cross-compile bin/llm-switch-<goos>-<goarch> for the 4 release platforms
+make compress   # UPX the release binaries (no-op where upx is missing or unsupported)
 ```
 
 End-to-end without real provider keys:
@@ -199,7 +256,7 @@ timeout (streams live as long as needed, bounded by an idle watchdog).
   the binary sets `0700`).
 - Client gateway keys are stored as SHA-256 hashes; the plaintext is shown exactly once.
 - The admin UI is a single password + bearer session. The default listen address
-  (`:8901`) binds all interfaces — restrict it with `-addr 127.0.0.1:8901` or run
+  (`:8901`) binds all interfaces — restrict it with `--addr 127.0.0.1:8901` or run
   behind authenticated TLS; the gateway makes no attempt to be multi-tenant.
 
 ## License
