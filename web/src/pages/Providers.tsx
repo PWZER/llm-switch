@@ -826,6 +826,9 @@ function EndpointModal({
     }
   })();
 
+  // takenProtocols arrives as a freshly computed array each render; key the
+  // effect on its CONTENT so an open modal is never reset mid-edit.
+  const takenKey = takenProtocols.join(',');
   useEffect(() => {
     if (!open) return;
     setProbeResult(null);
@@ -843,15 +846,19 @@ function EndpointModal({
       form.setFieldsValue(initial);
     } else {
       form.resetFields();
+      // Default to the first protocol the provider has no endpoint for yet.
+      const proto =
+        (['openai', 'responses', 'anthropic'] as const).find((p) => !takenProtocols.includes(p)) ?? 'openai';
       form.setFieldsValue({
-        protocol: 'openai',
+        protocol: proto,
         auth_style: '',
         enabled: true,
         supports_embeddings: false,
-        chat_path: DEFAULT_CHAT_PATHS.openai,
+        chat_path: DEFAULT_CHAT_PATHS[proto],
       });
     }
-  }, [open, editing, initial, form]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- takenProtocols is read via takenKey
+  }, [open, editing, initial, takenKey, form]);
 
   const submit = async (v: EndpointForm) => {
     // Drop a stale supports_embeddings left over from a protocol switch —
