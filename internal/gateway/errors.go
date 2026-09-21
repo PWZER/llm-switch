@@ -106,7 +106,7 @@ func storeLogEntry(r *http.Request, start time.Time, ck engine.ClientKey,
 	if c := cand.Channel; c != nil {
 		cid := c.ID
 		entry.ChannelID = &cid
-		entry.ChannelName = c.Name
+		entry.ChannelProtocol = c.Protocol
 		if c.Provider != nil {
 			pid := c.Provider.ID
 			entry.ProviderID = &pid

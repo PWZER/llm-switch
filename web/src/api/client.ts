@@ -84,19 +84,17 @@ export interface Channel {
   id: number;
   provider_id: number;
   provider_name: string;
-  name: string;
-  protocol: 'openai' | 'anthropic';
+  /** Channel identity within a provider: at most one endpoint per protocol. */
+  protocol: 'openai' | 'anthropic' | 'responses';
   base_url: string;
+  /** Request path for every protocol (/chat/completions, /v1/messages, /responses). */
   chat_path: string;
-  auth_style: 'bearer' | 'x-api-key';
-  responses_path: string | null;
+  /** '' = protocol default (bearer for openai/responses, x-api-key for anthropic). */
+  auth_style: '' | 'bearer' | 'x-api-key';
   extra_headers: string;
   enabled: boolean;
-  priority: number;
-  weight: number;
+  /** Only meaningful for openai channels. */
   supports_embeddings: boolean;
-  passthrough: boolean;
-  force_upstream_stream: boolean;
 }
 
 // — usage / balance probes ---------------------------------------------------
@@ -214,7 +212,7 @@ export interface RequestLog {
   provider_name: string;
   account_id: number | null;
   account_name: string;
-  channel_name: string;
+  channel_protocol: string;
   model: string;
   upstream_model: string;
   protocol_in: string;
@@ -269,19 +267,13 @@ export interface ExportAccount {
 }
 
 export interface ExportChannel {
-  name: string;
-  protocol: 'openai' | 'anthropic';
+  protocol: 'openai' | 'anthropic' | 'responses';
   base_url: string;
   chat_path: string;
-  responses_path: string | null;
-  auth_style: 'bearer' | 'x-api-key';
+  auth_style: '' | 'bearer' | 'x-api-key';
   extra_headers: string;
   enabled: boolean;
-  priority: number;
-  weight: number;
   supports_embeddings: boolean;
-  passthrough: boolean;
-  force_upstream_stream: boolean;
 }
 
 export interface ExportModel {
@@ -305,9 +297,10 @@ export interface ExportProvider {
 }
 
 export interface ExportRouteTarget {
-  /** Provider name; channel/account pins reference names within it. */
+  /** Provider name; endpoint/account pins reference it. */
   provider: string;
-  channel: string | null;
+  /** Pinned endpoint protocol; null = auto-select within the provider. */
+  channel_protocol: string | null;
   account_label: string | null;
   upstream_model: string;
 }

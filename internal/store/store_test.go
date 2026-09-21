@@ -32,8 +32,8 @@ func TestMigrationsIdempotent(t *testing.T) {
 		t.Fatalf("second migrate: %v", err)
 	}
 	var maxv int
-	if err := st.db.Read.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&maxv); err != nil || maxv != 4 {
-		t.Fatalf("want schema version 4, got %d (err=%v)", maxv, err)
+	if err := st.db.Read.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&maxv); err != nil || maxv != 5 {
+		t.Fatalf("want schema version 5, got %d (err=%v)", maxv, err)
 	}
 }
 
@@ -233,11 +233,10 @@ func TestProviderChannelRouteRoundtrip(t *testing.T) {
 	}
 
 	cid, err := st.Channels.Create(ctx, &Channel{
-		ProviderID: pid, Name: "ds-openai", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: "https://api.deepseek.com", ChatPath: "/chat/completions",
 		AuthStyle: "bearer", ExtraHeaders: "{}",
-		Enabled: true, Priority: 10, Weight: 1,
-		Passthrough: true,
+		Enabled: true,
 	})
 	if err != nil {
 		t.Fatalf("create channel: %v", err)
@@ -255,6 +254,23 @@ func TestProviderChannelRouteRoundtrip(t *testing.T) {
 	}
 	if c.ProviderName != "deepseek" {
 		t.Fatalf("unexpected channel: %+v", c)
+	}
+
+	// (provider_id, protocol) is the channel's identity: a second endpoint of
+	// the same protocol is rejected, and GetByProtocol resolves the unique row.
+	if _, err := st.Channels.Create(ctx, &Channel{
+		ProviderID: pid, Protocol: "openai",
+		BaseURL: "https://mirror.example.com", ChatPath: "/chat/completions",
+		ExtraHeaders: "{}", Enabled: true,
+	}); err == nil {
+		t.Fatal("duplicate (provider, protocol) channel must be rejected")
+	}
+	byProto, err := st.Channels.GetByProtocol(ctx, pid, "openai")
+	if err != nil || byProto.ID != cid || byProto.ProviderName != "deepseek" {
+		t.Fatalf("get channel by protocol: %+v err=%v", byProto, err)
+	}
+	if _, err := st.Channels.GetByProtocol(ctx, pid, "anthropic"); err != ErrNotFound {
+		t.Fatalf("missing protocol must be ErrNotFound, got %v", err)
 	}
 	m, err := st.Models.Get(ctx, pid, "deepseek-flash")
 	if err != nil || m.Upstream() != "deepseek-flash" {
@@ -328,19 +344,21 @@ func TestModelRouteProviderTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("provider: %v", err)
 	}
-	newChannel := func(name string) int64 {
+	// One channel per protocol per provider — the test uses two protocols to
+	// exercise pinning and deletion on the same provider.
+	newChannel := func(protocol string) int64 {
 		t.Helper()
 		cid, err := st.Channels.Create(ctx, &Channel{
-			ProviderID: pid, Name: name, Protocol: "openai",
+			ProviderID: pid, Protocol: protocol,
 			BaseURL: "http://127.0.0.1:1", ChatPath: "/chat/completions",
-			AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 1, Weight: 1,
+			ExtraHeaders: "{}", Enabled: true,
 		})
 		if err != nil {
-			t.Fatalf("channel %s: %v", name, err)
+			t.Fatalf("channel %s: %v", protocol, err)
 		}
 		return cid
 	}
-	cid := newChannel("c1")
+	cid := newChannel("openai")
 
 	// A provider-scoped (auto-select) target round-trips and stores an
 	// explicit JSON null channel_id.
@@ -416,7 +434,7 @@ func TestModelRouteProviderTargets(t *testing.T) {
 
 	// Degrading onto an identical auto target dedupes instead of stacking a
 	// redundant failover copy.
-	cid2 := newChannel("c2")
+	cid2 := newChannel("anthropic")
 	a.Targets = []ModelRouteTarget{
 		{ProviderID: pid, ChannelID: int64p(cid2), UpstreamModel: "m"},
 		{ProviderID: pid, UpstreamModel: "m"},
@@ -440,9 +458,9 @@ func TestModelRouteProviderTargets(t *testing.T) {
 		t.Fatalf("provider2: %v", err)
 	}
 	cid3, err := st.Channels.Create(ctx, &Channel{
-		ProviderID: pid2, Name: "c3", Protocol: "openai",
+		ProviderID: pid2, Protocol: "openai",
 		BaseURL: "http://127.0.0.1:2", ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 1, Weight: 1,
+		ExtraHeaders: "{}", Enabled: true,
 	})
 	if err != nil {
 		t.Fatalf("channel3: %v", err)

@@ -417,10 +417,9 @@ func TestModelsDuplicateNamesMerge(t *testing.T) {
 	pid2, err := h.st.Providers.Create(ctx, "fake2", nil)
 	must(t, err)
 	_, err = h.st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid2, Name: "fake2-openai", Protocol: "openai",
+		ProviderID: pid2, Protocol: "openai",
 		BaseURL: h.openai.URL(), ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 5, Weight: 1,
-		Passthrough: true,
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 	})
 	must(t, err)
 	must(h.t, h.st.Models.Create(ctx, &store.Model{

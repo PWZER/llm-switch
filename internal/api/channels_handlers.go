@@ -1,28 +1,22 @@
 package api
 
 import (
+	"errors"
 	"net/http"
-	"strings"
 
 	"github.com/PWZER/llm-switch/internal/httpx"
 	"github.com/PWZER/llm-switch/internal/store"
 )
 
 type channelBody struct {
-	ProviderID          int64   `json:"provider_id"`
-	Name                string  `json:"name"`
-	Protocol            string  `json:"protocol"`
-	BaseURL             string  `json:"base_url"`
-	ChatPath            string  `json:"chat_path"`
-	AuthStyle           string  `json:"auth_style"`
-	ResponsesPath       *string `json:"responses_path"`
-	ExtraHeaders        string  `json:"extra_headers"`
-	Enabled             *bool   `json:"enabled"`
-	Priority            *int    `json:"priority"`
-	Weight              *int    `json:"weight"`
-	SupportsEmbeddings  *bool   `json:"supports_embeddings"`
-	Passthrough         *bool   `json:"passthrough"`
-	ForceUpstreamStream *bool   `json:"force_upstream_stream"`
+	ProviderID         int64  `json:"provider_id"`
+	Protocol           string `json:"protocol"`
+	BaseURL            string `json:"base_url"`
+	ChatPath           string `json:"chat_path"`
+	AuthStyle          string `json:"auth_style"`
+	ExtraHeaders       string `json:"extra_headers"`
+	Enabled            *bool  `json:"enabled"`
+	SupportsEmbeddings *bool  `json:"supports_embeddings"`
 }
 
 func (s *Server) handleListChannels(w http.ResponseWriter, req *http.Request) {
@@ -41,6 +35,9 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, req *http.Request) {
 	}
 	if err := validateChannelBody(&body, true); err != nil {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, err.Error())
+		return
+	}
+	if !s.checkProtocolFree(w, req, body.ProviderID, body.Protocol, 0) {
 		return
 	}
 	c := body.toChannel(true)
@@ -93,7 +90,20 @@ func (s *Server) handleUpdateChannel(w http.ResponseWriter, req *http.Request) {
 	}
 	c := body.toChannel(false)
 	c.ID = current.ID
+	c.ProviderID = current.ProviderID
 	c.CreatedAt = current.CreatedAt
+	if c.Protocol == "" {
+		c.Protocol = current.Protocol
+	}
+	if c.SupportsEmbeddings && c.Protocol != "openai" {
+		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002,
+			"supports_embeddings applies to openai channels only")
+		return
+	}
+	if c.Protocol != current.Protocol &&
+		!s.checkProtocolFree(w, req, current.ProviderID, c.Protocol, id) {
+		return
+	}
 	if err := s.St.Channels.Update(req.Context(), &c); err != nil {
 		mapStoreErr(w, req, err)
 		return
@@ -119,23 +129,40 @@ func (s *Server) handleDeleteChannel(w http.ResponseWriter, req *http.Request) {
 	httpx.WriteEnvelope(w, req, map[string]bool{"ok": true})
 }
 
+// checkProtocolFree enforces one endpoint per protocol per provider ahead of
+// the DB UNIQUE constraint (excludeID ignores the row being updated). Writes
+// the 409 response and returns false when the protocol is taken.
+func (s *Server) checkProtocolFree(w http.ResponseWriter, req *http.Request, providerID int64, protocol string, excludeID int64) bool {
+	existing, err := s.St.Channels.GetByProtocol(req.Context(), providerID, protocol)
+	if errors.Is(err, store.ErrNotFound) {
+		return true
+	}
+	if err != nil {
+		mapStoreErr(w, req, err)
+		return false
+	}
+	if existing.ID == excludeID {
+		return true
+	}
+	httpx.WriteEnvelopeError(w, req, http.StatusConflict, 40910,
+		"provider already has a "+protocol+" endpoint — edit or delete it first")
+	return false
+}
+
 func validateChannelBody(b *channelBody, creating bool) error {
 	if creating {
 		if b.ProviderID <= 0 {
 			return errText("provider_id is required")
 		}
-		if b.Name == "" {
-			return errText("name is required")
-		}
-		if b.Protocol != "openai" && b.Protocol != "anthropic" {
-			return errText(`protocol must be "openai" or "anthropic"`)
-		}
 		if b.BaseURL == "" {
 			return errText("base_url is required")
 		}
 	}
-	if b.Protocol != "" && b.Protocol != "openai" && b.Protocol != "anthropic" {
-		return errText(`protocol must be "openai" or "anthropic"`)
+	if creating && b.Protocol == "" {
+		return errText(`protocol must be "openai", "anthropic" or "responses"`)
+	}
+	if b.Protocol != "" && b.Protocol != "openai" && b.Protocol != "anthropic" && b.Protocol != "responses" {
+		return errText(`protocol must be "openai", "anthropic" or "responses"`)
 	}
 	if b.AuthStyle != "" && b.AuthStyle != "bearer" && b.AuthStyle != "x-api-key" {
 		return errText(`auth_style must be "bearer" or "x-api-key"`)
@@ -143,16 +170,9 @@ func validateChannelBody(b *channelBody, creating bool) error {
 	if b.ExtraHeaders != "" && b.ExtraHeaders != "{}" && b.ExtraHeaders[0] != '{' {
 		return errText("extra_headers must be a JSON object string")
 	}
-	if b.ResponsesPath != nil {
-		p := strings.TrimSpace(*b.ResponsesPath)
-		if p != "" {
-			if strings.Contains(p, "://") || strings.ContainsAny(p, " \t\r\n") {
-				return errText("responses_path must be a URL path like /responses")
-			}
-			if b.Protocol == "anthropic" {
-				return errText("responses_path applies to openai channels only")
-			}
-		}
+	protocol := b.Protocol
+	if b.SupportsEmbeddings != nil && *b.SupportsEmbeddings && protocol != "" && protocol != "openai" {
+		return errText("supports_embeddings applies to openai channels only")
 	}
 	return nil
 }
@@ -160,40 +180,21 @@ func validateChannelBody(b *channelBody, creating bool) error {
 // toChannel materializes the body into a store row, applying defaults on create.
 func (b *channelBody) toChannel(creating bool) store.Channel {
 	c := store.Channel{
-		ProviderID:    b.ProviderID,
-		Name:          b.Name,
-		Protocol:      b.Protocol,
-		BaseURL:       b.BaseURL,
-		ChatPath:      b.ChatPath,
-		AuthStyle:     b.AuthStyle,
-		ResponsesPath: b.ResponsesPath,
-		ExtraHeaders:  b.ExtraHeaders,
+		ProviderID:   b.ProviderID,
+		Protocol:     b.Protocol,
+		BaseURL:      b.BaseURL,
+		ChatPath:     b.ChatPath,
+		AuthStyle:    b.AuthStyle,
+		ExtraHeaders: b.ExtraHeaders,
 	}
 	if creating {
 		c.Enabled = true
-		c.Passthrough = true
-		c.Weight = 1
 	}
 	if b.Enabled != nil {
 		c.Enabled = *b.Enabled
 	}
-	if b.Priority != nil {
-		c.Priority = *b.Priority
-	}
-	if b.Weight != nil {
-		c.Weight = *b.Weight
-	}
 	if b.SupportsEmbeddings != nil {
 		c.SupportsEmbeddings = *b.SupportsEmbeddings
-	}
-	if b.Passthrough != nil {
-		c.Passthrough = *b.Passthrough
-	}
-	if b.ForceUpstreamStream != nil {
-		c.ForceUpstreamStream = *b.ForceUpstreamStream
-	}
-	if c.AuthStyle == "" {
-		c.AuthStyle = "bearer"
 	}
 	if c.ExtraHeaders == "" {
 		c.ExtraHeaders = "{}"

@@ -37,24 +37,35 @@ func TestSeedDefaultProviders(t *testing.T) {
 		t.Fatalf("want %d channels, got %d", wantChannels, len(channels))
 	}
 
-	byName := map[string]Channel{}
+	// Channels are keyed by (provider, protocol) — the map must absorb every
+	// row, i.e. no provider carries a second channel of one protocol.
+	byProto := map[string]Channel{}
 	for _, c := range channels {
-		byName[c.Name] = c
+		byProto[c.ProviderName+"/"+c.Protocol] = c
+	}
+	if len(byProto) != len(channels) {
+		t.Fatalf("seeded duplicate (provider, protocol) channel: %d rows, %d keys", len(channels), len(byProto))
 	}
 
-	// Spot-check the tricky endpoints: Zhipu anthropic auth style, Kimi For
-	// Coding trailing slash, OpenAI responses passthrough path.
-	za := byName["zhipu-anthropic"]
-	if za.BaseURL != "https://open.bigmodel.cn/api/anthropic" || za.AuthStyle != "x-api-key" {
-		t.Fatalf("zhipu-anthropic wrong: %+v", za)
+	// Spot-check the tricky endpoints: Kimi For Coding's significant trailing
+	// slash, OpenAI's two protocol-keyed channels, and protocol-default auth
+	// styles (seeded channels all carry '' — dispatch resolves bearer/x-api-key
+	// per protocol).
+	za := byProto["Zhipu GLM/anthropic"]
+	if za.BaseURL != "https://open.bigmodel.cn/api/anthropic" || za.ChatPath != "/v1/messages" || za.AuthStyle != "" {
+		t.Fatalf("zhipu anthropic wrong: %+v", za)
 	}
-	kc := byName["kimi-coding-anthropic"]
+	kc := byProto["KimiCoding/anthropic"]
 	if kc.BaseURL != "https://api.kimi.com/coding/" {
 		t.Fatalf("kimi coding base_url lost trailing slash: %q", kc.BaseURL)
 	}
-	oa := byName["openai"]
-	if oa.ResponsesPath == nil || *oa.ResponsesPath != "/responses" {
-		t.Fatalf("openai responses_path missing: %+v", oa)
+	oa := byProto["OpenAI/openai"]
+	if oa.BaseURL != "https://api.openai.com/v1" || oa.ChatPath != "/chat/completions" {
+		t.Fatalf("openai chat channel wrong: %+v", oa)
+	}
+	or := byProto["OpenAI/responses"]
+	if or.BaseURL != "https://api.openai.com/v1" || or.ChatPath != "/responses" {
+		t.Fatalf("openai responses channel wrong: %+v", or)
 	}
 
 	// Every seeded provider carries its docs-verified models-list fetch URL.

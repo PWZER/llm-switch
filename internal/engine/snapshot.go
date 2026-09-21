@@ -33,23 +33,19 @@ type Provider struct {
 	Enabled  bool
 }
 
-// Channel is a routable protocol-specific endpoint.
+// Channel is a routable protocol-specific endpoint; a provider carries at
+// most one per protocol. AuthStyle "" resolves to the protocol default at
+// dispatch; ChatPath "" resolves to the protocol default path.
 type Channel struct {
-	ID                  int64
-	ProviderID          int64
-	Provider            *Provider
-	Name                string
-	Protocol            string // "openai" | "anthropic"
-	BaseURL             string
-	ChatPath            string
-	AuthStyle           string  // "bearer" | "x-api-key"
-	ResponsesPath       *string // upstream Responses API endpoint; nil/"" = bridge via IR
-	ExtraHeaders        map[string]string
-	Priority            int
-	Weight              int
-	SupportsEmbeddings  bool
-	Passthrough         bool
-	ForceUpstreamStream bool
+	ID                 int64
+	ProviderID         int64
+	Provider           *Provider
+	Protocol           string // "openai" | "anthropic" | "responses"
+	BaseURL            string
+	ChatPath           string
+	AuthStyle          string // "" | "bearer" | "x-api-key"
+	ExtraHeaders       map[string]string
+	SupportsEmbeddings bool
 }
 
 // Candidate pairs a channel with the upstream model to request. Account is
@@ -117,8 +113,8 @@ type Snapshot struct {
 	Providers map[int64]*Provider
 	Channels  map[int64]*Channel
 	// channelsByProvider groups the live channels (enabled channel of an
-	// enabled provider) per provider, each slice sorted priority DESC then
-	// weight DESC — the same expansion order as ByModel candidates.
+	// enabled provider) per provider, each slice ordered by channel id — the
+	// same expansion order as ByModel candidates.
 	channelsByProvider map[int64][]*Channel
 	ByModel            map[string][]Candidate // failover-ordered
 	Routes             map[string]Route
@@ -196,8 +192,8 @@ func (s *Snapshot) anthropicServed(name string) bool {
 
 // targetLiveChannels returns the channels one route target expands to: the
 // pinned channel (nil when disabled or deleted), or every live channel of
-// the target's provider in build order (priority DESC, weight DESC; empty
-// when it has none). Account pins are the caller's concern.
+// the target's provider in id order (empty when it has none). Account pins
+// are the caller's concern.
 func (s *Snapshot) targetLiveChannels(tgt RouteTarget) []*Channel {
 	if tgt.ChannelID != 0 {
 		ch := s.Channels[tgt.ChannelID]
@@ -216,7 +212,7 @@ func (s *Snapshot) targetLiveChannels(tgt RouteTarget) []*Channel {
 // same same-protocol preference as row-derived candidates. A target pinning
 // an account is skipped when the account is not in the provider's enabled
 // pool.
-func (s *Snapshot) routeChain(rt Route, preferProtocol string) []Candidate {
+func (s *Snapshot) routeChain(rt Route, prefer []string) []Candidate {
 	var cands []Candidate
 	for _, tgt := range rt.Targets {
 		if tgt.ChannelID != 0 {
@@ -253,7 +249,7 @@ func (s *Snapshot) routeChain(rt Route, preferProtocol string) []Candidate {
 		for _, ch := range live {
 			seg = append(seg, Candidate{Channel: ch, UpstreamModel: tgt.UpstreamModel, Account: pinned})
 		}
-		cands = append(cands, preferSameProtocol(seg, preferProtocol)...)
+		cands = append(cands, preferProtocols(seg, prefer)...)
 	}
 	return cands
 }
@@ -289,62 +285,87 @@ func (p *Provider) account(id int64) *Account {
 // learned claude-* naming keep working; stripping never adds list entries)
 // -> not found. A name with no enabled row and no route is unroutable.
 //
-// preferProtocol is the client surface's wire protocol ("openai" |
-// "anthropic"): row-derived candidates matching it win outright, and
-// cross-protocol candidates serve only when no same-protocol candidate
-// exists (bridging costs a conversion). Route targets pinning an explicit
-// channel are explicit admin configuration and are never filtered;
-// provider-scoped route targets apply the same same-protocol preference
-// within their own segment only.
+// prefer is the client surface's ordered protocol preference chain. The two
+// candidate sources apply it differently:
+//
+//   - Model-row candidates are a pool of equivalent serving options, so the
+//     chain ORDERS them (orderProtocols): closest protocol first, but every
+//     candidate stays in the failover list — a dead responses endpoint falls
+//     back to a chat transcode, and so on down the chain.
+//   - Route chains are an explicit admin-ordered failover sequence, so each
+//     provider-scoped target FILTERS to its best protocol tier
+//     (preferProtocols): falling back across protocols is the next target's
+//     job, never the current segment's. Channel-pinned targets are explicit
+//     configuration and are never filtered.
 //
 // The second return is the canonical client-facing name that matched — the
 // route's own name for route hits, the bare (marker-stripped and, for
 // claude-* mirrors, prefix-stripped) row name for row hits — for attribution
 // and usage logging; empty when not found.
-func (s *Snapshot) Resolve(requested, preferProtocol string) ([]Candidate, string, bool) {
+func (s *Snapshot) Resolve(requested string, prefer []string) ([]Candidate, string, bool) {
 	requested = strings.TrimSuffix(requested, Context1mSuffix)
 	if rt, ok := s.Routes[requested]; ok {
-		if cands := s.routeChain(rt, preferProtocol); len(cands) > 0 {
+		if cands := s.routeChain(rt, prefer); len(cands) > 0 {
 			return cands, rt.Name, true
 		}
 		// Route exists but every target is disabled/deleted: fall through so
 		// the model name itself can still resolve via models rows.
 	}
 	if cands, ok := s.ByModel[requested]; ok && len(cands) > 0 {
-		return preferSameProtocol(cands, preferProtocol), requested, true
+		return orderProtocols(cands, prefer), requested, true
 	}
 	// A literal claude-* route or row always wins above; only then does
 	// prefix stripping apply.
 	if rest, ok := strings.CutPrefix(requested, "claude-"); ok {
 		if rt, ok := s.Routes[rest]; ok {
-			if cands := s.routeChain(rt, preferProtocol); len(cands) > 0 {
+			if cands := s.routeChain(rt, prefer); len(cands) > 0 {
 				return cands, rt.Name, true
 			}
 		}
 		if cands, ok := s.ByModel[rest]; ok && len(cands) > 0 {
-			return preferSameProtocol(cands, preferProtocol), rest, true
+			return orderProtocols(cands, prefer), rest, true
 		}
 	}
 	return nil, "", false
 }
 
-// preferSameProtocol keeps only the candidates whose channel speaks the
-// client surface's protocol when any exist; otherwise it returns the full
-// list (cross-protocol bridging is the fallback, never the default).
-func preferSameProtocol(cands []Candidate, protocol string) []Candidate {
-	if protocol == "" {
-		return cands
-	}
-	var same []Candidate
-	for _, c := range cands {
-		if c.Channel != nil && c.Channel.Protocol == protocol {
-			same = append(same, c)
+// preferProtocols keeps only the candidates matching the first preference
+// tier with any match; an empty chain (or no match at any tier) returns the
+// full list. Used for route-target segments, where cross-protocol fallback
+// belongs to the next chain entry, not the current one.
+func preferProtocols(cands []Candidate, prefer []string) []Candidate {
+	for _, protocol := range prefer {
+		var same []Candidate
+		for _, c := range cands {
+			if c.Channel != nil && c.Channel.Protocol == protocol {
+				same = append(same, c)
+			}
+		}
+		if len(same) > 0 {
+			return same
 		}
 	}
-	if len(same) > 0 {
-		return same
-	}
 	return cands
+}
+
+// orderProtocols stably sorts candidates by preference-chain position
+// (channel id order survives within a tier) without dropping any: every
+// candidate remains available for failover, closest protocol first. Used for
+// model-row candidates, which are a pool rather than an ordered chain.
+func orderProtocols(cands []Candidate, prefer []string) []Candidate {
+	rank := func(p string) int {
+		for i, want := range prefer {
+			if p == want {
+				return i
+			}
+		}
+		return len(prefer)
+	}
+	out := append([]Candidate(nil), cands...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return rank(out[i].Channel.Protocol) < rank(out[j].Channel.Protocol)
+	})
+	return out
 }
 
 // Holder owns the current snapshot pointer.
@@ -418,14 +439,10 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 		}
 		nc := &Channel{
 			ID: c.ID, ProviderID: c.ProviderID, Provider: snap.Providers[c.ProviderID],
-			Name: c.Name, Protocol: c.Protocol, BaseURL: c.BaseURL, ChatPath: c.ChatPath,
-			AuthStyle: c.AuthStyle, ResponsesPath: c.ResponsesPath,
-			ExtraHeaders:        parseHeaders(c.ExtraHeaders),
-			Priority:            c.Priority,
-			Weight:              c.Weight,
-			SupportsEmbeddings:  c.SupportsEmbeddings,
-			Passthrough:         c.Passthrough,
-			ForceUpstreamStream: c.ForceUpstreamStream,
+			Protocol: c.Protocol, BaseURL: c.BaseURL, ChatPath: c.ChatPath,
+			AuthStyle:          c.AuthStyle,
+			ExtraHeaders:       parseHeaders(c.ExtraHeaders),
+			SupportsEmbeddings: c.SupportsEmbeddings,
 		}
 		if nc.Provider == nil || !nc.Provider.Enabled {
 			continue // provider disabled or missing: channel unroutable
@@ -433,18 +450,6 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 		snap.Channels[nc.ID] = nc
 		snap.channelsByProvider[nc.ProviderID] = append(snap.channelsByProvider[nc.ProviderID], nc)
 	}
-	// Segment order for provider-scoped route targets must match the row
-	// expansion below: priority DESC, then weight DESC (the store's SQL
-	// ordering breaks ties by id instead of weight).
-	for _, chs := range snap.channelsByProvider {
-		sort.SliceStable(chs, func(i, j int) bool {
-			if chs[i].Priority != chs[j].Priority {
-				return chs[i].Priority > chs[j].Priority
-			}
-			return chs[i].Weight > chs[j].Weight
-		})
-	}
-
 	// Model rows are the routing table: each enabled row yields one candidate
 	// per live channel of its provider (the registry is provider-scoped — every
 	// endpoint of the provider can serve the name), carrying the row's upstream
@@ -465,12 +470,7 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	}
 	for model := range snap.ByModel {
 		cands := snap.ByModel[model]
-		sort.SliceStable(cands, func(i, j int) bool {
-			if cands[i].Channel.Priority != cands[j].Channel.Priority {
-				return cands[i].Channel.Priority > cands[j].Channel.Priority // higher first
-			}
-			return cands[i].Channel.Weight > cands[j].Channel.Weight
-		})
+		sort.SliceStable(cands, func(i, j int) bool { return cands[i].Channel.ID < cands[j].Channel.ID })
 	}
 
 	routes, err := st.Routes.List(ctx)
@@ -504,10 +504,10 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	// describe renders the entry description as "{provider}/{account}" using
 	// the account that would serve first: the route target's pinned account,
 	// else the first enabled account of the serving provider. The channel
-	// name is deliberately omitted — every live channel of the provider can
-	// serve the name, so naming the first one reads as a protocol mark. A
-	// provider without enabled accounts degrades to "{provider}"; names no
-	// channel serves fall back to the row's provider name, then "".
+	// endpoint is deliberately omitted — every live channel of the provider
+	// can serve the name, so naming one reads as a protocol mark. A provider
+	// without enabled accounts degrades to "{provider}"; names no channel
+	// serves fall back to the row's provider name, then "".
 	describe := func(name string, providerID int64) string {
 		render := func(ch *Channel, pinned *Account) string {
 			p := ch.Provider
@@ -530,7 +530,7 @@ func buildSnapshot(ctx context.Context, st *store.Store) (*Snapshot, error) {
 					continue
 				}
 				// chs[0] is the target's build-order top channel: the pinned
-				// endpoint, or the provider's highest-priority live one.
+				// endpoint, or the provider's lowest-id live one.
 				var pinned *Account
 				if tgt.AccountID != 0 {
 					pinned = chs[0].Provider.account(tgt.AccountID)

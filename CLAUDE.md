@@ -80,23 +80,33 @@ Pipeline per request: **parse → route → adapt → bridge** around an interna
 `internal/protocol/responses`) implement the `Codec` interface; cross-protocol = client
 codec → IR → upstream codec. Wire-identical traffic → **passthrough fast path** (byte
 relay with a usage tap), skipping the IR: same-protocol pairs, plus `/v1/responses`
-requests to openai channels with an explicit `responses_path` (upstream Responses API;
-the tap protocol switches to `openai-responses` so usage parses `response.completed`).
-`openai-responses` is a client-surface protocol only — `channels.protocol` stays
-`'openai' | 'anthropic'` (SQL CHECK unchanged).
+requests to native `responses` channels (the usage tap keys on the channel's
+`responses` protocol so it parses `response.completed`).
+`openai-responses` is the **client-surface** protocol name (routes,
+`request_logs.protocol_in`); upstream channels spell it `responses` —
+`channels.protocol ∈ 'openai' | 'anthropic' | 'responses'`. The two strings
+name the same wire format on different axes; never compare across axes.
 
 Data model (SQLite, `internal/store/migrations/0001_init.sql` +
-`0002_provider_scoped_models.sql`):
+`0002_provider_scoped_models.sql`; `0005_protocol_keyed_channels.sql` made
+channels protocol-keyed — split off native responses channels, dropped
+name/priority/weight — and renamed `request_logs.channel_name` to
+`channel_protocol`):
 
 ```
 providers (vendor account: name, models_url + endpoints)   accounts are shared by all its channels
   └─ accounts (label, api_key, weight, enabled, usage_probes JSON)  weighted RR + in-memory cooldown
-  └─ channels (protocol, base_url, chat_path, responses_path?, auth_style, priority, weight)
+  └─ channels (protocol ∈ openai|anthropic|responses, base_url, chat_path, auth_style)  ← UNIQUE(provider_id, protocol)
   └─ models (client-facing id + upstream_model alias, PK (provider_id, id))  ← registry = routing table
 model_routes (client-facing name → provider + upstream_model [+ channel pin] [+ account_id pin])  ← hot-switchable
 api_keys (client-facing gateway keys, sha256-hashed, shown once)
-request_logs (one row per request, account_id/account_name attribution; async batched writes)
+request_logs (one row per request, account + channel_protocol attribution; async batched writes)
 ```
+
+A channel has no name: the protocol is its identity within a provider (one
+endpoint per protocol per provider). `auth_style` empty = protocol default
+(bearer for openai/responses, x-api-key for anthropic); `chat_path` empty =
+protocol default path (`/chat/completions`, `/v1/messages`, `/responses`).
 
 One models row = one provider serving one client-facing model name
 (`upstream_model` empty = identity mapping) — every live channel of the
@@ -146,16 +156,18 @@ changes. Account cooldown/rotation state lives outside the snapshot (in-memory, 
 
 Routing precedence: strip a trailing `[1m]` (reserved listing marker, never part of a
 routing identity) → explicit **model route** → enabled **models rows** for the name
-(each row expands to one candidate per live channel of its provider; channel priority
-DESC groups, weighted RR within group; each candidate carries the row's upstream alias)
+(each row expands to one candidate per live channel of its provider — at most one
+per protocol — ordered by channel id; each candidate carries the row's upstream alias)
 → `claude-`-stripped name retried against routes then rows →
-protocol-shaped 404. Row-derived candidates are **protocol-filtered by the client
-surface** (`openai-responses` prefers `openai`): same-protocol candidates win
-outright, cross-protocol bridging serves only when no same-protocol candidate
-exists. Route targets pinning an explicit channel are explicit configuration and
-never filtered; a provider-scoped route target (no `channel_id`) expands to one
-candidate per live channel of its provider (priority DESC, weight DESC) with the
-same same-protocol-first preference applied within its own segment only. A name with
+protocol-shaped 404. Row-derived candidates are **stably sorted by the client
+surface's preference chain** (chat → openai > anthropic > responses; anthropic →
+anthropic > openai > responses; responses → responses > openai > anthropic):
+closest protocol first, but every candidate stays in the failover list — a dead
+native endpoint falls back to a bridged one. Route chains are the opposite: an
+explicit admin-ordered failover sequence, so each provider-scoped target
+**filters to its best protocol tier** within its own segment (cross-protocol
+fallback is the next target's job), and channel-pinned targets are explicit
+configuration, never filtered. A name with
 no enabled row and no route is neither listed nor routable. Model routes are
 listed in `GET /v1/models` on both surfaces; route
 names are canonical — the admin API rejects the `[1m]` suffix.
@@ -182,8 +194,8 @@ marker (`[route] ` for model-route entries, including names that also have a
 models row since the route wins at resolve time; `[model] ` for plain
 registry rows), the provider, and the account that would serve
 first (route-pinned, else the first enabled account; omitted when the provider
-has none). The channel name is deliberately omitted — every live channel of
-the provider can serve the name, so naming the first one reads as a protocol
+has none). The endpoint is deliberately omitted — every live channel of
+the provider can serve the name, so naming one reads as a protocol
 mark; names no channel serves fall back to the row's provider
 name — Claude Code's /model picker renders it instead of
 "From gateway". Claude Code's gateway discovery
@@ -285,9 +297,10 @@ retention.
     `ir.Request.ResponseFormat` — teaching the chat decoder it would make
     chat→anthropic bridging regress from silently-dropped to 400.
 14. **Usage tap is protocol-gated.** `tapStreamLine` keys responses parsing on the
-    `protocol` argument (`openai-responses`); never extend the shared generic usage
-    struct with Responses field names — that would silently start harvesting tokens
-    from anthropic passthrough bodies.
+    `protocol` argument (`openai-responses` client surface or `responses` channel
+    protocol); never extend the shared generic usage struct with Responses field
+    names — that would silently start harvesting tokens from anthropic passthrough
+    bodies.
 
 ## Seeded Vendor Endpoints (docs-verified base URLs)
 
@@ -297,10 +310,12 @@ retention.
 | DeepSeek | `https://api.deepseek.com` | `https://api.deepseek.com/anthropic` |
 | Kimi/Moonshot | `https://api.moonshot.cn/v1` (cn `api.moonshot.cn/v1`) | `https://api.moonshot.cn/anthropic` (cn mirror) |
 | Kimi For Coding | `https://api.kimi.com/coding/v1` | `https://api.kimi.com/coding/` (trailing slash significant) |
+| OpenAI | `https://api.openai.com/v1` (+ responses channel `/responses`) | — |
 
 Generic OpenAI/Anthropic-compatible types cover everything else.
 Explicit `chat_path` on channels avoids base-URL join ambiguity. The seeded OpenAI
-channel carries `responses_path: /responses`.
+provider carries two channels: openai (`/chat/completions`) and responses
+(`/responses`) on the same base URL.
 
 First boot seeds six built-in vendors (Zhipu GLM, DeepSeek, Kimi/Moonshot, Kimi For
 Coding, OpenAI, Anthropic) with these endpoints, their provider-level `models_url`

@@ -103,9 +103,9 @@ func TestModelRouteNameCanonical(t *testing.T) {
 		t.Fatalf("provider: %v", err)
 	}
 	cid, err := st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "c", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: "http://127.0.0.1:1", ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 1, Weight: 1,
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 	})
 	if err != nil {
 		t.Fatalf("channel: %v", err)
@@ -157,24 +157,24 @@ func TestUpsertRouteProviderTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("provider: %v", err)
 	}
-	mkChannel := func(providerID int64, name string) int64 {
+	mkChannel := func(providerID int64) int64 {
 		t.Helper()
 		cid, err := st.Channels.Create(ctx, &store.Channel{
-			ProviderID: providerID, Name: name, Protocol: "openai",
+			ProviderID: providerID, Protocol: "openai",
 			BaseURL: "http://127.0.0.1:1", ChatPath: "/chat/completions",
-			AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 1, Weight: 1,
+			AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 		})
 		if err != nil {
-			t.Fatalf("channel %s: %v", name, err)
+			t.Fatalf("channel: %v", err)
 		}
 		return cid
 	}
-	cid1 := mkChannel(pid, "c1")
+	cid1 := mkChannel(pid)
 	pid2, err := st.Providers.Create(ctx, "p2", nil)
 	if err != nil {
 		t.Fatalf("provider2: %v", err)
 	}
-	cid2 := mkChannel(pid2, "c2")
+	cid2 := mkChannel(pid2)
 	aid1, err := st.Accounts.Create(ctx, pid, "a1", "k1", 1, "")
 	if err != nil {
 		t.Fatalf("account: %v", err)

@@ -40,11 +40,7 @@ const upstreamModelOptions = (models: Model[], providerId?: number): { value: st
 const channelLabel = (channels: Channel[], id?: number): ReactNode => {
   const c = channels.find((x) => x.id === id);
   if (!c) return `#${id}`;
-  return (
-    <>
-      {c.name} <ProtocolTag protocol={c.protocol} />
-    </>
-  );
+  return <ProtocolTag protocol={c.protocol} />;
 };
 
 const accountLabel = (accounts: Account[], id?: number) => {
@@ -456,16 +452,13 @@ function TargetModal({
     form.setFieldsValue(initial ?? { provider_id: undefined, channel_id: undefined, upstream_model: '', account_id: undefined });
   }, [open, initial, form]);
 
+  // The provider's endpoints — the protocol tag alone identifies each one
+  // (a provider has at most one endpoint per protocol).
   const channelOptions = routableChannels
     .filter((c) => c.provider_id === providerId)
     .map((c) => ({
       value: c.id,
-      label: (
-        <>
-          {c.name}{' '}
-          <ProtocolTag protocol={c.protocol} style={{ marginInlineEnd: 0 }} />
-        </>
-      ),
+      label: <ProtocolTag protocol={c.protocol} style={{ marginInlineEnd: 0 }} />,
     }));
   const modelOptions = upstreamModelOptions(models, providerId);
   const accountOptions = accounts

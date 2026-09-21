@@ -11,9 +11,14 @@ type Protocol string
 const (
 	OpenAI    Protocol = "openai"
 	Anthropic Protocol = "anthropic"
-	// OpenAIResponses is the OpenAI Responses API wire shape (POST /v1/responses).
-	// It is a client-surface protocol only; channels never carry this value.
+	// OpenAIResponses names the OpenAI Responses API wire shape as seen on
+	// the client surface (POST /v1/responses) and in request logs.
 	OpenAIResponses Protocol = "openai-responses"
+	// Responses names the same wire shape as an upstream channel protocol
+	// (channels.protocol = 'responses'). Both keys resolve to the one
+	// Responses codec; the distinct strings keep the client-surface axis and
+	// the channel axis distinguishable in code.
+	Responses Protocol = "responses"
 )
 
 // BlockType is the canonical content block kind.

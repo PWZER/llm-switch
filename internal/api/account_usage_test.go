@@ -29,18 +29,20 @@ func TestDefaultProbesForProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
-	mk := func(name, base string) {
+	// One channel per protocol (the schema allows at most one endpoint of each
+	// protocol per provider); probe derivation only matches base_url hosts.
+	mk := func(protocol, base string) {
 		t.Helper()
 		if _, err := st.Channels.Create(ctx, &store.Channel{
-			ProviderID: pid, Name: name, Protocol: "openai",
+			ProviderID: pid, Protocol: protocol,
 			BaseURL: base, ChatPath: "/chat/completions", AuthStyle: "bearer",
-			ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1,
+			ExtraHeaders: "{}", Enabled: true,
 		}); err != nil {
 			t.Fatalf("create channel: %v", err)
 		}
 	}
-	mk("zhipu", "https://open.bigmodel.cn/api/anthropic")
-	mk("deepseek", "https://api.deepseek.com/anthropic")
+	mk("openai", "https://open.bigmodel.cn/api/anthropic")
+	mk("anthropic", "https://api.deepseek.com/anthropic")
 
 	probes := s.defaultProbesForProvider(ctx, pid)
 	if len(probes) != 2 {
@@ -59,9 +61,9 @@ func TestDefaultProbesForProvider(t *testing.T) {
 		t.Fatalf("create provider: %v", err)
 	}
 	if _, err := st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid2, Name: "local", Protocol: "openai",
+		ProviderID: pid2, Protocol: "openai",
 		BaseURL: "http://127.0.0.1:9091", ChatPath: "/chat/completions", AuthStyle: "bearer",
-		ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1,
+		ExtraHeaders: "{}", Enabled: true,
 	}); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}

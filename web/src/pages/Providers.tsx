@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import {
-  App as AntApp, Button, Drawer, Form, Input, InputNumber, Modal, Popconfirm,
-  Select, Space, Switch, Table, Typography, theme,
+  App as AntApp, Button, Drawer, Form, Input, Modal, Popconfirm,
+  Select, Space, Switch, Table, Tooltip, Typography, theme,
 } from 'antd';
 import { PlusOutlined, SettingOutlined, SyncOutlined, DownOutlined } from '@ant-design/icons';
 import {
@@ -14,14 +14,14 @@ import ModelSelectList, { ModelSelectItem } from '../components/ModelSelectList'
 import { ProtocolTag, protocolOrder } from '../components/protocol';
 
 // Merged provider management: one provider (vendor account + endpoints) hosts
-// one or more protocol endpoints, each with its own failover priority. The
-// provider also owns the models-list fetch URL (models_url, absolute) and the
-// staged register_models list — model rows are provider-scoped and register
-// at provider save time. Credentials live on accounts, managed on the Account
-// Pool page — this drawer handles names, models_url and endpoints only. A
-// single ProviderDrawer serves both create (endpoints buffer locally,
-// persisted in one submit) and manage (every section mutates the API
-// immediately).
+// one endpoint per protocol (openai / responses / anthropic — the protocol is
+// the endpoint's identity). The provider also owns the models-list fetch URL
+// (models_url, absolute) and the staged register_models list — model rows are
+// provider-scoped and register at provider save time. Credentials live on
+// accounts, managed on the Account Pool page — this drawer handles names,
+// models_url and endpoints only. A single ProviderDrawer serves both create
+// (endpoints buffer locally, persisted in one submit) and manage (every
+// section mutates the API immediately).
 
 export default function Providers() {
   const { t } = useLang();
@@ -216,15 +216,21 @@ function ProviderDrawer({
   const setCurrentModelsUrl = isCreate ? setModelsUrl : setEditModelsUrl;
 
   // The preview's auth header style follows the provider's own endpoints
-  // (openai first — the models list is an OpenAI-style endpoint), mirroring
-  // the backend refresh-models resolution.
+  // (openai first, then responses — the models list is an OpenAI-style
+  // endpoint), mirroring the backend refresh-models resolution. An empty
+  // auth_style means the protocol default.
   const providerAuthStyle = (() => {
     const styles = isCreate
       ? localEndpoints.map((e) => ({ protocol: e.protocol, auth_style: e.auth_style }))
       : channels
           .filter((c) => c.provider_id === provider?.id && c.enabled)
           .map((c) => ({ protocol: c.protocol, auth_style: c.auth_style }));
-    return (styles.find((s) => s.protocol === 'openai') ?? styles[0])?.auth_style ?? 'bearer';
+    const pick =
+      styles.find((s) => s.protocol === 'openai') ??
+      styles.find((s) => s.protocol === 'responses') ??
+      styles[0];
+    if (!pick) return 'bearer';
+    return pick.auth_style || defaultAuthStyle(pick.protocol);
   })();
 
   const fetchModelsPreview = async (cred: { account_id?: number; api_key?: string }) => {
@@ -489,6 +495,9 @@ function RemoteEndpoints({
         open={adding || !!editing}
         editing={editing}
         providerId={providerId}
+        takenProtocols={list
+          .filter((c) => c.id !== editing?.id)
+          .map((c) => c.protocol)}
         onClose={() => {
           setAdding(false);
           setEditing(null);
@@ -550,6 +559,9 @@ function LocalEndpoints({
         editing={null}
         initial={editIdx != null ? value[editIdx] : null}
         providerId={0}
+        takenProtocols={value
+          .filter((_, j) => j !== editIdx)
+          .map((e) => e.protocol)}
         onLocalSubmit={(v) => {
           onChange(editIdx != null ? value.map((x, j) => (j === editIdx ? v : x)) : [...value, v]);
         }}
@@ -575,8 +587,7 @@ function LocalEndpointCard({
     <div style={{ border: `1px solid ${token.colorBorderSecondary}`, borderRadius: 8, padding: 12 }}>
       <Space style={{ width: '100%', justifyContent: 'space-between' }}>
         <Space>
-          <ProtocolTag protocol={endpoint.protocol} />
-          <Typography.Text strong>{endpoint.name}</Typography.Text>
+          <ProtocolTag protocol={endpoint.protocol} style={{ fontSize: 13, paddingInline: 8 }} />
           <Typography.Text type="secondary" code>
             {endpoint.base_url}
             {endpoint.chat_path}
@@ -589,11 +600,6 @@ function LocalEndpointCard({
           </Popconfirm>
         </Space>
       </Space>
-      <div style={{ marginTop: 8 }}>
-        <Typography.Text type="secondary">
-          {t('prov.priority')}: {endpoint.priority} · {t('prov.weight')}: {endpoint.weight}
-        </Typography.Text>
-      </div>
     </div>
   );
 }
@@ -685,8 +691,7 @@ function EndpointCard({
     <div style={{ border: `1px solid ${token.colorBorderSecondary}`, borderRadius: 8, padding: 12 }}>
       <Space style={{ width: '100%', justifyContent: 'space-between' }}>
         <Space>
-          <ProtocolTag protocol={channel.protocol} />
-          <Typography.Text strong>{channel.name}</Typography.Text>
+          <ProtocolTag protocol={channel.protocol} style={{ fontSize: 13, paddingInline: 8 }} />
           <Typography.Text type="secondary" code>
             {channel.base_url}
             {channel.chat_path}
@@ -704,11 +709,6 @@ function EndpointCard({
           </Popconfirm>
         </Space>
       </Space>
-      <div style={{ marginTop: 8 }}>
-        <Typography.Text type="secondary">
-          {t('prov.priority')}: {channel.priority} · {t('prov.weight')}: {channel.weight}
-        </Typography.Text>
-      </div>
       {testResult && (
         <div style={{ marginTop: 8 }}>
           <div>
@@ -728,24 +728,31 @@ function EndpointCard({
 }
 
 interface EndpointForm {
-  name: string;
-  protocol: 'openai' | 'anthropic';
+  protocol: 'openai' | 'anthropic' | 'responses';
   base_url: string;
   chat_path: string;
-  auth_style: 'bearer' | 'x-api-key';
-  responses_path?: string;
-  priority: number;
-  weight: number;
+  auth_style: '' | 'bearer' | 'x-api-key';
   enabled: boolean;
-  passthrough: boolean;
   supports_embeddings: boolean;
 }
+
+// Backend-resolved protocol defaults; empty chat_path / auth_style on the wire
+// mean "use these".
+const DEFAULT_CHAT_PATHS: Record<EndpointForm['protocol'], string> = {
+  openai: '/chat/completions',
+  responses: '/responses',
+  anthropic: '/v1/messages',
+};
+
+const defaultAuthStyle = (protocol: string): 'bearer' | 'x-api-key' =>
+  protocol === 'anthropic' ? 'x-api-key' : 'bearer';
 
 function EndpointModal({
   open,
   editing,
   initial,
   providerId,
+  takenProtocols = [],
   onLocalSubmit,
   onClose,
   onDone,
@@ -755,6 +762,9 @@ function EndpointModal({
   /** Local-mode edit initial values (provider not persisted yet). */
   initial?: EndpointForm | null;
   providerId: number;
+  /** Protocols already used by sibling endpoints — a provider has at most
+   *  one endpoint per protocol, so those options are disabled. */
+  takenProtocols?: string[];
   /** Local mode: hand the form values to the parent (provider not persisted). */
   onLocalSubmit?: (v: EndpointForm) => void;
   onClose: () => void;
@@ -763,8 +773,8 @@ function EndpointModal({
   const { t } = useLang();
   const { message } = AntApp.useApp();
   const [form] = Form.useForm<EndpointForm>();
-  // responses_path only applies to openai channels (backend rejects it for
-  // anthropic), so the field is hidden and stripped for other protocols.
+  // supports_embeddings only applies to openai channels, so the field is
+  // hidden and stripped for other protocols.
   const protocol = Form.useWatch('protocol', form);
   const [probing, setProbing] = useState(false);
   const [probeResult, setProbeResult] = useState<
@@ -821,16 +831,11 @@ function EndpointModal({
     setProbeResult(null);
     if (editing) {
       form.setFieldsValue({
-        name: editing.name,
         protocol: editing.protocol,
         base_url: editing.base_url,
         chat_path: editing.chat_path,
         auth_style: editing.auth_style,
-        responses_path: editing.responses_path ?? undefined,
-        priority: editing.priority,
-        weight: editing.weight,
         enabled: editing.enabled,
-        passthrough: editing.passthrough,
         supports_embeddings: editing.supports_embeddings,
       });
     } else if (initial) {
@@ -840,21 +845,18 @@ function EndpointModal({
       form.resetFields();
       form.setFieldsValue({
         protocol: 'openai',
-        auth_style: 'bearer',
-        priority: 10,
-        weight: 1,
+        auth_style: '',
         enabled: true,
-        passthrough: true,
         supports_embeddings: false,
-        chat_path: '/chat/completions',
+        chat_path: DEFAULT_CHAT_PATHS.openai,
       });
     }
   }, [open, editing, initial, form]);
 
   const submit = async (v: EndpointForm) => {
-    // Drop a stale responses_path left over from a protocol switch — the
-    // backend rejects it on anthropic channels.
-    if (v.protocol !== 'openai') v.responses_path = undefined;
+    // Drop a stale supports_embeddings left over from a protocol switch —
+    // only openai channels serve embeddings.
+    if (v.protocol !== 'openai') v.supports_embeddings = false;
     if (onLocalSubmit) {
       onLocalSubmit(v);
       onDone();
@@ -873,11 +875,31 @@ function EndpointModal({
     }
   };
 
-  const editName = editing?.name ?? initial?.name;
+  const isEdit = !!editing || !!initial;
+
+  // One endpoint per protocol per provider: protocols already taken by a
+  // sibling endpoint (remote channels, or locally buffered ones) are disabled
+  // with a hint; the edited endpoint keeps its own protocol selectable.
+  const protocolOptions = (['openai', 'responses', 'anthropic'] as const).map((p) => {
+    const label =
+      p === 'openai' ? t('prov.openaiCompat')
+      : p === 'responses' ? t('prov.responsesApi')
+      : t('prov.anthropicCompat');
+    if (!takenProtocols.includes(p)) return { value: p, label };
+    return {
+      value: p,
+      disabled: true,
+      label: (
+        <Tooltip title={t('prov.protocolTaken').replace('{protocol}', p)}>
+          <span>{label}</span>
+        </Tooltip>
+      ),
+    };
+  });
 
   return (
     <Modal
-      title={editName ? `${t('prov.editEndpoint')} — ${editName}` : t('prov.addEndpoint')}
+      title={isEdit ? t('prov.editEndpoint') : t('prov.addEndpoint')}
       open={open}
       onCancel={onClose}
       onOk={() => form.submit()}
@@ -886,22 +908,26 @@ function EndpointModal({
     >
       <Form form={form} layout="vertical" onFinish={submit}>
         <Space style={{ width: '100%' }} size="large">
-          <Form.Item name="name" label={t('common.name')} rules={[{ required: true }]}>
-            <Input placeholder="deepseek-openai" style={{ width: 200 }} />
-          </Form.Item>
           <Form.Item name="protocol" label={t('prov.protocol')} rules={[{ required: true }]}>
             <Select
-              style={{ width: 180 }}
-              options={[
-                { value: 'anthropic', label: t('prov.anthropicCompat') },
-                { value: 'openai', label: t('prov.openaiCompat') },
-              ]}
+              style={{ width: 220 }}
+              options={protocolOptions}
+              onChange={(p: EndpointForm['protocol']) => {
+                // Keep an untouched chat_path coherent with the protocol:
+                // rewrite it when empty or another protocol's default; a
+                // custom path survives the switch.
+                const cur = form.getFieldValue('chat_path') ?? '';
+                if (!cur || Object.values(DEFAULT_CHAT_PATHS).includes(cur)) {
+                  form.setFieldValue('chat_path', DEFAULT_CHAT_PATHS[p]);
+                }
+              }}
             />
           </Form.Item>
           <Form.Item name="auth_style" label={t('prov.authStyle')}>
             <Select
-              style={{ width: 140 }}
+              style={{ width: 190 }}
               options={[
+                { value: '', label: t('prov.authAuto') },
                 { value: 'bearer', label: t('prov.bearer') },
                 { value: 'x-api-key', label: t('prov.xApiKey') },
               ]}
@@ -912,13 +938,8 @@ function EndpointModal({
           <Input placeholder="https://api.deepseek.com" />
         </Form.Item>
         <Form.Item name="chat_path" label={t('prov.chatPath')} tooltip={t('prov.chatPathTip')}>
-          <Input placeholder="/chat/completions" />
+          <Input placeholder={protocol ? DEFAULT_CHAT_PATHS[protocol] : DEFAULT_CHAT_PATHS.openai} />
         </Form.Item>
-        {protocol === 'openai' && (
-          <Form.Item name="responses_path" label={t('prov.responsesPath')} tooltip={t('prov.responsesPathTip')}>
-            <Input placeholder="/responses" />
-          </Form.Item>
-        )}
         {!onLocalSubmit && (
           <Space style={{ marginBottom: 12 }} wrap>
             <Button icon={<SyncOutlined spin={probing} />} onClick={runProbe} disabled={probing}>
@@ -937,21 +958,14 @@ function EndpointModal({
           </div>
         )}
         <Space size="large">
-          <Form.Item name="priority" label={t('prov.priority')} tooltip={t('prov.priorityTip')}>
-            <InputNumber />
-          </Form.Item>
-          <Form.Item name="weight" label={t('prov.weight')}>
-            <InputNumber min={1} />
-          </Form.Item>
           <Form.Item name="enabled" label={t('common.enabled')} valuePropName="checked">
             <Switch />
           </Form.Item>
-          <Form.Item name="passthrough" label="Passthrough" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item name="supports_embeddings" label="Embeddings" valuePropName="checked">
-            <Switch />
-          </Form.Item>
+          {protocol === 'openai' && (
+            <Form.Item name="supports_embeddings" label="Embeddings" valuePropName="checked">
+              <Switch />
+            </Form.Item>
+          )}
         </Space>
       </Form>
     </Modal>

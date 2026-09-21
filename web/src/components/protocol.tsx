@@ -1,20 +1,22 @@
 // Shared protocol display helpers: one color map and one display order for
-// every place the 'anthropic'/'openai' enum is rendered. Protocol values are
-// business enums and stay untranslated (see i18n/dictionaries.ts header).
+// every place the 'anthropic'/'openai'/'responses' enum is rendered. Protocol
+// values are business enums and stay untranslated (see i18n/dictionaries.ts
+// header).
 
 import { Tag } from 'antd';
 import type { TagProps } from 'antd';
 
-export type Protocol = 'openai' | 'anthropic';
+export type Protocol = 'openai' | 'anthropic' | 'responses';
 
 // Antd preset colors adapt to dark mode via the theme algorithm.
 export const PROTOCOL_COLORS: Record<Protocol, string> = {
   openai: 'green',
+  responses: 'purple',
   anthropic: 'orange',
 };
 
 // Canonical display order everywhere protocol lists are shown.
-export const PROTOCOLS = ['anthropic', 'openai'] as const;
+export const PROTOCOLS = ['openai', 'responses', 'anthropic'] as const;
 
 // Sort key for display order; unknown protocol values sort last.
 export const protocolOrder = (p: string): number => {

@@ -164,17 +164,17 @@ func TestPayloadRecordingFailover(t *testing.T) {
 	ctx := context.Background()
 	must(t, h.st.Settings.Set(ctx, "log_bodies", "1"))
 
-	// Second provider with a lower-priority openai channel on the same fake:
-	// the first attempt 429s, failover succeeds on the second.
+	// Second provider with another openai channel on the same fake (ordered
+	// after the harness channel by id): the first attempt 429s, failover
+	// succeeds on the second.
 	pid, err := h.st.Providers.Create(ctx, "fake2", nil)
 	must(t, err)
 	_, err = h.st.Accounts.Create(ctx, pid, "k2", "upstream-secret-2", 1, "")
 	must(t, err)
 	_, err = h.st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "fake2-openai", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: h.openai.URL(), ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 5, Weight: 1,
-		Passthrough: true,
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 	})
 	must(t, err)
 	_, err = h.st.Models.EnsureModel(ctx, &store.Model{

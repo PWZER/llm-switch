@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 
@@ -204,15 +203,7 @@ func (s *Server) handleRefreshModels(w http.ResponseWriter, req *http.Request) {
 	// channels at all, bearer is the safe default.
 	authStyle := "bearer"
 	if channels, err := s.St.Channels.List(req.Context()); err == nil {
-		sort.Slice(channels, func(i, j int) bool {
-			return channels[i].Protocol == "openai" && channels[j].Protocol != "openai"
-		})
-		for _, ch := range channels {
-			if ch.ProviderID == id && ch.Enabled {
-				authStyle = ch.AuthStyle
-				break
-			}
-		}
+		authStyle = pickModelsAuthStyle(channels, id)
 	}
 
 	models, err := getModelsURL(req.Context(), *p.ModelsURL, authStyle, account.APIKey)

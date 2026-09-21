@@ -52,9 +52,9 @@ func seedProviderChannel(t *testing.T, st *store.Store, upstreamURL string) (pid
 		t.Fatalf("provider: %v", err)
 	}
 	cid, err = st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "ch", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: upstreamURL, ChatPath: "/chat/completions", AuthStyle: "bearer",
-		ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1,
+		ExtraHeaders: "{}", Enabled: true,
 	})
 	if err != nil {
 		t.Fatalf("channel: %v", err)

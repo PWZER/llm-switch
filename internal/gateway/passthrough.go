@@ -34,7 +34,7 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 	if !ok {
 		return
 	}
-	if protocol == protocolOpenAIResponses {
+	if protocol == protocolOpenAIResponses || protocol == protocolResponses {
 		// Responses-shaped body: usage nests under response.completed /
 		// response.incomplete, or top-level for the non-stream object.
 		tapResponsesUsage(payload, u)

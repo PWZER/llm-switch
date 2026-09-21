@@ -10,23 +10,19 @@ import (
 	"github.com/PWZER/llm-switch/internal/store"
 )
 
-func strPtr(s string) *string { return &s }
-
-// addResponsesChannel adds a second openai channel carrying a responses_path
-// (passthrough-capable) at the given priority to the harness provider, and
-// ensures model is registered on that provider (provider-scoped rows expand
-// to the new channel automatically).
-func (h *harness) addResponsesChannel(model string, priority int) {
+// addResponsesChannel adds a native responses-protocol channel to the
+// harness provider (Responses-surface passthrough target), and ensures model
+// is registered on that provider (provider-scoped rows expand to the new
+// channel automatically).
+func (h *harness) addResponsesChannel(model string) {
 	h.t.Helper()
 	ctx := context.Background()
 	provs, err := h.st.Providers.List(ctx)
 	must(h.t, err)
 	_, err = h.st.Channels.Create(ctx, &store.Channel{
-		ProviderID: provs[0].ID, Name: "fake-responses", Protocol: "openai",
-		BaseURL: h.openai.URL(), ChatPath: "/chat/completions",
-		ResponsesPath: strPtr("/responses"),
-		AuthStyle:     "bearer", ExtraHeaders: "{}", Enabled: true, Priority: priority, Weight: 1,
-		Passthrough: true,
+		ProviderID: provs[0].ID, Protocol: "responses",
+		BaseURL: h.openai.URL(), ChatPath: "/responses",
+		ExtraHeaders: "{}", Enabled: true,
 	})
 	must(h.t, err)
 	_, err = h.st.Models.EnsureModel(ctx, &store.Model{
@@ -38,7 +34,7 @@ func (h *harness) addResponsesChannel(model string, priority int) {
 
 func TestResponsesPassthroughNonStream(t *testing.T) {
 	h := newHarness(t)
-	h.addResponsesChannel("test-model", 20)
+	h.addResponsesChannel("test-model")
 
 	resp, raw := h.post("/v1/responses", `{"model":"test-model","input":"Hi","store":false,"text":{"format":{"type":"text"}}}`, nil)
 	if resp.StatusCode != 200 {
@@ -81,7 +77,7 @@ func TestResponsesPassthroughNonStream(t *testing.T) {
 
 func TestResponsesPassthroughStream(t *testing.T) {
 	h := newHarness(t)
-	h.addResponsesChannel("test-model", 20)
+	h.addResponsesChannel("test-model")
 
 	resp, raw := h.post("/v1/responses", `{"model":"test-model","input":"Hi","stream":true}`, nil)
 	if resp.StatusCode != 200 {
@@ -281,7 +277,7 @@ func TestResponsesToolsRoundTrip(t *testing.T) {
 
 func TestResponsesFailoverToChat(t *testing.T) {
 	h := newHarness(t)
-	h.addResponsesChannel("test-model", 20) // passthrough channel tried first
+	h.addResponsesChannel("test-model") // native responses channel tried first
 	h.openai.FailFirstN(1)
 
 	resp, raw := h.post("/v1/responses", `{"model":"test-model","input":"Hi","stream":false}`, nil)

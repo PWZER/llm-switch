@@ -78,10 +78,10 @@ func (s *Server) handleTestChannel(w http.ResponseWriter, req *http.Request) {
 	result := s.probeEndpoint(req.Context(), &ch, nil, payload, "")
 	switch {
 	case result.OK:
-		slog.Info("endpoint connectivity test passed", "channel", ch.Name,
+		slog.Info("endpoint connectivity test passed", "channel_id", ch.ID,
 			"class", result.Class, "status", result.Status, "total_ms", result.TotalMS)
 	default:
-		slog.Warn("endpoint connectivity test failed", "channel", ch.Name, "class", result.Class,
+		slog.Warn("endpoint connectivity test failed", "channel_id", ch.ID, "class", result.Class,
 			"status", result.Status, "err", result.Error, "total_ms", result.TotalMS)
 	}
 	httpx.WriteEnvelope(w, req, result)
@@ -118,7 +118,7 @@ func (s *Server) probeEndpoint(ctx context.Context, ch *store.Channel, secret []
 		return res
 	}
 	if len(secret) > 0 {
-		if ch.AuthStyle == "x-api-key" {
+		if channelAuthStyle(ch) == "x-api-key" {
 			httpReq.Header.Set("x-api-key", string(secret))
 			if ch.Protocol == "anthropic" {
 				httpReq.Header.Set("anthropic-version", "2023-06-01")
@@ -252,8 +252,11 @@ func (s *Server) handleEndpointFormProbe(w http.ResponseWriter, req *http.Reques
 	if !readJSON(w, req, &params) {
 		return
 	}
+	if params.Protocol != "openai" && params.Protocol != "anthropic" && params.Protocol != "responses" {
+		params.Protocol = "openai"
+	}
 	if params.AuthStyle == "" {
-		params.AuthStyle = "bearer"
+		params.AuthStyle = defaultAuthStyle(params.Protocol)
 	}
 
 	if modelsOnly {
@@ -286,9 +289,6 @@ func (s *Server) handleEndpointFormProbe(w http.ResponseWriter, req *http.Reques
 		return
 	}
 
-	if params.Protocol != "openai" && params.Protocol != "anthropic" {
-		params.Protocol = "openai"
-	}
 	if params.BaseURL == "" {
 		httpx.WriteEnvelopeError(w, req, http.StatusBadRequest, 40002, "base_url is required")
 		return
@@ -360,8 +360,12 @@ func chatPathOf(ch *store.Channel) string {
 		}
 		return ch.ChatPath
 	}
-	if ch.Protocol == "anthropic" {
+	switch ch.Protocol {
+	case "anthropic":
 		return "/v1/messages"
+	case "responses":
+		return "/responses"
+	default:
+		return "/chat/completions"
 	}
-	return "/chat/completions"
 }

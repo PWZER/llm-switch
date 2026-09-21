@@ -99,7 +99,9 @@ func For(p ir.Protocol) (Codec, error) {
 		return openaiCodec{}, nil
 	case ir.Anthropic:
 		return anthropicCodec{}, nil
-	case ir.OpenAIResponses:
+	case ir.OpenAIResponses, ir.Responses:
+		// The client-surface name and the upstream channel protocol share
+		// one codec — it is the same wire format.
 		return responsesCodec{}, nil
 	default:
 		return nil, fmt.Errorf("unknown protocol %q", p)

@@ -96,8 +96,8 @@ func (s *Server) runAccountQuickTest(w http.ResponseWriter, req *http.Request, a
 	// The auth header style comes from the provider's endpoints (OpenAI
 	// protocol first — the models list is an OpenAI-style endpoint).
 	authStyle := "bearer"
-	if channels := s.enabledProviderChannels(req, account.ProviderID); len(channels) > 0 {
-		authStyle = channels[0].AuthStyle
+	if channels, err := s.St.Channels.List(req.Context()); err == nil {
+		authStyle = pickModelsAuthStyle(channels, account.ProviderID)
 	}
 
 	models, err := getModelsURL(req.Context(), *provider.ModelsURL, authStyle, account.APIKey)
@@ -196,17 +196,17 @@ func (s *Server) runAccountDeepTest(w http.ResponseWriter, req *http.Request, ac
 	res.endpointTestResult = s.probeEndpoint(req.Context(), ch, []byte(account.APIKey), payload, model)
 	switch {
 	case res.OK:
-		slog.Info("account deep test passed", "account_id", account.ID, "channel", ch.Name,
+		slog.Info("account deep test passed", "account_id", account.ID, "channel_id", ch.ID,
 			"model", res.Model, "status", res.Status, "total_ms", res.TotalMS)
 	default:
-		slog.Warn("account deep test failed", "account_id", account.ID, "channel", ch.Name,
+		slog.Warn("account deep test failed", "account_id", account.ID, "channel_id", ch.ID,
 			"class", res.Class, "status", res.Status, "err", res.Error)
 	}
 	httpx.WriteEnvelope(w, req, res)
 }
 
-// enabledProviderChannels returns the provider's enabled channels, OpenAI
-// protocol first (the models list is an OpenAI-style endpoint).
+// enabledProviderChannels returns the provider's enabled channels in
+// protocol preference order (openai → responses → anthropic).
 func (s *Server) enabledProviderChannels(req *http.Request, providerID int64) []*store.Channel {
 	all, err := s.St.Channels.List(req.Context())
 	if err != nil {
@@ -218,6 +218,8 @@ func (s *Server) enabledProviderChannels(req *http.Request, providerID int64) []
 			channels = append(channels, &all[i])
 		}
 	}
-	sort.Slice(channels, func(i, j int) bool { return channels[i].Protocol == "openai" && channels[j].Protocol != "openai" })
+	sort.SliceStable(channels, func(i, j int) bool {
+		return protocolRank(channels[i].Protocol) < protocolRank(channels[j].Protocol)
+	})
 	return channels
 }

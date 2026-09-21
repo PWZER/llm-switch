@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,10 +10,20 @@ import (
 	"github.com/PWZER/llm-switch/internal/store"
 )
 
+// The gateway's per-surface protocol preference chains (mirrors of the
+// production values passed to Snapshot.Resolve).
+var (
+	openaiSurface    = []string{"openai", "anthropic", "responses"}
+	anthropicSurface = []string{"anthropic", "openai", "responses"}
+	responsesSurface = []string{"responses", "openai", "anthropic"}
+)
+
 // newTestSnapshot seeds a store with provider-scoped model rows and a model
-// route, then builds a snapshot over it. Provider "fake" has both an
-// anthropic and an openai channel (rows expand to candidates on every live
-// channel of their provider); provider "fake2" is openai-only.
+// route, then builds a snapshot over it. Provider "fake" has both an openai
+// and an anthropic channel — one endpoint per protocol (the schema's
+// UNIQUE(provider_id, protocol)); rows expand to candidates on every live
+// channel of their provider, in channel-id order (openai first). Provider
+// "fake2" is openai-only.
 func newTestSnapshot(t *testing.T) *Snapshot {
 	t.Helper()
 	dir := t.TempDir()
@@ -31,22 +42,23 @@ func newTestSnapshot(t *testing.T) *Snapshot {
 	if err != nil {
 		t.Fatalf("provider: %v", err)
 	}
-	// The primary channel is anthropic-protocol: the claude-*/[1m] listing
-	// decorations only apply to anthropic-served names.
+	// The openai channel is created first (lower id); the anthropic one at the
+	// higher id is the primary surface for the claude-*/[1m] listing
+	// decorations, which only apply to anthropic-served names.
+	if _, err := st.Channels.Create(ctx, &store.Channel{
+		ProviderID: pid, Protocol: "openai",
+		BaseURL: "http://127.0.0.1:2", ChatPath: "/chat/completions",
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
+	}); err != nil {
+		t.Fatalf("oai channel: %v", err)
+	}
 	cid, err := st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "fake-anthropic", Protocol: "anthropic",
+		ProviderID: pid, Protocol: "anthropic",
 		BaseURL: "http://127.0.0.1:1", ChatPath: "/v1/messages",
-		AuthStyle: "x-api-key", ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1,
+		AuthStyle: "x-api-key", ExtraHeaders: "{}", Enabled: true,
 	})
 	if err != nil {
 		t.Fatalf("channel: %v", err)
-	}
-	if _, err := st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "fake-oai", Protocol: "openai",
-		BaseURL: "http://127.0.0.1:2", ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1,
-	}); err != nil {
-		t.Fatalf("oai channel: %v", err)
 	}
 	// An OpenAI-protocol-only provider: names served only here never get the
 	// claude-*/[1m] decorations.
@@ -55,9 +67,9 @@ func newTestSnapshot(t *testing.T) *Snapshot {
 		t.Fatalf("provider2: %v", err)
 	}
 	if _, err := st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid2, Name: "fake2-oai", Protocol: "openai",
+		ProviderID: pid2, Protocol: "openai",
 		BaseURL: "http://127.0.0.1:3", ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1,
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 	}); err != nil {
 		t.Fatalf("fake2 channel: %v", err)
 	}
@@ -246,114 +258,129 @@ func TestResolveBaseline(t *testing.T) {
 
 	// Every found branch returns the canonical client-facing name: the
 	// route's own name for route hits, the bare (marker/prefix-stripped)
-	// row name for row hits.
-	if cands, name, ok := snap.Resolve("my-route", "anthropic"); !ok || name != "my-route" ||
+	// row name for row hits. Route hits carry the pinned channel only; row
+	// hits carry every live channel of the provider, chain-ordered.
+	if cands, name, ok := snap.Resolve("my-route", anthropicSurface); !ok || name != "my-route" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
 		t.Fatalf("route resolve broken: %v %q %v", cands, name, ok)
 	}
-	if cands, name, ok := snap.Resolve("test-model", "anthropic"); !ok || name != "test-model" ||
-		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
+	if cands, name, ok := snap.Resolve("test-model", anthropicSurface); !ok || name != "test-model" ||
+		len(cands) != 2 || cands[0].UpstreamModel != "fake-chat" || cands[0].Channel.Protocol != "anthropic" {
 		t.Fatalf("row resolve broken: %v %q %v", cands, name, ok)
 	}
 
 	// A disabled row is unroutable: listed ⇔ routable.
-	if _, _, ok := snap.Resolve("off-model", "anthropic"); ok {
+	if _, _, ok := snap.Resolve("off-model", anthropicSurface); ok {
 		t.Fatal("disabled row must not resolve")
 	}
 
 	// claude-* requests route to the stripped row name (client caches that
 	// learned claude-* naming keep working), while claude-* must never invent
 	// a route for an unknown base name.
-	if cands, name, ok := snap.Resolve("claude-test", "anthropic"); !ok || name != "claude-test" ||
-		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
+	if cands, name, ok := snap.Resolve("claude-test", anthropicSurface); !ok || name != "claude-test" ||
+		len(cands) != 2 || cands[0].UpstreamModel != "fake-chat" || cands[0].Channel.Protocol != "anthropic" {
 		t.Fatalf("literal claude row must win: %v %q %v", cands, name, ok)
 	}
-	if cands, name, ok := snap.Resolve("claude-test-model", "anthropic"); !ok || name != "test-model" ||
-		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
+	if cands, name, ok := snap.Resolve("claude-test-model", anthropicSurface); !ok || name != "test-model" ||
+		len(cands) != 2 || cands[0].UpstreamModel != "fake-chat" || cands[0].Channel.Protocol != "anthropic" {
 		t.Fatalf("stripped row must route: %v %q %v", cands, name, ok)
 	}
-	if _, _, ok := snap.Resolve("claude-nope", "anthropic"); ok {
+	if _, _, ok := snap.Resolve("claude-nope", anthropicSurface); ok {
 		t.Fatal("stripped unknown name must not resolve")
 	}
-	if _, _, ok := snap.Resolve("nope", "anthropic"); ok {
+	if _, _, ok := snap.Resolve("nope", anthropicSurface); ok {
 		t.Fatal("unknown model must not resolve")
 	}
 
 	// The [1m] listing marker is stripped before matching: suffixed requests
 	// resolve to the bare route/row identity (Claude Code strips the marker
 	// client-side, others may send it verbatim).
-	if cands, name, ok := snap.Resolve("my-route[1m]", "anthropic"); !ok || name != "my-route" ||
+	if cands, name, ok := snap.Resolve("my-route[1m]", anthropicSurface); !ok || name != "my-route" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
 		t.Fatalf("[1m]-suffixed route resolve broken: %v %q %v", cands, name, ok)
 	}
-	if cands, name, ok := snap.Resolve("test-model[1m]", "anthropic"); !ok || name != "test-model" ||
-		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
+	if cands, name, ok := snap.Resolve("test-model[1m]", anthropicSurface); !ok || name != "test-model" ||
+		len(cands) != 2 || cands[0].UpstreamModel != "fake-chat" || cands[0].Channel.Protocol != "anthropic" {
 		t.Fatalf("[1m]-suffixed row resolve broken: %v %q %v", cands, name, ok)
 	}
-	if cands, name, ok := snap.Resolve("claude-test[1m]", "anthropic"); !ok || name != "claude-test" ||
-		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
+	if cands, name, ok := snap.Resolve("claude-test[1m]", anthropicSurface); !ok || name != "claude-test" ||
+		len(cands) != 2 || cands[0].UpstreamModel != "fake-chat" || cands[0].Channel.Protocol != "anthropic" {
 		t.Fatalf("literal claude row must win after marker strip: %v %q %v", cands, name, ok)
 	}
 
 	// claude- stripping now checks routes before rows, so the listed
 	// claude-<route> mirror resolves to the route chain.
-	if cands, name, ok := snap.Resolve("claude-my-route", "anthropic"); !ok || name != "my-route" ||
+	if cands, name, ok := snap.Resolve("claude-my-route", anthropicSurface); !ok || name != "my-route" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
 		t.Fatalf("claude-<route> resolve broken: %v %q %v", cands, name, ok)
 	}
-	if cands, name, ok := snap.Resolve("claude-my-route[1m]", "anthropic"); !ok || name != "my-route" ||
+	if cands, name, ok := snap.Resolve("claude-my-route[1m]", anthropicSurface); !ok || name != "my-route" ||
 		len(cands) != 1 || cands[0].UpstreamModel != "fake-chat" {
 		t.Fatalf("claude-<route>[1m] resolve broken: %v %q %v", cands, name, ok)
 	}
 
 	// Marker noise stays unroutable.
 	for _, absent := range []string{"[1m]", "nope[1m]", "claude-nope[1m]", "my-route[1m][1m]"} {
-		if _, _, ok := snap.Resolve(absent, "anthropic"); ok {
+		if _, _, ok := snap.Resolve(absent, anthropicSurface); ok {
 			t.Fatalf("degenerate name %q must not resolve", absent)
 		}
 	}
 }
 
 // TestResolveProtocolPreference: a provider's row expands to candidates on
-// every live channel of the provider, but the client surface's protocol wins
-// outright — cross-protocol candidates serve only when no same-protocol
-// candidate exists. Route chains are explicit and never filtered.
+// every live channel of the provider (channel-id order), and Resolve stably
+// sorts them by the client surface's preference chain — the same-protocol
+// tier leads even when it sits at a higher id, while cross-protocol
+// candidates stay in the failover list after it. Provider-scoped ROUTE
+// segments behave differently: they still collapse to their single best
+// tier, and explicit channel pins are never touched.
 func TestResolveProtocolPreference(t *testing.T) {
 	snap := newTestSnapshot(t)
 
-	// test-model's provider has both protocols: each surface gets exactly its
-	// own kind.
-	cands, _, ok := snap.Resolve("test-model", "anthropic")
-	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "anthropic" {
-		t.Fatalf("anthropic surface must get the anthropic channel only: %v %v", cands, ok)
+	// test-model's provider has openai (id 1) and anthropic (id 2): the
+	// anthropic surface leads with its own tier despite the higher id, and
+	// keeps the openai candidate as cross-protocol failover.
+	cands, _, ok := snap.Resolve("test-model", anthropicSurface)
+	if !ok || len(cands) != 2 ||
+		cands[0].Channel.Protocol != "anthropic" || cands[1].Channel.Protocol != "openai" {
+		t.Fatalf("anthropic surface must order anthropic before openai: %v %v", cands, ok)
 	}
-	cands, _, ok = snap.Resolve("test-model", "openai")
-	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "openai" {
-		t.Fatalf("openai surface must get the openai channel only: %v %v", cands, ok)
+	// The openai surface matches id order; both candidates survive.
+	cands, _, ok = snap.Resolve("test-model", openaiSurface)
+	if !ok || len(cands) != 2 ||
+		cands[0].Channel.Protocol != "openai" || cands[1].Channel.Protocol != "anthropic" {
+		t.Fatalf("openai surface must order openai before anthropic: %v %v", cands, ok)
+	}
+	// No responses channel: the empty tier is skipped, the rest keep chain
+	// order (openai before anthropic).
+	cands, _, ok = snap.Resolve("test-model", responsesSurface)
+	if !ok || len(cands) != 2 ||
+		cands[0].Channel.Protocol != "openai" || cands[1].Channel.Protocol != "anthropic" {
+		t.Fatalf("responses surface must follow the chain order: %v %v", cands, ok)
 	}
 
-	// oai-model's provider is openai-only: the anthropic surface falls back
-	// to cross-protocol bridging.
-	cands, _, ok = snap.Resolve("oai-model", "anthropic")
+	// oai-model's provider is openai-only: a single cross-protocol candidate.
+	cands, _, ok = snap.Resolve("oai-model", anthropicSurface)
 	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "openai" {
 		t.Fatalf("openai-only provider must fall back to cross-protocol: %v %v", cands, ok)
 	}
 
 	// Route targets pinning an explicit channel are explicit admin
-	// configuration: no protocol filtering.
-	cands, _, ok = snap.Resolve("my-route", "openai")
+	// configuration: no protocol filtering, no reordering.
+	cands, _, ok = snap.Resolve("my-route", openaiSurface)
 	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "anthropic" {
 		t.Fatalf("route chain must not be protocol-filtered: %v %v", cands, ok)
 	}
 
-	// A provider-scoped route target behaves like a row: same-protocol first.
-	cands, _, ok = snap.Resolve("auto-route", "anthropic")
+	// A provider-scoped route target collapses to its best protocol tier —
+	// unlike rows, it does not keep a cross-protocol tail.
+	cands, _, ok = snap.Resolve("auto-route", anthropicSurface)
 	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "anthropic" {
-		t.Fatalf("provider target must prefer same protocol: %v %v", cands, ok)
+		t.Fatalf("provider target must collapse to the anthropic tier: %v %v", cands, ok)
 	}
-	cands, _, ok = snap.Resolve("auto-route", "openai")
+	cands, _, ok = snap.Resolve("auto-route", openaiSurface)
 	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "openai" {
-		t.Fatalf("provider target must prefer same protocol (openai): %v %v", cands, ok)
+		t.Fatalf("provider target must collapse to the openai tier: %v %v", cands, ok)
 	}
 }
 
@@ -362,11 +389,14 @@ func idp(v int64) *int64 { return &v }
 func boolp(b bool) *bool { return &b }
 
 // TestResolveProviderTarget: a provider-scoped route target expands to one
-// candidate per live channel of its provider (priority DESC, weight DESC),
-// with same-protocol-first preference applied per segment only — an explicit
-// channel pin in the same chain is never filtered. A dead pinned account
-// skips the whole segment (fall-through), and disabled channels or providers
-// never expand.
+// candidate per live channel of its provider in channel-id order, with the
+// surface's protocol preference applied per segment only — the first
+// preference tier with a match wins outright, so a same-protocol candidate at
+// a higher id beats a lower-id cross-protocol one. A provider carries at most
+// one channel per protocol, so one segment holds at most three candidates.
+// An explicit channel pin in the same chain is never filtered. A dead pinned
+// account skips the whole segment (fall-through), and disabled channels or
+// providers never expand.
 func TestResolveProviderTarget(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -384,22 +414,23 @@ func TestResolveProviderTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("provider: %v", err)
 	}
-	mkChannel := func(name, protocol string, priority, weight int, enabled bool) int64 {
+	mkChannel := func(protocol string, enabled bool) int64 {
 		t.Helper()
 		cid, err := st.Channels.Create(ctx, &store.Channel{
-			ProviderID: pid, Name: name, Protocol: protocol,
+			ProviderID: pid, Protocol: protocol,
 			BaseURL: "http://127.0.0.1:1", ChatPath: "/x",
-			AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: enabled, Priority: priority, Weight: weight,
+			ExtraHeaders: "{}", Enabled: enabled,
 		})
 		if err != nil {
-			t.Fatalf("channel %s: %v", name, err)
+			t.Fatalf("channel %s: %v", protocol, err)
 		}
 		return cid
 	}
-	anthroLo := mkChannel("a-lo", "anthropic", 5, 1, true)  // lower priority
-	oaiHi := mkChannel("o-hi", "openai", 10, 5, true)       // highest priority overall
-	anthroHi := mkChannel("a-hi", "anthropic", 10, 3, true) // top anthropic by weight
-	mkChannel("o-hi2", "openai", 10, 7, true)               // top openai by weight
+	// Creation order fixes the ids: oai < anthro < resps — in-segment order
+	// is channel id ASC, so this listing is the full unfiltered segment.
+	oai := mkChannel("openai", true)
+	anthro := mkChannel("anthropic", true)
+	resps := mkChannel("responses", true)
 
 	upsert := func(name string, targets []store.ModelRouteTarget) {
 		t.Helper()
@@ -418,68 +449,75 @@ func TestResolveProviderTarget(t *testing.T) {
 	summary := func(cands []Candidate) string {
 		out := make([]string, 0, len(cands))
 		for _, c := range cands {
-			out = append(out, c.Channel.Name+"("+c.UpstreamModel+")")
+			out = append(out, fmt.Sprintf("%d(%s)", c.Channel.ID, c.UpstreamModel))
 		}
 		return strings.Join(out, ",")
 	}
+	setEnabled := func(cid int64, enabled bool) {
+		t.Helper()
+		ch, err := st.Channels.Get(ctx, cid)
+		if err != nil {
+			t.Fatalf("get channel: %v", err)
+		}
+		ch.Enabled = enabled
+		if err := st.Channels.Update(ctx, &ch); err != nil {
+			t.Fatalf("set channel %d enabled=%v: %v", cid, enabled, err)
+		}
+	}
+	fullSeg := fmt.Sprintf("%d(up),%d(up),%d(up)", oai, anthro, resps)
 
 	upsert("auto", []store.ModelRouteTarget{{ProviderID: pid, UpstreamModel: "up"}})
 
-	// In-segment order: priority DESC then weight DESC; protocol preference
-	// beats priority (a-lo's protocol wins over o-hi's priority for the
-	// anthropic surface). Candidates carry the target's upstream model.
-	snap := build()
-	cands, _, ok := snap.Resolve("auto", "anthropic")
-	if !ok || summary(cands) != "a-hi(up),a-lo(up)" {
-		t.Fatalf("anthropic segment wrong: %q %v", summary(cands), ok)
-	}
-	cands, _, ok = snap.Resolve("auto", "openai")
-	if !ok || summary(cands) != "o-hi2(up),o-hi(up)" {
-		t.Fatalf("openai segment wrong: %q %v", summary(cands), ok)
+	// No preference chain: the whole segment in channel-id order, candidates
+	// carrying the target's upstream model.
+	if cands, _, ok := build().Resolve("auto", nil); !ok || summary(cands) != fullSeg {
+		t.Fatalf("unfiltered segment wrong: %q", summary(cands))
 	}
 
-	// No same-protocol channel left: the whole segment falls back to
-	// cross-protocol, in priority order.
-	mustDisable := func(cid int64) {
-		t.Helper()
-		ch, err := st.Channels.Get(ctx, cid)
-		if err != nil {
-			t.Fatalf("get channel: %v", err)
-		}
-		ch.Enabled = false
-		if err := st.Channels.Update(ctx, &ch); err != nil {
-			t.Fatalf("disable channel: %v", err)
-		}
-	}
-	mustDisable(anthroLo)
-	mustDisable(anthroHi)
-	cands, _, ok = build().Resolve("auto", "anthropic")
-	if !ok || summary(cands) != "o-hi2(up),o-hi(up)" {
-		t.Fatalf("cross-protocol fallback wrong: %q %v", summary(cands), ok)
-	}
-	mustEnable := func(cid int64) {
-		t.Helper()
-		ch, err := st.Channels.Get(ctx, cid)
-		if err != nil {
-			t.Fatalf("get channel: %v", err)
-		}
-		ch.Enabled = true
-		if err := st.Channels.Update(ctx, &ch); err != nil {
-			t.Fatalf("enable channel: %v", err)
+	// Protocol preference beats id ordering: the anthropic channel sits at a
+	// higher id than openai, yet each surface's first matching tier wins
+	// outright and no cross-protocol candidate survives beside it.
+	for _, tc := range []struct {
+		prefer []string
+		want   int64
+	}{
+		{anthropicSurface, anthro},
+		{openaiSurface, oai},
+		{responsesSurface, resps},
+	} {
+		cands, _, ok := build().Resolve("auto", tc.prefer)
+		if !ok || len(cands) != 1 || cands[0].Channel.ID != tc.want {
+			t.Fatalf("prefer %v: got %q, want only channel %d", tc.prefer, summary(cands), tc.want)
 		}
 	}
-	mustEnable(anthroLo)
-	mustEnable(anthroHi)
+
+	// Disabled channels never expand: with responses gone the segment is the
+	// two remaining ids in order.
+	setEnabled(resps, false)
+	wantTwo := fmt.Sprintf("%d(up),%d(up)", oai, anthro)
+	if cands, _, ok := build().Resolve("auto", nil); !ok || summary(cands) != wantTwo {
+		t.Fatalf("segment with a disabled channel wrong: %q", summary(cands))
+	}
+	setEnabled(resps, true)
+
+	// No candidate matches any preference tier: the whole live segment falls
+	// back to cross-protocol bridging, in id order.
+	setEnabled(anthro, false)
+	wantFallback := fmt.Sprintf("%d(up),%d(up)", oai, resps)
+	if cands, _, ok := build().Resolve("auto", []string{"anthropic"}); !ok || summary(cands) != wantFallback {
+		t.Fatalf("cross-protocol fallback wrong: %q", summary(cands))
+	}
+	setEnabled(anthro, true)
 
 	// Mixed chain: the provider segment comes first (protocol-preferred), the
 	// explicit pin follows unfiltered — an openai pin is listed for the
 	// anthropic surface even though same-protocol channels exist.
 	upsert("mixed", []store.ModelRouteTarget{
 		{ProviderID: pid, UpstreamModel: "up"},
-		{ProviderID: pid, ChannelID: idp(oaiHi), UpstreamModel: "pin"},
+		{ProviderID: pid, ChannelID: idp(oai), UpstreamModel: "pin"},
 	})
-	cands, _, ok = build().Resolve("mixed", "anthropic")
-	if !ok || summary(cands) != "a-hi(up),a-lo(up),o-hi(pin)" {
+	cands, _, ok := build().Resolve("mixed", anthropicSurface)
+	if !ok || summary(cands) != fmt.Sprintf("%d(up),%d(pin)", anthro, oai) {
 		t.Fatalf("mixed chain wrong: %q %v", summary(cands), ok)
 	}
 
@@ -491,17 +529,18 @@ func TestResolveProviderTarget(t *testing.T) {
 	}
 	upsert("pinacc", []store.ModelRouteTarget{
 		{ProviderID: pid, UpstreamModel: "up", AccountID: &aid},
-		{ProviderID: pid, ChannelID: idp(oaiHi), UpstreamModel: "pin"},
+		{ProviderID: pid, ChannelID: idp(oai), UpstreamModel: "pin"},
 	})
-	cands, _, ok = build().Resolve("pinacc", "anthropic")
-	if !ok || len(cands) != 3 {
+	cands, _, ok = build().Resolve("pinacc", anthropicSurface)
+	if !ok || summary(cands) != fmt.Sprintf("%d(up),%d(pin)", anthro, oai) ||
+		cands[0].Account == nil || cands[0].Account.ID != aid {
 		t.Fatalf("live pinned account must serve the segment: %q %v", summary(cands), ok)
 	}
 	if err := st.Accounts.Update(ctx, aid, nil, nil, boolp(false)); err != nil {
 		t.Fatalf("disable account: %v", err)
 	}
-	cands, _, ok = build().Resolve("pinacc", "anthropic")
-	if !ok || len(cands) != 1 || cands[0].Channel.Name != "o-hi" {
+	cands, _, ok = build().Resolve("pinacc", anthropicSurface)
+	if !ok || len(cands) != 1 || cands[0].Channel.ID != oai {
 		t.Fatalf("dead pinned account must skip the segment: %q %v", summary(cands), ok)
 	}
 
@@ -509,7 +548,7 @@ func TestResolveProviderTarget(t *testing.T) {
 	if err := st.Providers.SetEnabled(ctx, pid, false); err != nil {
 		t.Fatalf("disable provider: %v", err)
 	}
-	if _, _, ok := build().Resolve("auto", "anthropic"); ok {
+	if _, _, ok := build().Resolve("auto", anthropicSurface); ok {
 		t.Fatal("disabled provider must not expand")
 	}
 	if err := st.Providers.SetEnabled(ctx, pid, true); err != nil {
@@ -519,10 +558,10 @@ func TestResolveProviderTarget(t *testing.T) {
 	// Legacy stored target (ProviderID 0 + channel pin) still resolves via
 	// the pin, unfiltered.
 	upsert("legacy", []store.ModelRouteTarget{
-		{ChannelID: idp(oaiHi), UpstreamModel: "pin"},
+		{ChannelID: idp(oai), UpstreamModel: "pin"},
 	})
-	cands, _, ok = build().Resolve("legacy", "anthropic")
-	if !ok || len(cands) != 1 || cands[0].Channel.Protocol != "openai" {
+	cands, _, ok = build().Resolve("legacy", anthropicSurface)
+	if !ok || len(cands) != 1 || cands[0].Channel.ID != oai || cands[0].Channel.Protocol != "openai" {
 		t.Fatalf("legacy channel pin must resolve unfiltered: %q %v", summary(cands), ok)
 	}
 }

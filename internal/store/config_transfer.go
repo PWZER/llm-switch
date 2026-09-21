@@ -13,7 +13,9 @@ import (
 )
 
 // ExportVersion is the only config document version this build reads.
-const ExportVersion = 1
+// v2: channels are keyed by protocol (name/priority/weight/responses_path
+// gone; route targets pin channel_protocol instead of a channel name).
+const ExportVersion = 2
 
 // Section names accepted by ExportConfig and recognized by ImportConfig.
 const (
@@ -66,22 +68,17 @@ type ExportAccount struct {
 	UsageProbes json.RawMessage `json:"usage_probes"`
 }
 
-// ExportChannel mirrors a channel row minus IDs/timestamps. ExtraHeaders is
-// the stored JSON-object string verbatim (lossless pass-through).
+// ExportChannel mirrors a channel row minus IDs/timestamps. Protocol is the
+// identity (unique per provider). AuthStyle empty means the protocol default.
+// ExtraHeaders is the stored JSON-object string verbatim (lossless pass-through).
 type ExportChannel struct {
-	Name                string  `json:"name"`
-	Protocol            string  `json:"protocol"` // "openai" | "anthropic"
-	BaseURL             string  `json:"base_url"`
-	ChatPath            string  `json:"chat_path"`
-	ResponsesPath       *string `json:"responses_path"`
-	AuthStyle           string  `json:"auth_style"` // "bearer" | "x-api-key"
-	ExtraHeaders        string  `json:"extra_headers"`
-	Enabled             bool    `json:"enabled"`
-	Priority            int     `json:"priority"`
-	Weight              int     `json:"weight"`
-	SupportsEmbeddings  bool    `json:"supports_embeddings"`
-	Passthrough         bool    `json:"passthrough"`
-	ForceUpstreamStream bool    `json:"force_upstream_stream"`
+	Protocol           string `json:"protocol"` // "openai" | "anthropic" | "responses"
+	BaseURL            string `json:"base_url"`
+	ChatPath           string `json:"chat_path"`
+	AuthStyle          string `json:"auth_style"` // "" | "bearer" | "x-api-key"
+	ExtraHeaders       string `json:"extra_headers"`
+	Enabled            bool   `json:"enabled"`
+	SupportsEmbeddings bool   `json:"supports_embeddings"`
 }
 
 type ExportModel struct {
@@ -94,15 +91,16 @@ type ExportModel struct {
 }
 
 // ExportRouteTarget references its provider by name. Channel pins reference
-// a channel name and account pins an account label within that provider —
-// neither is unique in the schema, so import resolves first-match and
-// degrades a missing pin to provider auto-select with a warning. A dead
-// stored pin (row already gone) exports as nil for the same reason.
+// the channel's protocol (unique per provider) and account pins an account
+// label within that provider — labels are not unique in the schema, so
+// import resolves first-match and degrades a missing pin to provider
+// auto-select with a warning. A dead stored pin (row already gone) exports
+// as nil for the same reason.
 type ExportRouteTarget struct {
-	Provider      string  `json:"provider"`
-	Channel       *string `json:"channel"`
-	AccountLabel  *string `json:"account_label"`
-	UpstreamModel string  `json:"upstream_model"`
+	Provider        string  `json:"provider"`
+	ChannelProtocol *string `json:"channel_protocol"`
+	AccountLabel    *string `json:"account_label"`
+	UpstreamModel   string  `json:"upstream_model"`
 }
 
 type ExportRoute struct {
@@ -192,9 +190,9 @@ func (s *Store) ExportConfig(ctx context.Context, sections []string, includeAcco
 	for _, p := range providers {
 		providerName[p.ID] = p.Name
 	}
-	channelName := make(map[int64]string, len(channels))
+	channelProtocol := make(map[int64]string, len(channels))
 	for _, c := range channels {
-		channelName[c.ID] = c.Name
+		channelProtocol[c.ID] = c.Protocol
 	}
 	accountLabel := make(map[int64]string, len(accounts))
 	for _, a := range accounts {
@@ -244,12 +242,10 @@ func (s *Store) ExportConfig(ctx context.Context, sections []string, includeAcco
 					continue
 				}
 				ep.Channels = append(ep.Channels, ExportChannel{
-					Name: c.Name, Protocol: c.Protocol, BaseURL: c.BaseURL,
-					ChatPath: c.ChatPath, ResponsesPath: c.ResponsesPath,
-					AuthStyle: c.AuthStyle, ExtraHeaders: c.ExtraHeaders,
-					Enabled: c.Enabled, Priority: c.Priority, Weight: c.Weight,
-					SupportsEmbeddings: c.SupportsEmbeddings, Passthrough: c.Passthrough,
-					ForceUpstreamStream: c.ForceUpstreamStream,
+					Protocol: c.Protocol, BaseURL: c.BaseURL,
+					ChatPath: c.ChatPath, AuthStyle: c.AuthStyle,
+					ExtraHeaders: c.ExtraHeaders, Enabled: c.Enabled,
+					SupportsEmbeddings: c.SupportsEmbeddings,
 				})
 			}
 			for _, m := range models {
@@ -275,8 +271,8 @@ func (s *Store) ExportConfig(ctx context.Context, sections []string, includeAcco
 					UpstreamModel: tgt.UpstreamModel,
 				}
 				if tgt.ChannelID != nil {
-					if name := channelName[*tgt.ChannelID]; name != "" {
-						ert.Channel = &name // a dead pin cannot be named; export as nil
+					if proto := channelProtocol[*tgt.ChannelID]; proto != "" {
+						ert.ChannelProtocol = &proto // a dead pin cannot be named; export as nil
 					}
 				}
 				if tgt.AccountID != nil {
@@ -407,32 +403,26 @@ func prepareImport(doc *ConfigExport, res *ImportResult) ([]ExportProvider, []Ex
 		channels := make([]ExportChannel, 0, len(p.Channels))
 		seenChannel := map[string]bool{}
 		for _, c := range p.Channels {
-			c.Name = strings.TrimSpace(c.Name)
-			if c.Name == "" {
-				return nil, nil, nil, bad("provider %q channel name is required", p.Name)
-			}
 			switch c.Protocol {
-			case "openai", "anthropic":
+			case "openai", "anthropic", "responses":
 			default:
-				return nil, nil, nil, bad("provider %q channel %q: protocol must be openai or anthropic", p.Name, c.Name)
+				return nil, nil, nil, bad("provider %q channel %q: protocol must be openai, anthropic or responses", p.Name, c.Protocol)
 			}
 			switch c.AuthStyle {
-			case "bearer", "x-api-key":
+			case "", "bearer", "x-api-key":
 			default:
-				return nil, nil, nil, bad("provider %q channel %q: auth_style must be bearer or x-api-key", p.Name, c.Name)
+				return nil, nil, nil, bad("provider %q channel %q: auth_style must be bearer or x-api-key", p.Name, c.Protocol)
 			}
 			c.ExtraHeaders = strings.TrimSpace(c.ExtraHeaders)
 			if c.ExtraHeaders == "" {
 				c.ExtraHeaders = "{}"
 			} else if !json.Valid([]byte(c.ExtraHeaders)) || !strings.HasPrefix(c.ExtraHeaders, "{") {
-				return nil, nil, nil, bad("provider %q channel %q: extra_headers must be a JSON object", p.Name, c.Name)
+				return nil, nil, nil, bad("provider %q channel %q: extra_headers must be a JSON object", p.Name, c.Protocol)
 			}
-			if seenChannel[c.Name] {
-				res.Warnings = append(res.Warnings, fmt.Sprintf(
-					"provider %q: duplicate channel %q — first entry wins", p.Name, c.Name))
-				continue
+			if seenChannel[c.Protocol] {
+				return nil, nil, nil, bad("provider %q: duplicate %q channel — a provider carries at most one endpoint per protocol", p.Name, c.Protocol)
 			}
-			seenChannel[c.Name] = true
+			seenChannel[c.Protocol] = true
 			channels = append(channels, c)
 		}
 
@@ -646,14 +636,14 @@ func importAccounts(ctx context.Context, tx *sql.Tx, providerID int64, p ExportP
 	return nil
 }
 
-// importChannels matches by (provider, name) first occurrence and updates the
-// full endpoint shape, or inserts.
+// importChannels matches by (provider, protocol) — the channel's unique
+// identity — and updates the full endpoint shape, or inserts.
 func importChannels(ctx context.Context, tx *sql.Tx, providerID int64, p ExportProvider, res *ImportResult) error {
 	type chRef struct {
-		id   int64
-		name string
+		id       int64
+		protocol string
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id, name FROM channels WHERE provider_id = ? ORDER BY id`, providerID)
+	rows, err := tx.QueryContext(ctx, `SELECT id, protocol FROM channels WHERE provider_id = ? ORDER BY id`, providerID)
 	if err != nil {
 		return fmt.Errorf("import provider %q channels: %w", p.Name, err)
 	}
@@ -661,7 +651,7 @@ func importChannels(ctx context.Context, tx *sql.Tx, providerID int64, p ExportP
 	var existing []chRef
 	for rows.Next() {
 		var c chRef
-		if err := rows.Scan(&c.id, &c.name); err != nil {
+		if err := rows.Scan(&c.id, &c.protocol); err != nil {
 			return fmt.Errorf("import provider %q channels: %w", p.Name, err)
 		}
 		existing = append(existing, c)
@@ -674,7 +664,7 @@ func importChannels(ctx context.Context, tx *sql.Tx, providerID int64, p ExportP
 		var id int64
 		found := false
 		for _, ex := range existing {
-			if !matched[ex.id] && ex.name == c.Name {
+			if !matched[ex.id] && ex.protocol == c.Protocol {
 				id, found = ex.id, true
 				break
 			}
@@ -682,27 +672,23 @@ func importChannels(ctx context.Context, tx *sql.Tx, providerID int64, p ExportP
 		if found {
 			matched[id] = true
 			if _, err := tx.ExecContext(ctx, `
-				UPDATE channels SET protocol = ?, base_url = ?, chat_path = ?, auth_style = ?,
-					responses_path = ?, extra_headers = ?, enabled = ?, priority = ?, weight = ?,
-					supports_embeddings = ?, passthrough = ?, force_upstream_stream = ?, updated_at = ?
+				UPDATE channels SET base_url = ?, chat_path = ?, auth_style = ?,
+					extra_headers = ?, enabled = ?, supports_embeddings = ?, updated_at = ?
 				WHERE id = ?`,
-				c.Protocol, c.BaseURL, c.ChatPath, c.AuthStyle, c.ResponsesPath, c.ExtraHeaders,
-				c.Enabled, c.Priority, c.Weight, c.SupportsEmbeddings, c.Passthrough,
-				c.ForceUpstreamStream, now(), id); err != nil {
-				return fmt.Errorf("import provider %q channel %q: %w", p.Name, c.Name, err)
+				c.BaseURL, c.ChatPath, c.AuthStyle, c.ExtraHeaders,
+				c.Enabled, c.SupportsEmbeddings, now(), id); err != nil {
+				return fmt.Errorf("import provider %q channel %q: %w", p.Name, c.Protocol, err)
 			}
 			res.Channels.Updated++
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO channels (provider_id, name, protocol, base_url, chat_path, auth_style,
-				responses_path, extra_headers, enabled, priority, weight,
-				supports_embeddings, passthrough, force_upstream_stream, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			providerID, c.Name, c.Protocol, c.BaseURL, c.ChatPath, c.AuthStyle, c.ResponsesPath,
-			c.ExtraHeaders, c.Enabled, c.Priority, c.Weight, c.SupportsEmbeddings,
-			c.Passthrough, c.ForceUpstreamStream, now(), now()); err != nil {
-			return fmt.Errorf("import provider %q channel %q: %w", p.Name, c.Name, err)
+			INSERT INTO channels (provider_id, protocol, base_url, chat_path, auth_style,
+				extra_headers, enabled, supports_embeddings, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			providerID, c.Protocol, c.BaseURL, c.ChatPath, c.AuthStyle,
+			c.ExtraHeaders, c.Enabled, c.SupportsEmbeddings, now(), now()); err != nil {
+			return fmt.Errorf("import provider %q channel %q: %w", p.Name, c.Protocol, err)
 		}
 		res.Channels.Created++
 	}
@@ -779,8 +765,8 @@ func importRoutes(ctx context.Context, tx *sql.Tx, routes []ExportRoute, res *Im
 				continue
 			}
 			rt := ModelRouteTarget{ProviderID: providerID, UpstreamModel: tgt.UpstreamModel}
-			if tgt.Channel != nil {
-				cid, found, err := txChannelIDByName(ctx, tx, providerID, *tgt.Channel)
+			if tgt.ChannelProtocol != nil {
+				cid, found, err := txChannelIDByProtocol(ctx, tx, providerID, *tgt.ChannelProtocol)
 				if err != nil {
 					return err
 				}
@@ -788,8 +774,8 @@ func importRoutes(ctx context.Context, tx *sql.Tx, routes []ExportRoute, res *Im
 					rt.ChannelID = &cid
 				} else {
 					res.Warnings = append(res.Warnings, fmt.Sprintf(
-						"route %q target %d: channel %q not found on provider %q — pin dropped (provider auto-select)",
-						r.Name, i+1, *tgt.Channel, tgt.Provider))
+						"route %q target %d: no %q channel on provider %q — pin dropped (provider auto-select)",
+						r.Name, i+1, *tgt.ChannelProtocol, tgt.Provider))
 				}
 			}
 			if tgt.AccountLabel != nil {
@@ -913,13 +899,13 @@ func txProviderByName(ctx context.Context, tx *sql.Tx, name string) (int64, bool
 }
 
 type exportAccountRow struct {
-	id        int64
+	id         int64
 	providerID int64
-	label     string
-	apiKey    string
-	weight    int
-	enabled   bool
-	probes    string
+	label      string
+	apiKey     string
+	weight     int
+	enabled    bool
+	probes     string
 }
 
 // accountsForExport reads every account including plaintext keys (list
@@ -971,16 +957,16 @@ func txAccountsByProvider(ctx context.Context, tx *sql.Tx, providerID int64) ([]
 	return out, rows.Err()
 }
 
-func txChannelIDByName(ctx context.Context, tx *sql.Tx, providerID int64, name string) (int64, bool, error) {
+func txChannelIDByProtocol(ctx context.Context, tx *sql.Tx, providerID int64, protocol string) (int64, bool, error) {
 	var id int64
 	err := tx.QueryRowContext(ctx,
-		`SELECT id FROM channels WHERE provider_id = ? AND name = ? ORDER BY id LIMIT 1`,
-		providerID, name).Scan(&id)
+		`SELECT id FROM channels WHERE provider_id = ? AND protocol = ?`,
+		providerID, protocol).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("lookup channel %q: %w", name, err)
+		return 0, false, fmt.Errorf("lookup channel (%d, %s): %w", providerID, protocol, err)
 	}
 	return id, true, nil
 }

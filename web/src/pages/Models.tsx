@@ -122,7 +122,7 @@ export default function Models() {
       else list.push({ name: c.protocol, live: c.enabled });
       map.set(c.provider_id, list);
     });
-    // Canonical display order: anthropic first, then openai.
+    // Canonical display order (protocolOrder): openai, responses, anthropic.
     map.forEach((list) => list.sort((a, b) => protocolOrder(a.name) - protocolOrder(b.name)));
     return map;
   }, [channels]);

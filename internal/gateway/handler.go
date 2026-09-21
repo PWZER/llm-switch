@@ -24,24 +24,36 @@ import (
 const (
 	protocolOpenAI    = "openai"
 	protocolAnthropic = "anthropic"
+	// protocolResponses is the upstream channel protocol for the Responses
+	// API wire shape — a first-class endpoint kind alongside openai chat and
+	// anthropic messages.
+	protocolResponses = "responses"
 	// protocolOpenAIResponses is the client-facing Responses API surface
-	// (POST /v1/responses). Channels never carry this value: Responses traffic
-	// either passes through to an openai channel's responses_path or is
-	// bridged to the channel's chat protocol.
+	// (POST /v1/responses). Channels never carry this value — the upstream
+	// side spells it "responses"; the distinct strings keep the two axes
+	// distinguishable.
 	protocolOpenAIResponses = "openai-responses"
 
 	defaultOpenAIChatPath    = "/chat/completions"
 	defaultAnthropicChatPath = "/v1/messages"
+	defaultResponsesPath     = "/responses"
 	embeddingsPath           = "/embeddings"
 )
 
-// surfaceProtocol maps a client surface to the upstream wire protocol it
-// prefers: the Responses surface is served by openai channels.
-func surfaceProtocol(clientProtocol string) string {
-	if clientProtocol == protocolOpenAIResponses {
-		return protocolOpenAI
+// surfaceProtocolChain maps a client surface to its ordered upstream
+// protocol preference: the first tier present among the candidates serves;
+// anything later is a cross-protocol bridge. The Responses surface prefers
+// a native responses channel (byte-wise passthrough), then an openai chat
+// channel (cheap transcode), then anthropic.
+func surfaceProtocolChain(clientProtocol string) []string {
+	switch clientProtocol {
+	case protocolOpenAIResponses:
+		return []string{protocolResponses, protocolOpenAI, protocolAnthropic}
+	case protocolAnthropic:
+		return []string{protocolAnthropic, protocolOpenAI, protocolResponses}
+	default:
+		return []string{protocolOpenAI, protocolAnthropic, protocolResponses}
 	}
-	return clientProtocol
 }
 
 // Gateway is the data-plane service.
@@ -214,7 +226,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			cap = newCapture(r, body)
 		}
 		ck, _ := ClientKeyFrom(r.Context())
-		cands, canonical, found := snap.Resolve(model, surfaceProtocol(clientProtocol))
+		cands, canonical, found := snap.Resolve(model, surfaceProtocolChain(clientProtocol))
 		// request_logs.model records the canonical resolved identity so
 		// decorated discovery ids (claude-* mirrors, [1m] markers) coalesce;
 		// client-facing strings keep the raw name.
@@ -250,7 +262,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			}
 			account, err := g.pickAccount(cand)
 			if errors.Is(err, errAccountCooling) {
-				slog.Warn("route-pinned account cooling, failing over", "channel", cand.Channel.Name,
+				slog.Warn("route-pinned account cooling, failing over", "channel_id", cand.Channel.ID,
 					"provider", prov.Name, "account_id", cand.Account.ID, "model", model, "attempt", i+1)
 				lastStatus, lastErrType = http.StatusServiceUnavailable, "account_cooldown"
 				lastUpstream = cand.UpstreamModel
@@ -267,14 +279,14 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			acc := account
 			lastAccount = &acc
 
-			ptPath := responsesPassthroughPath(clientProtocol, cand.Channel)
+			// A Responses-surface request landing on a native responses
+			// channel relays byte-wise; the channel's chat_path IS the
+			// upstream Responses endpoint.
+			pt := responsesPassthrough(clientProtocol, cand.Channel)
 			upPath := chatPath(cand.Channel)
-			if ptPath != "" {
-				upPath = ptPath
-			}
-			upBody, perr := prepareUpstreamBody(body, clientProtocol, cand.Channel.Protocol, cand.UpstreamModel, stream, ptPath != "")
+			upBody, perr := prepareUpstreamBody(body, clientProtocol, cand.Channel.Protocol, cand.UpstreamModel, stream, pt)
 			if perr != nil {
-				slog.Warn("request preparation failed", "channel", cand.Channel.Name,
+				slog.Warn("request preparation failed", "channel_id", cand.Channel.ID,
 					"model", model, "err", perr)
 				g.recordFailure(r, start, ck, logModel, cand.UpstreamModel, clientProtocol, stream,
 					http.StatusBadRequest, "invalid_request", i+1, lastAccount, cap)
@@ -289,7 +301,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 
 			resp, err := g.dispatch(r, cand, account.Secret, upBody, stream, clientProtocol, upPath, cap)
 			if err != nil {
-				slog.Warn("upstream attempt failed", "channel", cand.Channel.Name,
+				slog.Warn("upstream attempt failed", "channel_id", cand.Channel.ID,
 					"provider", prov.Name, "account_id", account.ID, "model", model, "attempt", i+1, "err", err)
 				g.Pool.Report(account.ID, OutcomeServerError, 0)
 				lastStatus, lastErrType = http.StatusBadGateway, "network_error"
@@ -316,14 +328,14 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				} else if resp.StatusCode == http.StatusRequestTimeout {
 					errType = "timeout"
 				}
-				slog.Warn("upstream retriable failure", "channel", cand.Channel.Name,
+				slog.Warn("upstream retriable failure", "channel_id", cand.Channel.ID,
 					"provider", prov.Name, "account_id", account.ID, "model", model, "attempt", i+1,
 					"status", resp.StatusCode, "retry_after", ra.String())
 				g.Pool.Report(account.ID, outcome, ra)
 				lastStatus, lastErrType = resp.StatusCode, errType
 				continue
 			case statusAuth:
-				slog.Warn("upstream rejected credentials", "channel", cand.Channel.Name,
+				slog.Warn("upstream rejected credentials", "channel_id", cand.Channel.ID,
 					"provider", prov.Name, "account_id", account.ID, "status", resp.StatusCode)
 				if eb := captureUpstreamError(resp); len(eb) > 0 {
 					lastErrBody = eb
@@ -375,21 +387,10 @@ func (g *Gateway) dispatch(r *http.Request, cand engine.Candidate, secret string
 	return g.Client.Do(req)
 }
 
-// responsesPassthroughPath returns the upstream Responses endpoint when the
-// request can be relayed to it byte-wise, else "". Only openai channels with
-// an explicit responses_path qualify.
-func responsesPassthroughPath(clientProtocol string, ch *engine.Channel) string {
-	if clientProtocol != protocolOpenAIResponses || ch.Protocol != protocolOpenAI {
-		return ""
-	}
-	if ch.ResponsesPath == nil || *ch.ResponsesPath == "" {
-		return ""
-	}
-	p := *ch.ResponsesPath
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	return p
+// responsesPassthrough reports whether the request relays to the channel
+// byte-wise: a Responses-surface request hitting a native responses channel.
+func responsesPassthrough(clientProtocol string, ch *engine.Channel) bool {
+	return clientProtocol == protocolOpenAIResponses && ch.Protocol == protocolResponses
 }
 
 // commit relays a successful (or non-retriable) upstream response to the client
@@ -407,24 +408,21 @@ func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time
 		err        error
 		converting = cand.Channel.Protocol != clientProtocol
 		// Responses passthrough must preempt the converted relays: the
-		// upstream body is Responses-shaped even though the channel protocol
-		// is "openai", so the usage tap keys on the responses protocol.
-		ptPath   = responsesPassthroughPath(clientProtocol, cand.Channel)
+		// upstream body is Responses-shaped, so the usage tap keys on the
+		// channel's responses protocol.
+		pt       = responsesPassthrough(clientProtocol, cand.Channel)
 		tapProto = cand.Channel.Protocol
 	)
-	if ptPath != "" {
-		tapProto = clientProtocol
-	}
 	sink := cap.sink()
 	switch {
-	case ptPath != "" && stream && resp.StatusCode < 400:
+	case pt && stream && resp.StatusCode < 400:
 		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout(), sink)
 	case stream && resp.StatusCode < 400 && converting:
 		usage, ttft, err = relayConvertedStream(w, r, resp,
 			cand.Channel.Protocol, clientProtocol, model, g.idleTimeout(), sink)
 	case stream && resp.StatusCode < 400:
 		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout(), sink)
-	case ptPath != "":
+	case pt:
 		usage, err = relayNonStream(w, r, resp, tapProto, sink)
 	case converting:
 		usage, err = relayConvertedNonStream(w, r, resp, cand.Channel.Protocol, clientProtocol, model, sink)
@@ -702,7 +700,7 @@ func (g *Gateway) countTokens(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, r, protocolAnthropic, http.StatusServiceUnavailable, "api_error", "gateway is starting")
 		return
 	}
-	cands, _, found := snap.Resolve(model, protocolAnthropic)
+	cands, _, found := snap.Resolve(model, surfaceProtocolChain(protocolAnthropic))
 	if !found {
 		writeModelNotFound(w, r, protocolAnthropic, model)
 		return
@@ -768,7 +766,7 @@ func (g *Gateway) embeddings(w http.ResponseWriter, r *http.Request) {
 	if g.Payloads != nil && (snap.SettingBool("log_bodies", false) || r.Header.Get("X-Debug-Trace") == "1") {
 		cap = newCapture(r, body)
 	}
-	cands, canonical, found := snap.Resolve(model, protocolOpenAI)
+	cands, canonical, found := snap.Resolve(model, surfaceProtocolChain(protocolOpenAI))
 	logModel := orDefault(canonical, model)
 	if !found {
 		writeModelNotFound(w, r, protocolOpenAI, model)
@@ -834,10 +832,27 @@ func chatPath(ch *engine.Channel) string {
 		}
 		return p
 	}
-	if ch.Protocol == protocolAnthropic {
+	switch ch.Protocol {
+	case protocolAnthropic:
 		return defaultAnthropicChatPath
+	case protocolResponses:
+		return defaultResponsesPath
+	default:
+		return defaultOpenAIChatPath
 	}
-	return defaultOpenAIChatPath
+}
+
+// channelAuthStyle resolves the channel's upstream auth style: an explicit
+// value wins; empty defaults per protocol (bearer for openai/responses,
+// x-api-key for anthropic).
+func channelAuthStyle(ch *engine.Channel) string {
+	if ch.AuthStyle != "" {
+		return ch.AuthStyle
+	}
+	if ch.Protocol == protocolAnthropic {
+		return "x-api-key"
+	}
+	return "bearer"
 }
 
 func joinURL(base, path string) string {
@@ -892,7 +907,7 @@ func setUpstreamHeaders(req *http.Request, clientReq *http.Request, ch *engine.C
 	if stream {
 		h.Set("Accept", "text/event-stream")
 	}
-	if ch.AuthStyle == "x-api-key" {
+	if channelAuthStyle(ch) == "x-api-key" {
 		h.Set("x-api-key", secret)
 		if ch.Protocol == protocolAnthropic {
 			h.Set("anthropic-version", "2023-06-01")

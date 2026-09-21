@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -40,9 +41,9 @@ func seedConfigFixture(t *testing.T, st *store.Store) {
 		t.Fatalf("account: %v", err)
 	}
 	cid, err := st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "ch", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: "http://127.0.0.1:1", ChatPath: "/chat/completions", AuthStyle: "bearer",
-		ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1,
+		ExtraHeaders: "{}", Enabled: true,
 	})
 	if err != nil {
 		t.Fatalf("channel: %v", err)
@@ -202,19 +203,22 @@ func TestConfigImportHandler(t *testing.T) {
 		t.Fatalf("second import must be all updates: %+v", again)
 	}
 
-	// Warnings surface through the envelope.
+	// Warnings surface through the envelope: a route pin naming a protocol the
+	// provider has no channel of degrades to provider auto-select with a
+	// warning.
 	rec = postJSON(t, dstSrv, "/config/import",
-		`{"version":1,"model_routes":[{"name":"w","targets":[{"provider":"ds","channel":"nope","upstream_model":"m1"}]}]}`)
+		`{"version":`+strconv.Itoa(store.ExportVersion)+`,"model_routes":[{"name":"w","targets":[{"provider":"ds","channel_protocol":"nope","upstream_model":"m1"}]}]}`)
 	var warnEnv configEnvelope
 	_ = json.Unmarshal(rec.Body.Bytes(), &warnEnv)
 	if !strings.Contains(string(warnEnv.Data), "nope") {
 		t.Fatalf("warnings must surface: %s", warnEnv.Data)
 	}
 
-	// Bad documents map to 40002, malformed body to 40001.
-	rec = postJSON(t, dstSrv, "/config/import", `{"version":2}`)
+	// Bad documents map to 40002, malformed body to 40001. The current
+	// version alone carries no sections, so it is still a bad document.
+	rec = postJSON(t, dstSrv, "/config/import", `{"version":`+strconv.Itoa(store.ExportVersion)+`}`)
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("version 2: %d", rec.Code)
+		t.Fatalf("sections-less document: %d", rec.Code)
 	}
 	var badEnv configEnvelope
 	_ = json.Unmarshal(rec.Body.Bytes(), &badEnv)

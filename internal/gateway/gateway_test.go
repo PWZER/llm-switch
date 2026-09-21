@@ -62,10 +62,9 @@ func newHarness(t *testing.T) *harness {
 	_, err = st.Accounts.Create(ctx, pid, "k1", "upstream-secret", 1, "")
 	must(t, err)
 	_, err = st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "fake-openai", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: openai.URL(), ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1,
-		Passthrough: true,
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 	})
 	must(t, err)
 	_, err = st.Models.EnsureModel(ctx, &store.Model{
@@ -73,10 +72,9 @@ func newHarness(t *testing.T) *harness {
 	})
 	must(t, err)
 	_, err = st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "fake-anthropic", Protocol: "anthropic",
+		ProviderID: pid, Protocol: "anthropic",
 		BaseURL: anthro.URL(), ChatPath: "/v1/messages",
-		AuthStyle: "x-api-key", ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1,
-		Passthrough: true,
+		AuthStyle: "x-api-key", ExtraHeaders: "{}", Enabled: true,
 	})
 	must(t, err)
 	_, err = st.Models.EnsureModel(ctx, &store.Model{
@@ -166,8 +164,8 @@ func (h *harness) addSingleProtocolModel(model, protocol string) {
 	_, err = h.st.Accounts.Create(ctx, pid, "k", "upstream-secret", 1, "")
 	must(h.t, err)
 	ch := &store.Channel{
-		ProviderID: pid, Name: "solo-" + protocol, Protocol: protocol,
-		ExtraHeaders: "{}", Enabled: true, Priority: 10, Weight: 1, Passthrough: true,
+		ProviderID: pid, Protocol: protocol,
+		ExtraHeaders: "{}", Enabled: true,
 	}
 	if protocol == "anthropic" {
 		ch.BaseURL, ch.ChatPath, ch.AuthStyle = h.anthro.URL(), "/v1/messages", "x-api-key"
@@ -434,17 +432,16 @@ func TestFailoverOn429(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 
-	// Add a second provider with an openai channel at lower priority; fake #1
-	// fails first 3 calls.
+	// Add a second provider with an openai channel (orders after the first
+	// provider's by channel id); fake #1 fails first 3 calls.
 	pid, err := h.st.Providers.Create(ctx, "fake2", nil)
 	must(t, err)
 	_, err = h.st.Accounts.Create(ctx, pid, "k2", "upstream-secret-2", 1, "")
 	must(t, err)
 	_, err = h.st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "fake2-openai", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: h.openai.URL(), ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 5, Weight: 1,
-		Passthrough: true,
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 	})
 	must(t, err)
 	_, err = h.st.Models.EnsureModel(ctx, &store.Model{
@@ -677,35 +674,41 @@ func TestRouteProviderTargetCrossProtocolFallback(t *testing.T) {
 	}
 }
 
-// In-segment failover: a provider-scoped target fails over across the
-// provider's own endpoints (two openai endpoints; the anthropic one is
-// protocol-filtered away for the openai surface).
+// Route-chain failover: the chain's second target takes over when the first
+// target's only same-protocol candidate 429s. (A provider carries at most
+// one endpoint per protocol, so failover lives across targets, not within a
+// segment.)
 func TestRouteProviderSegmentFailover(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 
 	ch, err := h.st.Channels.Get(ctx, 1)
 	must(t, err)
-	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
-		Name:    "auto",
-		Targets: []store.ModelRouteTarget{{ProviderID: ch.ProviderID, UpstreamModel: "fake-chat"}},
-	}))
-	// A second openai endpoint of the same provider at lower priority.
+	// Second provider with its own openai channel as the chain's fallback.
+	pid, err := h.st.Providers.Create(ctx, "fake2", nil)
+	must(t, err)
+	_, err = h.st.Accounts.Create(ctx, pid, "k2", "upstream-secret-2", 1, "")
+	must(t, err)
 	_, err = h.st.Channels.Create(ctx, &store.Channel{
-		ProviderID: ch.ProviderID, Name: "fake-openai-2", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: h.openai.URL(), ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 5, Weight: 1,
-		Passthrough: true,
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 	})
 	must(t, err)
+	must(t, h.st.Routes.Upsert(ctx, &store.ModelRoute{
+		Name: "auto",
+		Targets: []store.ModelRouteTarget{
+			{ProviderID: ch.ProviderID, UpstreamModel: "fake-chat"},
+			{ProviderID: pid, UpstreamModel: "fake-chat"},
+		},
+	}))
 	h.rebuild()
 
-	// First openai call 429s; the segment's next candidate (the second openai
-	// endpoint of the same provider) must take over.
+	// First openai call 429s; the chain's next target must take over.
 	h.openai.FailFirstN(1)
 	resp, raw := h.post("/v1/chat/completions", `{"model":"auto","stream":false}`, nil)
 	if resp.StatusCode != 200 {
-		t.Fatalf("segment failover failed, status %d: %s", resp.StatusCode, raw)
+		t.Fatalf("chain failover failed, status %d: %s", resp.StatusCode, raw)
 	}
 	if !strings.Contains(string(raw), "Hello from fake OpenAI") {
 		t.Fatalf("unexpected body: %s", raw)

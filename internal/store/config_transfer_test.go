@@ -9,8 +9,9 @@ import (
 )
 
 // seedTransferFixture builds one fully-populated provider (account, two
-// channels, two model rows), a route pinning both channels and the account,
-// one client key and two settings — the whole dependency closure in one place.
+// protocol-keyed channels, two model rows), a route pinning both channels and
+// the account, one client key and two settings — the whole dependency closure
+// in one place.
 func seedTransferFixture(t *testing.T, st *Store) (pid, aid, cidOpenAI, cidAnthro int64) {
 	t.Helper()
 	ctx := context.Background()
@@ -25,19 +26,21 @@ func seedTransferFixture(t *testing.T, st *Store) (pid, aid, cidOpenAI, cidAnthr
 		t.Fatalf("account: %v", err)
 	}
 	cidOpenAI, err = st.Channels.Create(ctx, &Channel{
-		ProviderID: pid, Name: "ds-openai", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: "https://api.deepseek.com", ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ResponsesPath: strp("/responses"), ExtraHeaders: `{"X-Debug":"1"}`,
-		Enabled: true, Priority: 10, Weight: 1, Passthrough: true,
+		AuthStyle: "bearer", ExtraHeaders: `{"X-Debug":"1"}`,
+		Enabled: true,
 	})
 	if err != nil {
 		t.Fatalf("channel: %v", err)
 	}
+	// AuthStyle "" = protocol default (x-api-key for anthropic); the export
+	// must carry it verbatim like any explicit value.
 	cidAnthro, err = st.Channels.Create(ctx, &Channel{
-		ProviderID: pid, Name: "ds-anthropic", Protocol: "anthropic",
-		BaseURL: "https://api.deepseek.com/anthropic",
-		AuthStyle: "x-api-key", ExtraHeaders: "{}",
-		Enabled: true, Priority: 5, Weight: 1,
+		ProviderID: pid, Protocol: "anthropic",
+		BaseURL:      "https://api.deepseek.com/anthropic",
+		ExtraHeaders: "{}",
+		Enabled:      true,
 	})
 	if err != nil {
 		t.Fatalf("channel 2: %v", err)
@@ -134,20 +137,21 @@ func TestConfigExportRoundTrip(t *testing.T) {
 	if err != nil || len(chs) != 2 {
 		t.Fatalf("channels: %+v err=%v", chs, err)
 	}
-	byName := map[string]Channel{}
+	// Channels are keyed by (provider, protocol) — the protocol is the
+	// identity the document speaks.
+	byProto := map[string]Channel{}
 	for _, c := range chs {
-		byName[c.Name] = c
+		byProto[c.Protocol] = c
 	}
-	openai, ok := byName["ds-openai"]
-	if !ok || openai.Protocol != "openai" || openai.BaseURL != "https://api.deepseek.com" ||
-		openai.ChatPath != "/chat/completions" || openai.ResponsesPath == nil || *openai.ResponsesPath != "/responses" ||
-		openai.ExtraHeaders != `{"X-Debug":"1"}` || openai.AuthStyle != "bearer" ||
-		openai.Priority != 10 || !openai.Passthrough || !openai.Enabled {
+	openai, ok := byProto["openai"]
+	if !ok || openai.BaseURL != "https://api.deepseek.com" ||
+		openai.ChatPath != "/chat/completions" ||
+		openai.ExtraHeaders != `{"X-Debug":"1"}` || openai.AuthStyle != "bearer" || !openai.Enabled {
 		t.Fatalf("openai channel: %+v", openai)
 	}
-	anthro, ok := byName["ds-anthropic"]
-	if !ok || anthro.Protocol != "anthropic" || anthro.BaseURL != "https://api.deepseek.com/anthropic" ||
-		anthro.AuthStyle != "x-api-key" || anthro.ResponsesPath != nil || anthro.Priority != 5 {
+	anthro, ok := byProto["anthropic"]
+	if !ok || anthro.BaseURL != "https://api.deepseek.com/anthropic" ||
+		anthro.AuthStyle != "" || !anthro.Enabled {
 		t.Fatalf("anthropic channel: %+v", anthro)
 	}
 
@@ -202,7 +206,7 @@ func TestImportUpsertMerge(t *testing.T) {
 		t.Fatalf("extra account: %v", err)
 	}
 	cid, err := dst.Channels.Create(ctx, &Channel{
-		ProviderID: pid, Name: "ds-openai", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: "https://old.example.com", ChatPath: "/chat/completions",
 		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 	})
@@ -248,7 +252,7 @@ func TestImportUpsertMerge(t *testing.T) {
 	}
 	chs, _ := dst.Channels.List(ctx)
 	for _, c := range chs {
-		if c.Name == "ds-openai" && (c.ID != cid || c.BaseURL != "https://api.deepseek.com") {
+		if c.Protocol == "openai" && (c.ID != cid || c.BaseURL != "https://api.deepseek.com") {
 			t.Fatalf("matched channel must be updated in place (id %d): %+v", cid, c)
 		}
 	}
@@ -324,7 +328,7 @@ func TestImportAccountMatching(t *testing.T) {
 	pid, _ = dst.Providers.Create(ctx, "pc", nil)
 	dst.Accounts.Create(ctx, pid, "other", "sk-unrelated-01234", 1, "")
 	doc = &ConfigExport{Version: ExportVersion, Providers: []ExportProvider{{
-		Name: "pc",
+		Name:     "pc",
 		Accounts: []ExportAccount{{Label: "", Weight: 1, Enabled: true, UsageProbes: json.RawMessage("[]")}},
 	}}}
 	res, err = dst.ImportConfig(ctx, doc)
@@ -339,10 +343,11 @@ func TestImportAccountMatching(t *testing.T) {
 	}
 }
 
-// Route-target pins resolve by name against the destination DB: known pins are
-// remapped, unknown pins degrade to provider auto-select with a warning,
-// unknown providers drop the target, and a provider referenced only by the
-// route is still found when the document carries no providers section.
+// Route-target pins resolve by channel protocol against the destination DB:
+// known pins are remapped, unknown pins degrade to provider auto-select with
+// a warning, unknown providers drop the target, and a provider referenced
+// only by the route is still found when the document carries no providers
+// section.
 func TestImportRoutePinRemapAndDegrade(t *testing.T) {
 	ctx := context.Background()
 	src := newTestStore(t)
@@ -361,7 +366,7 @@ func TestImportRoutePinRemapAndDegrade(t *testing.T) {
 	}
 	doc.ModelRoutes = append(doc.ModelRoutes,
 		ExportRoute{Name: "degraded", Targets: []ExportRouteTarget{
-			{Provider: "ds", Channel: strp("nope"), UpstreamModel: "deepseek-chat"},
+			{Provider: "ds", ChannelProtocol: strp("nope"), UpstreamModel: "deepseek-chat"},
 		}},
 		ExportRoute{Name: "dead", Targets: []ExportRouteTarget{
 			{Provider: "ghost", UpstreamModel: "m"},
@@ -400,7 +405,7 @@ func TestImportRoutePinRemapAndDegrade(t *testing.T) {
 	// is not in the document — target resolution must still succeed.
 	routesOnly := &ConfigExport{Version: ExportVersion, ModelRoutes: []ExportRoute{{
 		Name: "solo", Targets: []ExportRouteTarget{
-			{Provider: "ds", Channel: strp("ds-openai"), UpstreamModel: "deepseek-chat"},
+			{Provider: "ds", ChannelProtocol: strp("openai"), UpstreamModel: "deepseek-chat"},
 		},
 	}}}
 	res, err = dst.ImportConfig(ctx, routesOnly)
@@ -534,6 +539,18 @@ func TestImportValidationAndRollback(t *testing.T) {
 	if _, err := st.ImportConfig(ctx, dup); !errors.Is(err, ErrBadDocument) {
 		t.Fatalf("duplicate provider names must be ErrBadDocument, got %v", err)
 	}
+	// A provider carries at most one channel per protocol: a document with two
+	// openai channels on one provider can never land.
+	dupChannel := &ConfigExport{Version: ExportVersion, Providers: []ExportProvider{{
+		Name: "x",
+		Channels: []ExportChannel{
+			{Protocol: "openai", BaseURL: "https://a.example.com", ChatPath: "/chat/completions", ExtraHeaders: "{}"},
+			{Protocol: "openai", BaseURL: "https://b.example.com", ChatPath: "/chat/completions", ExtraHeaders: "{}"},
+		},
+	}}}
+	if _, err := st.ImportConfig(ctx, dupChannel); !errors.Is(err, ErrBadDocument) {
+		t.Fatalf("duplicate protocol channels must be ErrBadDocument, got %v", err)
+	}
 	badHash := &ConfigExport{Version: ExportVersion, APIKeys: []ExportAPIKey{
 		{Name: "k", KeyHash: "nothex"},
 	}}
@@ -604,7 +621,7 @@ func TestImportPlanDryRun(t *testing.T) {
 	// Ambiguous label matching: the fixture's "main" account has no label
 	// collision, so drive the ambiguity warning directly.
 	dupDoc := &ConfigExport{Version: ExportVersion, Providers: []ExportProvider{{
-		Name: "p",
+		Name:     "p",
 		Accounts: []ExportAccount{{Label: "dup", Weight: 9, Enabled: true, UsageProbes: json.RawMessage("[]")}},
 	}}}
 	dupPlan, err := dst.PlanImport(ctx, dupDoc)

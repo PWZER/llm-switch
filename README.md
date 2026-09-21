@@ -26,9 +26,9 @@ Clients                          llm-switch :8901                 Upstreams
 - **Cross-protocol conversion** through an internal IR — Anthropic clients can ride
   OpenAI upstreams and vice versa, with streaming SSE, tool calls, thinking/reasoning,
   images, and usage/cache tokens. Wire-identical traffic takes a byte-passthrough fast path.
-- **Routing & failover**: weighted round-robin over an account pool, channel priority
-  ordering, automatic failover on 429/5xx/network errors (always before the first
-  forwarded byte), per-account cooldowns honoring `Retry-After`.
+- **Routing & failover**: weighted round-robin over an account pool, per-surface
+  protocol preference, automatic failover on 429/5xx/network errors (always before
+  the first forwarded byte), per-account cooldowns honoring `Retry-After`.
 - **Model routes (hot-switching)**: stable client-facing names (e.g. `main`) re-pointable
   at runtime from the Web UI — agent configs never change, no restarts.
 - **Model discovery**: `GET /v1/models` serves the registry in OpenAI and Anthropic
@@ -145,8 +145,10 @@ running binary:
 
 ## Configuration (Web UI)
 
-1. **Providers** — endpoint channels per vendor. A vendor account often speaks both
-   protocols; add both channels and pick per need:
+1. **Providers** — endpoint channels per vendor: one channel per protocol
+   (`openai` chat, `anthropic` messages, `responses` — the native OpenAI Responses
+   API, served via byte passthrough). A vendor account often speaks several; add one
+   channel per protocol you need:
 
    | Vendor | OpenAI channel | Anthropic channel |
    | --- | --- | --- |
@@ -157,8 +159,9 @@ running binary:
 
    Set the provider-level `models_url`, fetch the upstream list, and check the models
    to register on save. Channel **Test** is connectivity-only (no credential sent).
-   Optional per channel: `responses_path` (native OpenAI Responses API, served via
-   byte passthrough) and `supports_embeddings` (gates `/v1/embeddings`).
+   `auth_style` defaults per protocol (bearer for openai/responses, x-api-key for
+   anthropic) — override only when the vendor deviates. Optional per channel:
+   `supports_embeddings` (gates `/v1/embeddings`, openai channels only).
 2. **Account Pool** — accounts (API key + weight + usage probes) belong to a provider;
    requests rotate across its enabled accounts. Per-account **Test** validates the key
    (quick = list models, deep = mini chat); **Usage** reports balance/quota.

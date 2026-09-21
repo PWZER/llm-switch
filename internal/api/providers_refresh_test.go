@@ -81,9 +81,9 @@ func TestRefreshAndSyncModels(t *testing.T) {
 		t.Fatalf("provider: %v", err)
 	}
 	if _, err := st.Channels.Create(ctx, &store.Channel{
-		ProviderID: pid, Name: "c", Protocol: "openai",
+		ProviderID: pid, Protocol: "openai",
 		BaseURL: srv.URL, ChatPath: "/chat/completions",
-		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true, Priority: 1, Weight: 1,
+		AuthStyle: "bearer", ExtraHeaders: "{}", Enabled: true,
 	}); err != nil {
 		t.Fatalf("channel: %v", err)
 	}
