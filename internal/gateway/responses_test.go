@@ -62,6 +62,21 @@ func TestResponsesPassthroughNonStream(t *testing.T) {
 	if _, has := up["text"]; !has {
 		t.Fatalf("unknown fields not preserved: %s", last)
 	}
+
+	// Usage must be harvested from the top-level usage of the bare
+	// (non-stream) response object.
+	time.Sleep(400 * time.Millisecond)
+	logs, _, err := h.st.Logs.QueryLogs(context.Background(), store.LogFilter{Model: "test-model"})
+	must(t, err)
+	found := false
+	for _, l := range logs {
+		if l.Success && l.PromptTokens == 12 && l.CompletionTokens == 6 && l.CacheReadTokens == 4 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("responses non-stream usage not logged: %+v", logs)
+	}
 }
 
 func TestResponsesPassthroughStream(t *testing.T) {

@@ -104,10 +104,10 @@ export default function Dashboard() {
         const r = byKey.get(`${bucket}|${model}`);
         const prompt = r?.prompt_tokens ?? 0;
         const cacheRead = r?.cache_read_tokens ?? 0;
+        // prompt_tokens includes cached tokens (normalized total-input
+        // convention), so the hit rate is simply cacheRead / prompt.
         const hitRate =
-          prompt + cacheRead > 0
-            ? Math.round((cacheRead / (prompt + cacheRead)) * 1000) / 10
-            : 0;
+          prompt > 0 ? Math.round((cacheRead / prompt) * 1000) / 10 : 0;
         out.push({
           bucket,
           model,

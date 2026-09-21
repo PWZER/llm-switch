@@ -43,7 +43,9 @@ func TestAnthropicClientToOpenAIUpstreamNonStream(t *testing.T) {
 		t.Fatalf("stop_reason %q", out.StopReason)
 	}
 	// Usage mapping: openai prompt/completion/cache -> anthropic input/output/cache_read.
-	if out.Usage.InputTokens != 12 || out.Usage.OutputTokens != 6 || out.Usage.CacheRead != 4 {
+	// OpenAI prompt_tokens (12) includes cached tokens (4); the Anthropic wire
+	// convention excludes them, so input_tokens = 12 - 4 = 8.
+	if out.Usage.InputTokens != 8 || out.Usage.OutputTokens != 6 || out.Usage.CacheRead != 4 {
 		t.Fatalf("usage mapping wrong: %+v", out.Usage)
 	}
 
@@ -192,7 +194,9 @@ func TestOpenAIClientToAnthropicUpstreamNonStream(t *testing.T) {
 	if out.Choices[0].FinishReason != "stop" {
 		t.Fatalf("finish_reason %q", out.Choices[0].FinishReason)
 	}
-	if out.Usage.PromptTokens != 10 || out.Usage.CompletionTokens != 5 {
+	// Anthropic input_tokens (10) excludes cache_read (3) + cache_creation (2);
+	// the OpenAI wire convention includes cache tokens, so prompt_tokens = 15.
+	if out.Usage.PromptTokens != 15 || out.Usage.CompletionTokens != 5 {
 		t.Fatalf("usage mapping wrong: %+v", out.Usage)
 	}
 	if out.Usage.PromptTokensDetails.CachedTokens != 3 {
@@ -222,7 +226,7 @@ func TestOpenAIClientToAnthropicUpstreamStream(t *testing.T) {
 		`"content":"Hello"`,
 		`"content":" from fake"`,
 		`"finish_reason":"stop"`,
-		`"prompt_tokens":10`,
+		`"prompt_tokens":15`, // anthropic input 10 + cache_read 3 + cache_write 2 (openai convention)
 		"[DONE]",
 	} {
 		if !strings.Contains(s, want) {

@@ -198,7 +198,9 @@ func (r *Renderer) Frame(ev ir.Event) ([]byte, error) {
 			"choices": []any{},
 			"usage": map[string]any{
 				"prompt_tokens": ev.Usage.Input, "completion_tokens": ev.Usage.Output,
-				"total_tokens": ev.Usage.Input + ev.Usage.Output,
+				"total_tokens":              ev.Usage.Input + ev.Usage.Output,
+				"prompt_tokens_details":     map[string]any{"cached_tokens": ev.Usage.CacheRead},
+				"completion_tokens_details": map[string]any{"reasoning_tokens": ev.Usage.Reasoning},
 			},
 		})...)
 		out = append(out, []byte("data: [DONE]\n\n")...)

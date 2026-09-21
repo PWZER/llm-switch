@@ -75,7 +75,8 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 
 	switch {
 	case frame.Type == "message_start" && frame.Message != nil && frame.Message.Usage != nil:
-		// Anthropic message_start: input + cache read/write.
+		// Anthropic message_start: input + cache read/write. Normalized to the
+		// total-input convention: Prompt includes cache tokens.
 		mu := frame.Message.Usage
 		if mu.InputTokens != nil {
 			u.Prompt = *mu.InputTokens
@@ -86,6 +87,7 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 		if mu.CacheCreationToken != nil {
 			u.CacheWrite = *mu.CacheCreationToken
 		}
+		u.Prompt += u.CacheRead + u.CacheWrite
 	case frame.Type == "message_delta" && frame.Usage != nil:
 		// Anthropic message_delta: official spec carries output_tokens only,
 		// but several Anthropic-compatible vendors (Zhipu/DeepSeek) put the
@@ -93,8 +95,29 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 		if frame.Usage.OutputTokens != nil {
 			u.Completion = *frame.Usage.OutputTokens
 		}
+		if frame.Usage.CacheReadTokens != nil && *frame.Usage.CacheReadTokens > 0 {
+			u.CacheRead = *frame.Usage.CacheReadTokens
+		}
+		if frame.Usage.CacheCreationToken != nil && *frame.Usage.CacheCreationToken > 0 {
+			u.CacheWrite = *frame.Usage.CacheCreationToken
+		}
 		if frame.Usage.InputTokens != nil && *frame.Usage.InputTokens > 0 {
-			u.Prompt = *frame.Usage.InputTokens
+			u.Prompt = *frame.Usage.InputTokens + u.CacheRead + u.CacheWrite
+		}
+	case frame.Usage != nil && frame.Usage.PromptTokens == nil && frame.Usage.InputTokens != nil:
+		// Non-stream Anthropic message body: top-level usage with Anthropic
+		// field names (input_tokens excludes cache).
+		fu := frame.Usage
+		u.Prompt = *fu.InputTokens
+		if fu.CacheReadTokens != nil {
+			u.CacheRead = *fu.CacheReadTokens
+		}
+		if fu.CacheCreationToken != nil {
+			u.CacheWrite = *fu.CacheCreationToken
+		}
+		u.Prompt += u.CacheRead + u.CacheWrite
+		if fu.OutputTokens != nil {
+			u.Completion = *fu.OutputTokens
 		}
 	case frame.Usage != nil:
 		// OpenAI chunk with usage (include_usage) or non-stream body shape.
@@ -119,6 +142,19 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 	}
 }
 
+// responsesWireUsage mirrors the usage object of the Responses API.
+// input_tokens already includes cached tokens (OpenAI convention).
+type responsesWireUsage struct {
+	InputTokens        *int64 `json:"input_tokens"`
+	OutputTokens       *int64 `json:"output_tokens"`
+	InputTokensDetails *struct {
+		CachedTokens *int64 `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
+	OutputTokensDetails *struct {
+		ReasoningTokens *int64 `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
+}
+
 // tapResponsesUsage harvests usage from a Responses-shaped payload: streaming
 // events nest it under response.completed / response.incomplete; the
 // non-stream body is the bare response object (type "response" after the
@@ -126,27 +162,22 @@ func tapStreamLine(protocol string, line []byte, u *usageInfo) {
 // chat/anthropic parsing below never sees these field names.
 func tapResponsesUsage(payload []byte, u *usageInfo) {
 	var frame struct {
-		Type     string `json:"type"`
+		Type     string              `json:"type"`
+		Usage    *responsesWireUsage `json:"usage"` // non-stream bare response object
 		Response *struct {
-			Usage *struct {
-				InputTokens        *int64 `json:"input_tokens"`
-				OutputTokens       *int64 `json:"output_tokens"`
-				InputTokensDetails *struct {
-					CachedTokens *int64 `json:"cached_tokens"`
-				} `json:"input_tokens_details"`
-				OutputTokensDetails *struct {
-					ReasoningTokens *int64 `json:"reasoning_tokens"`
-				} `json:"output_tokens_details"`
-			} `json:"usage"`
+			Usage *responsesWireUsage `json:"usage"`
 		} `json:"response"`
 	}
 	if err := json.Unmarshal(payload, &frame); err != nil {
 		return
 	}
-	if frame.Response == nil || frame.Response.Usage == nil {
+	ru := frame.Usage
+	if frame.Response != nil && frame.Response.Usage != nil {
+		ru = frame.Response.Usage
+	}
+	if ru == nil {
 		return
 	}
-	ru := frame.Response.Usage
 	if ru.InputTokens != nil {
 		u.Prompt = *ru.InputTokens
 	}

@@ -21,8 +21,20 @@ func (u *wireUsage) toIR() ir.Usage {
 	if u == nil {
 		return ir.Usage{}
 	}
-	return ir.Usage{Input: u.InputTokens, Output: u.OutputTokens,
+	// IR invariant: Input is the total input count INCLUDING cache tokens
+	// (OpenAI convention); Anthropic wire input_tokens excludes them.
+	return ir.Usage{Input: u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens,
+		Output: u.OutputTokens,
 		CacheRead: u.CacheReadInputTokens, CacheWrite: u.CacheCreationInputTokens}
+}
+
+// anthropicInputTokens converts the canonical total-input count back to the
+// Anthropic wire convention (cache tokens reported separately).
+func anthropicInputTokens(u ir.Usage) int64 {
+	if n := u.Input - u.CacheRead - u.CacheWrite; n > 0 {
+		return n
+	}
+	return 0
 }
 
 type wireResponse struct {
@@ -135,7 +147,7 @@ func EncodeResponse(resp *ir.Response) ([]byte, error) {
 		"content":     content,
 		"stop_reason": mapStopToAnthropic(resp.Stop),
 		"usage": map[string]any{
-			"input_tokens":                resp.Usage.Input,
+			"input_tokens":                anthropicInputTokens(resp.Usage),
 			"output_tokens":               resp.Usage.Output,
 			"cache_read_input_tokens":     resp.Usage.CacheRead,
 			"cache_creation_input_tokens": resp.Usage.CacheWrite,
@@ -159,12 +171,7 @@ type sseFrame struct {
 		StopReason  string `json:"stop_reason"`
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
-	Usage *struct {
-		OutputTokens             int64 `json:"output_tokens"`
-		InputTokens              int64 `json:"input_tokens"`
-		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-	} `json:"usage"`
+	Usage *wireUsage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
@@ -176,7 +183,7 @@ type StreamReader struct {
 	started    bool
 	seqTool    int
 	finished   bool
-	inputUsage ir.Usage
+	inputUsage wireUsage // raw wire fields; toIR applied at EvFinish
 	emitted    []ir.Event
 }
 
@@ -206,8 +213,11 @@ func (s *StreamReader) Feed(payload []byte) []ir.Event {
 		ev := ir.Event{Kind: ir.EvStart}
 		if frame.Message != nil {
 			ev.Model = frame.Message.Model
-			s.inputUsage = frame.Message.Usage.toIR()
-			s.inputUsage.Output = 0
+			s.inputUsage = wireUsage{}
+			if frame.Message.Usage != nil {
+				s.inputUsage = *frame.Message.Usage
+				s.inputUsage.OutputTokens = 0
+			}
 		}
 		s.emitted = append(s.emitted, ev)
 	case "content_block_start":
@@ -251,20 +261,20 @@ func (s *StreamReader) Feed(payload []byte) []ir.Event {
 			stop = mapStopReason(frame.Delta.StopReason)
 		}
 		if frame.Usage != nil {
-			usage.Output = frame.Usage.OutputTokens
+			usage.OutputTokens = frame.Usage.OutputTokens
 			// Anthropic-compatible vendors sometimes repeat the full usage in
 			// message_delta (and omit it from message_start) — merge non-zeros.
 			if frame.Usage.InputTokens > 0 {
-				usage.Input = frame.Usage.InputTokens
+				usage.InputTokens = frame.Usage.InputTokens
 			}
 			if frame.Usage.CacheReadInputTokens > 0 {
-				usage.CacheRead = frame.Usage.CacheReadInputTokens
+				usage.CacheReadInputTokens = frame.Usage.CacheReadInputTokens
 			}
 			if frame.Usage.CacheCreationInputTokens > 0 {
-				usage.CacheWrite = frame.Usage.CacheCreationInputTokens
+				usage.CacheCreationInputTokens = frame.Usage.CacheCreationInputTokens
 			}
 		}
-		s.emitted = append(s.emitted, ir.Event{Kind: ir.EvFinish, Stop: stop, Usage: usage})
+		s.emitted = append(s.emitted, ir.Event{Kind: ir.EvFinish, Stop: stop, Usage: usage.toIR()})
 	case "message_stop":
 		// Terminal framing; EvFinish already emitted on message_delta.
 	case "ping":
@@ -366,7 +376,12 @@ func (r *Renderer) Frame(ev ir.Event) ([]byte, error) {
 		out = append(out, eventFrame("message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": mapStopToAnthropic(ev.Stop), "stop_sequence": nil},
-			"usage": map[string]any{"output_tokens": ev.Usage.Output},
+			"usage": map[string]any{
+				"input_tokens":                anthropicInputTokens(ev.Usage),
+				"output_tokens":               ev.Usage.Output,
+				"cache_read_input_tokens":     ev.Usage.CacheRead,
+				"cache_creation_input_tokens": ev.Usage.CacheWrite,
+			},
 		})...)
 		// message_delta and message_stop are one logical terminal sequence.
 		return append(out, eventFrame("message_stop", map[string]any{"type": "message_stop"})...), nil

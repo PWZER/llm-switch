@@ -116,6 +116,12 @@ type Request struct {
 }
 
 // Usage is the canonical token accounting.
+//
+// Invariant: Input is the TOTAL input token count INCLUDING CacheRead and
+// CacheWrite (OpenAI prompt_tokens convention). Anthropic wire usage excludes
+// cache tokens from input_tokens, so the anthropic codec adds them in on
+// decode and subtracts them on encode. This keeps request_logs.prompt_tokens
+// semantics uniform across protocols (cache hit rate = CacheRead / Input).
 type Usage struct {
 	Input      int64
 	Output     int64

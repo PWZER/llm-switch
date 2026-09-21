@@ -32,8 +32,76 @@ func TestMigrationsIdempotent(t *testing.T) {
 		t.Fatalf("second migrate: %v", err)
 	}
 	var maxv int
-	if err := st.db.Read.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&maxv); err != nil || maxv != 3 {
-		t.Fatalf("want schema version 3, got %d (err=%v)", maxv, err)
+	if err := st.db.Read.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&maxv); err != nil || maxv != 4 {
+		t.Fatalf("want schema version 4, got %d (err=%v)", maxv, err)
+	}
+}
+
+// TestMigrationUsageNormalize plants pre-normalization log rows (anthropic
+// rows stored input_tokens EXCLUDING cache) and checks 0004 folds the cache
+// columns into prompt_tokens for anthropic-served rows only.
+func TestMigrationUsageNormalize(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	body, err := migrationsFS.ReadFile("migrations/0001_init.sql")
+	if err != nil {
+		t.Fatalf("read 0001: %v", err)
+	}
+	if _, err := db.Write.Exec(string(body)); err != nil {
+		t.Fatalf("apply 0001: %v", err)
+	}
+	if _, err := db.Write.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+		version    INTEGER PRIMARY KEY,
+		applied_at INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatalf("create schema_migrations: %v", err)
+	}
+	// Pretend 1-3 are applied so Migrate() runs only 0004.
+	for v := 1; v <= 3; v++ {
+		if _, err := db.Write.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, 1)`, v); err != nil {
+			t.Fatalf("record version %d: %v", v, err)
+		}
+	}
+
+	stmts := []string{
+		// Anthropic-served row: prompt excludes cache -> 618 + 70912 + 0.
+		`INSERT INTO request_logs (ts, model, protocol_in, protocol_out, status,
+			prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens)
+			VALUES (1, 'claude-x', 'anthropic', 'anthropic', 200, 618, 8, 70912, 0)`,
+		// OpenAI-served row: prompt already includes cache -> unchanged.
+		`INSERT INTO request_logs (ts, model, protocol_in, protocol_out, status,
+			prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens)
+			VALUES (2, 'deepseek-x', 'openai', 'openai', 200, 100, 7, 80, 0)`,
+	}
+	for _, q := range stmts {
+		if _, err := db.Write.Exec(q); err != nil {
+			t.Fatalf("seed log row: %v\n%s", err, q)
+		}
+	}
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("migrate to 4: %v", err)
+	}
+
+	var prompt, cacheRead int64
+	if err := db.Read.QueryRow(`SELECT prompt_tokens, cache_read_tokens FROM request_logs WHERE ts = 1`).
+		Scan(&prompt, &cacheRead); err != nil {
+		t.Fatalf("scan anthropic row: %v", err)
+	}
+	if prompt != 618+70912 || cacheRead != 70912 {
+		t.Fatalf("anthropic row not normalized: prompt=%d cache_read=%d", prompt, cacheRead)
+	}
+	if err := db.Read.QueryRow(`SELECT prompt_tokens, cache_read_tokens FROM request_logs WHERE ts = 2`).
+		Scan(&prompt, &cacheRead); err != nil {
+		t.Fatalf("scan openai row: %v", err)
+	}
+	if prompt != 100 || cacheRead != 80 {
+		t.Fatalf("openai row must stay unchanged: prompt=%d cache_read=%d", prompt, cacheRead)
 	}
 }
 
