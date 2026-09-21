@@ -231,6 +231,27 @@ export interface RequestLog {
   reasoning_tokens: number;
   latency_ms: number;
   first_token_ms: number | null;
+  payload_path: string; // '' = not recorded
+}
+
+// — log payload detail ------------------------------------------------------
+
+export interface LogPayloadSegment {
+  headers: Record<string, string[]>;
+  body: string;
+  truncated: boolean;
+}
+
+export interface LogPayload {
+  request_id: string;
+  client_request: LogPayloadSegment;
+  upstream_request: LogPayloadSegment | null;
+  upstream_response: {
+    status: number;
+    headers: Record<string, string[]>;
+    body: string;
+    truncated: boolean;
+  } | null;
 }
 
 // — configuration export / import -------------------------------------------

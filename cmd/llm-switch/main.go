@@ -27,9 +27,10 @@ import (
 	"github.com/PWZER/llm-switch/internal/daemon"
 	"github.com/PWZER/llm-switch/internal/engine"
 	"github.com/PWZER/llm-switch/internal/gateway"
-	"github.com/PWZER/llm-switch/internal/upgrade"
+	"github.com/PWZER/llm-switch/internal/payload"
 	"github.com/PWZER/llm-switch/internal/stats"
 	"github.com/PWZER/llm-switch/internal/store"
+	"github.com/PWZER/llm-switch/internal/upgrade"
 	"github.com/PWZER/llm-switch/internal/web"
 )
 
@@ -221,7 +222,9 @@ func run(cfg *config.Config) error {
 		return err
 	}
 	pool := gateway.NewAccountPool()
-	gw := gateway.New(holder, pool, gateway.NewUpstreamClient(), stats.New(st))
+	payloads := payload.NewWriter(filepath.Join(cfg.DataDir, "payloads"), st)
+	defer payloads.Close(context.Background())
+	gw := gateway.New(holder, pool, gateway.NewUpstreamClient(), stats.New(st), payloads)
 	defer gw.Log.Close(context.Background())
 
 	r := chi.NewRouter()
@@ -276,12 +279,13 @@ func run(cfg *config.Config) error {
 
 	// Admin API with the post-mutation snapshot reload hook.
 	apiSrv := &api.Server{
-		St:        st,
-		Admin:     admin,
-		Reload:    func(ctx context.Context) error { return holder.Rebuild(ctx, st) },
-		Snapshot:  holder,
-		Cooldowns: pool.Cooldowns,
-		Dropped:   gw.Log.Dropped,
+		St:         st,
+		Admin:      admin,
+		Reload:     func(ctx context.Context) error { return holder.Rebuild(ctx, st) },
+		Snapshot:   holder,
+		Cooldowns:  pool.Cooldowns,
+		Dropped:    gw.Log.Dropped,
+		PayloadDir: filepath.Join(cfg.DataDir, "payloads"),
 	}
 	r.Mount("/api/v1", apiSrv.Router())
 
@@ -353,6 +357,9 @@ func run(cfg *config.Config) error {
 	}
 	closeCtx, cancel3 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel3()
+	if err := payloads.Close(closeCtx); err != nil {
+		logger.Error("payload drain failed", "err", err)
+	}
 	if err := gw.Log.Close(closeCtx); err != nil {
 		logger.Error("stats drain failed", "err", err)
 	}

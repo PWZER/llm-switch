@@ -31,6 +31,8 @@ type Server struct {
 	Cooldowns func() map[int64]time.Time
 	// Dropped reports rows dropped by the stats writer (backpressure counter).
 	Dropped func() int64
+	// PayloadDir is the on-disk payload recording root (<data-dir>/payloads).
+	PayloadDir string
 }
 
 // Router builds the /api/v1 chi router. Login and health are public;
@@ -182,6 +184,7 @@ func (s *Server) mountProtected(pr chi.Router) {
 	pr.Post("/config/import", s.handleConfigImport)
 
 	pr.Get("/logs", s.handleListLogs)
+	pr.Get("/logs/{id}/payload", s.handleGetLogPayload)
 	pr.Get("/stats/overview", s.handleStatsOverview)
 	pr.Get("/stats/timeseries", s.handleStatsTimeseries)
 	pr.Get("/engine/status", s.handleEngineStatus)

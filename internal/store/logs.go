@@ -38,6 +38,9 @@ type RequestLog struct {
 	ReasoningTokens  int64   `json:"reasoning_tokens"`
 	LatencyMS        int64   `json:"latency_ms"`
 	FirstTokenMS     *int64  `json:"first_token_ms"`
+	// PayloadPath is the payload directory relative to <data-dir>/payloads
+	// (empty = not recorded). Doubles as the list marker and detail locator.
+	PayloadPath string `json:"payload_path"`
 }
 
 // LogFilter bounds a logs query. Zero values mean "unset".
@@ -57,7 +60,7 @@ type LogFilter struct {
 const logColumns = `id, ts, request_id, api_key_id, api_key_name, provider_id, provider_name,
 	account_id, account_name, channel_id, channel_name, model, upstream_model, protocol_in, protocol_out, stream,
 	status, success, error_type, attempts, prompt_tokens, completion_tokens,
-	cache_read_tokens, cache_write_tokens, reasoning_tokens, latency_ms, first_token_ms`
+	cache_read_tokens, cache_write_tokens, reasoning_tokens, latency_ms, first_token_ms, payload_path`
 
 // LogsRepo reads and writes request_logs. Inserts go through the batched
 // stats writer; this repo provides the batch primitive and query access.
@@ -78,8 +81,8 @@ func (r *LogsRepo) InsertBatch(ctx context.Context, rows []RequestLog) error {
 			ts, request_id, api_key_id, api_key_name, provider_id, provider_name,
 			account_id, account_name, channel_id, channel_name, model, upstream_model, protocol_in, protocol_out,
 			stream, status, success, error_type, attempts, prompt_tokens, completion_tokens,
-			cache_read_tokens, cache_write_tokens, reasoning_tokens, latency_ms, first_token_ms
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+			cache_read_tokens, cache_write_tokens, reasoning_tokens, latency_ms, first_token_ms, payload_path
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare log insert: %w", err)
 	}
@@ -93,7 +96,7 @@ func (r *LogsRepo) InsertBatch(ctx context.Context, rows []RequestLog) error {
 			row.TS, row.RequestID, row.APIKeyID, row.APIKeyName, row.ProviderID, row.ProviderName,
 			row.AccountID, row.AccountName, row.ChannelID, row.ChannelName, row.Model, row.UpstreamModel, row.ProtocolIn, row.ProtocolOut,
 			row.Stream, row.Status, row.Success, row.ErrorType, row.Attempts, row.PromptTokens, row.CompletionTokens,
-			row.CacheReadTokens, row.CacheWriteTokens, row.ReasoningTokens, row.LatencyMS, row.FirstTokenMS,
+			row.CacheReadTokens, row.CacheWriteTokens, row.ReasoningTokens, row.LatencyMS, row.FirstTokenMS, row.PayloadPath,
 		); err != nil {
 			return fmt.Errorf("insert log row: %w", err)
 		}
@@ -101,14 +104,17 @@ func (r *LogsRepo) InsertBatch(ctx context.Context, rows []RequestLog) error {
 	return tx.Commit()
 }
 
-func scanLog(rows *sql.Rows) (RequestLog, error) {
+// rowScanner is satisfied by both *sql.Rows and *sql.Row.
+type rowScanner interface{ Scan(...any) error }
+
+func scanLog(s rowScanner) (RequestLog, error) {
 	var l RequestLog
 	var errType sql.NullString
 	var ftms sql.NullInt64
-	err := rows.Scan(&l.ID, &l.TS, &l.RequestID, &l.APIKeyID, &l.APIKeyName, &l.ProviderID, &l.ProviderName,
+	err := s.Scan(&l.ID, &l.TS, &l.RequestID, &l.APIKeyID, &l.APIKeyName, &l.ProviderID, &l.ProviderName,
 		&l.AccountID, &l.AccountName, &l.ChannelID, &l.ChannelName, &l.Model, &l.UpstreamModel, &l.ProtocolIn, &l.ProtocolOut, &l.Stream,
 		&l.Status, &l.Success, &errType, &l.Attempts, &l.PromptTokens, &l.CompletionTokens,
-		&l.CacheReadTokens, &l.CacheWriteTokens, &l.ReasoningTokens, &l.LatencyMS, &l.FirstTokenMS)
+		&l.CacheReadTokens, &l.CacheWriteTokens, &l.ReasoningTokens, &l.LatencyMS, &l.FirstTokenMS, &l.PayloadPath)
 	if err != nil {
 		return l, err
 	}
@@ -121,6 +127,16 @@ func scanLog(rows *sql.Rows) (RequestLog, error) {
 		l.FirstTokenMS = &v
 	}
 	return l, nil
+}
+
+// GetLogByID returns one log row, or ErrNotFound.
+func (r *LogsRepo) GetLogByID(ctx context.Context, id int64) (RequestLog, error) {
+	l, err := scanLog(r.db.Read.QueryRowContext(ctx,
+		`SELECT `+logColumns+` FROM request_logs WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return l, ErrNotFound
+	}
+	return l, err
 }
 
 // QueryLogs returns a page of logs plus the total count for the filter.

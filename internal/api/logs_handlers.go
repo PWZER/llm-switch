@@ -5,7 +5,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/PWZER/llm-switch/internal/httpx"
+	"github.com/PWZER/llm-switch/internal/payload"
 	"github.com/PWZER/llm-switch/internal/store"
 )
 
@@ -54,6 +57,57 @@ func queryID(req *http.Request, name string) int64 {
 	}
 	n, _ := strconv.ParseInt(v, 10, 64)
 	return n
+}
+
+// segmentJSON renders one recorded segment for the envelope. Bodies are
+// returned as text; encoding/json replaces invalid UTF-8, which is
+// acceptable for a debugging view.
+func segmentJSON(seg payload.Segment) map[string]any {
+	return map[string]any{
+		"headers":   seg.Headers,
+		"body":      string(seg.Body),
+		"truncated": seg.Truncated,
+	}
+}
+
+// handleGetLogPayload serves GET /logs/{id}/payload: the three recorded
+// segments (client request, upstream request, upstream response).
+func (s *Server) handleGetLogPayload(w http.ResponseWriter, req *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(req, "id"), 10, 64)
+	row, err := s.St.Logs.GetLogByID(req.Context(), id)
+	if err != nil {
+		mapStoreErr(w, req, err)
+		return
+	}
+	if row.PayloadPath == "" {
+		httpx.WriteEnvelopeError(w, req, http.StatusNotFound, 40401, "no payload recorded for this log")
+		return
+	}
+	rec, err := payload.Read(s.PayloadDir, row.PayloadPath)
+	if err != nil {
+		httpx.WriteEnvelopeError(w, req, http.StatusNotFound, 40401, "payload expired or unavailable")
+		return
+	}
+	out := map[string]any{
+		"request_id":     rec.RequestID,
+		"client_request": segmentJSON(rec.ClientReq),
+	}
+	if rec.UpstreamReq != nil {
+		out["upstream_request"] = segmentJSON(*rec.UpstreamReq)
+	} else {
+		out["upstream_request"] = nil
+	}
+	if rec.RespStatus != 0 || rec.RespHeaders != nil || len(rec.RespBody) > 0 {
+		out["upstream_response"] = map[string]any{
+			"status":    rec.RespStatus,
+			"headers":   rec.RespHeaders,
+			"body":      string(rec.RespBody),
+			"truncated": rec.RespTrunc,
+		}
+	} else {
+		out["upstream_response"] = nil
+	}
+	httpx.WriteEnvelope(w, req, out)
 }
 
 // handleStatsOverview serves GET /stats/overview?from&to (default: last 24h).

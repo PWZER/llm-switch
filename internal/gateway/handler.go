@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/PWZER/llm-switch/internal/engine"
+	"github.com/PWZER/llm-switch/internal/payload"
 	"github.com/PWZER/llm-switch/internal/protocol/responses"
 	"github.com/PWZER/llm-switch/internal/stats"
 )
@@ -45,15 +46,16 @@ func surfaceProtocol(clientProtocol string) string {
 
 // Gateway is the data-plane service.
 type Gateway struct {
-	Holder *engine.Holder
-	Pool   *AccountPool
-	Client *http.Client
-	Log    *stats.Logger
+	Holder   *engine.Holder
+	Pool     *AccountPool
+	Client   *http.Client
+	Log      *stats.Logger
+	Payloads *payload.Writer // nil = payload recording disabled entirely
 }
 
 // New assembles a gateway.
-func New(holder *engine.Holder, pool *AccountPool, client *http.Client, logger *stats.Logger) *Gateway {
-	return &Gateway{Holder: holder, Pool: pool, Client: client, Log: logger}
+func New(holder *engine.Holder, pool *AccountPool, client *http.Client, logger *stats.Logger, payloads *payload.Writer) *Gateway {
+	return &Gateway{Holder: holder, Pool: pool, Client: client, Log: logger, Payloads: payloads}
 }
 
 // errAccountCooling means a route-pinned account is in cooldown; the caller
@@ -204,6 +206,13 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			writeProtocolError(w, r, clientProtocol, http.StatusServiceUnavailable, "api_error", "gateway is starting")
 			return
 		}
+		// Payload recording: global toggle (log_bodies) or a per-request
+		// X-Debug-Trace: 1 header. Checked here so all three mounts behave
+		// identically; the header is never forwarded upstream.
+		var cap *capture
+		if g.Payloads != nil && (snap.SettingBool("log_bodies", false) || r.Header.Get("X-Debug-Trace") == "1") {
+			cap = newCapture(r, body)
+		}
 		ck, _ := ClientKeyFrom(r.Context())
 		cands, canonical, found := snap.Resolve(model, surfaceProtocol(clientProtocol))
 		// request_logs.model records the canonical resolved identity so
@@ -213,7 +222,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 		if !found {
 			slog.Warn("model not found",
 				"model", model, "protocol", clientProtocol, "client_key", ck.Name)
-			g.recordFailure(r, start, ck, logModel, "", clientProtocol, stream, http.StatusNotFound, "model_not_found", 1, nil)
+			g.recordFailure(r, start, ck, logModel, "", clientProtocol, stream, http.StatusNotFound, "model_not_found", 1, nil, cap)
 			writeModelNotFound(w, r, clientProtocol, model)
 			return
 		}
@@ -236,6 +245,9 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 		for i := 0; i < maxAttempts; i++ {
 			cand := cands[i]
 			prov := cand.Channel.Provider
+			if cap != nil {
+				cap.resetAttempt()
+			}
 			account, err := g.pickAccount(cand)
 			if errors.Is(err, errAccountCooling) {
 				slog.Warn("route-pinned account cooling, failing over", "channel", cand.Channel.Name,
@@ -246,7 +258,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			}
 			if err != nil {
 				g.recordFailure(r, start, ck, logModel, cand.UpstreamModel, clientProtocol, stream,
-					http.StatusServiceUnavailable, "no_accounts", i+1, nil)
+					http.StatusServiceUnavailable, "no_accounts", i+1, nil, cap)
 				writeProtocolError(w, r, clientProtocol, http.StatusServiceUnavailable,
 					"api_error", "provider "+prov.Name+" has no enabled accounts")
 				return
@@ -265,7 +277,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				slog.Warn("request preparation failed", "channel", cand.Channel.Name,
 					"model", model, "err", perr)
 				g.recordFailure(r, start, ck, logModel, cand.UpstreamModel, clientProtocol, stream,
-					http.StatusBadRequest, "invalid_request", i+1, lastAccount)
+					http.StatusBadRequest, "invalid_request", i+1, lastAccount, cap)
 				status := http.StatusBadRequest
 				_, isBad := perr.(errBadRequest)
 				if !isBad {
@@ -275,7 +287,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				return
 			}
 
-			resp, err := g.dispatch(r, cand, account.Secret, upBody, stream, clientProtocol, upPath)
+			resp, err := g.dispatch(r, cand, account.Secret, upBody, stream, clientProtocol, upPath, cap)
 			if err != nil {
 				slog.Warn("upstream attempt failed", "channel", cand.Channel.Name,
 					"provider", prov.Name, "account_id", account.ID, "model", model, "attempt", i+1, "err", err)
@@ -283,12 +295,18 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				lastStatus, lastErrType = http.StatusBadGateway, "network_error"
 				continue
 			}
+			if cap != nil {
+				cap.setResponse(resp)
+			}
 
 			switch classifyStatus(resp.StatusCode) {
 			case statusRetriable:
 				ra := retryAfter(resp.Header)
 				if eb := captureUpstreamError(resp); len(eb) > 0 {
 					lastErrBody = eb
+					if cap != nil {
+						cap.respBody.Write(eb)
+					}
 				}
 				outcome := OutcomeServerError
 				errType := "upstream_5xx"
@@ -309,6 +327,9 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 					"provider", prov.Name, "account_id", account.ID, "status", resp.StatusCode)
 				if eb := captureUpstreamError(resp); len(eb) > 0 {
 					lastErrBody = eb
+					if cap != nil {
+						cap.respBody.Write(eb)
+					}
 				}
 				g.Pool.Report(account.ID, OutcomeAuthError, 0)
 				lastStatus, lastErrType = resp.StatusCode, "auth_error"
@@ -316,7 +337,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 			default:
 				// Committed: 2xx relayed, non-retriable 4xx/5xx passed through.
 				g.commit(w, r, start, resp, cand, account, ck, model, logModel,
-					clientProtocol, stream, lastStatus, lastErrType, i+1)
+					clientProtocol, stream, lastStatus, lastErrType, i+1, cap)
 				return
 			}
 		}
@@ -329,16 +350,17 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 		slog.Error("all upstream candidates failed", "model", model,
 			"client_key", ck.Name, "attempts", maxAttempts,
 			"last_status", status, "error_type", orDefault(lastErrType, "upstream_error"))
-		g.recordFailure(r, start, ck, logModel, lastUpstream, clientProtocol, stream, status, orDefault(lastErrType, "upstream_error"), maxAttempts, lastAccount)
+		g.recordFailure(r, start, ck, logModel, lastUpstream, clientProtocol, stream, status, orDefault(lastErrType, "upstream_error"), maxAttempts, lastAccount, cap)
 		writeUpstreamError(w, r, clientProtocol, status, lastErrBody)
 	}
 }
 
 // dispatch sends the prepared upstream request. Auth injected per channel
 // style; hop-by-hop headers stripped. upPath overrides the channel chat path
-// (used for Responses passthrough).
+// (used for Responses passthrough). cap, when non-nil, records the exact
+// request bytes sent.
 func (g *Gateway) dispatch(r *http.Request, cand engine.Candidate, secret string,
-	body []byte, stream bool, clientProtocol, upPath string) (*http.Response, error) {
+	body []byte, stream bool, clientProtocol, upPath string, cap *capture) (*http.Response, error) {
 
 	ch := cand.Channel
 	url := joinURL(ch.BaseURL, upPath)
@@ -347,6 +369,9 @@ func (g *Gateway) dispatch(r *http.Request, cand engine.Candidate, secret string
 		return nil, err
 	}
 	setUpstreamHeaders(req, r, ch, secret, clientProtocol, stream, len(body))
+	if cap != nil {
+		cap.setUpstream(req, body)
+	}
 	return g.Client.Do(req)
 }
 
@@ -370,10 +395,11 @@ func responsesPassthroughPath(clientProtocol string, ch *engine.Channel) string 
 // commit relays a successful (or non-retriable) upstream response to the client
 // and records the request log entry. model seeds the client-facing echo in
 // converted relays; logModel (the canonical resolved name) feeds the log.
+// cap, when non-nil, collects the upstream response body while relaying.
 func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time,
 	resp *http.Response, cand engine.Candidate, acc engine.Account, ck engine.ClientKey,
 	model, logModel, clientProtocol string, stream bool,
-	prevStatus int, prevErrType string, attempts int) {
+	prevStatus int, prevErrType string, attempts int, cap *capture) {
 
 	var (
 		usage      usageInfo
@@ -389,20 +415,21 @@ func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time
 	if ptPath != "" {
 		tapProto = clientProtocol
 	}
+	sink := cap.sink()
 	switch {
 	case ptPath != "" && stream && resp.StatusCode < 400:
-		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout())
+		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout(), sink)
 	case stream && resp.StatusCode < 400 && converting:
 		usage, ttft, err = relayConvertedStream(w, r, resp,
-			cand.Channel.Protocol, clientProtocol, model, g.idleTimeout())
+			cand.Channel.Protocol, clientProtocol, model, g.idleTimeout(), sink)
 	case stream && resp.StatusCode < 400:
-		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout())
+		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout(), sink)
 	case ptPath != "":
-		usage, err = relayNonStream(w, r, resp, tapProto)
+		usage, err = relayNonStream(w, r, resp, tapProto, sink)
 	case converting:
-		usage, err = relayConvertedNonStream(w, r, resp, cand.Channel.Protocol, clientProtocol, model)
+		usage, err = relayConvertedNonStream(w, r, resp, cand.Channel.Protocol, clientProtocol, model, sink)
 	default:
-		usage, err = relayNonStream(w, r, resp, tapProto)
+		usage, err = relayNonStream(w, r, resp, tapProto, sink)
 	}
 
 	success := err == nil && resp.StatusCode < 400
@@ -412,7 +439,7 @@ func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time
 	}
 	_ = prevStatus
 	g.logRequest(r, start, ck, logModel, cand, &acc, clientProtocol, stream,
-		resp.StatusCode, success, errType, attempts, usage, ttft)
+		resp.StatusCode, success, errType, attempts, usage, ttft, cap)
 	g.Pool.Report(acc.ID, OutcomeOK, 0)
 }
 
@@ -737,6 +764,10 @@ func (g *Gateway) embeddings(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "gateway is starting")
 		return
 	}
+	var cap *capture
+	if g.Payloads != nil && (snap.SettingBool("log_bodies", false) || r.Header.Get("X-Debug-Trace") == "1") {
+		cap = newCapture(r, body)
+	}
 	cands, canonical, found := snap.Resolve(model, protocolOpenAI)
 	logModel := orDefault(canonical, model)
 	if !found {
@@ -760,22 +791,29 @@ func (g *Gateway) embeddings(w http.ResponseWriter, r *http.Request) {
 		writeProtocolError(w, r, protocolOpenAI, http.StatusServiceUnavailable, "api_error", "no enabled accounts")
 		return
 	}
+	upBody := rewriteModel(body, cand.UpstreamModel, false)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
-		joinURL(cand.Channel.BaseURL, embeddingsPath), bytesReader(rewriteModel(body, cand.UpstreamModel, false)))
+		joinURL(cand.Channel.BaseURL, embeddingsPath), bytesReader(upBody))
 	if err != nil {
 		writeProtocolError(w, r, protocolOpenAI, http.StatusInternalServerError, "api_error", err.Error())
 		return
 	}
 	setUpstreamHeaders(req, r, cand.Channel, account.Secret, protocolOpenAI, false, len(body))
+	if cap != nil {
+		cap.setUpstream(req, upBody)
+	}
 	resp, err := g.Client.Do(req)
 	if err != nil {
 		writeProtocolError(w, r, protocolOpenAI, http.StatusBadGateway, "api_error", "upstream unreachable")
 		return
 	}
-	usage, rerr := relayNonStream(w, r, resp, protocolOpenAI)
+	if cap != nil {
+		cap.setResponse(resp)
+	}
+	usage, rerr := relayNonStream(w, r, resp, protocolOpenAI, cap.sink())
 	ck, _ := ClientKeyFrom(r.Context())
 	g.logRequest(r, start, ck, logModel, *cand, &account, protocolOpenAI, false,
-		resp.StatusCode, rerr == nil && resp.StatusCode < 400, errorTypeFor(rerr, resp.StatusCode), 1, usage, nil)
+		resp.StatusCode, rerr == nil && resp.StatusCode < 400, errorTypeFor(rerr, resp.StatusCode), 1, usage, nil, cap)
 }
 
 // — helpers ---------------------------------------------------------------
@@ -922,18 +960,20 @@ func errorTypeFor(err error, status int) string {
 }
 
 func (g *Gateway) recordFailure(r *http.Request, start time.Time, ck engine.ClientKey,
-	model, upstreamModel, protocolIn string, stream bool, status int, errType string, attempts int, acc *engine.Account) {
+	model, upstreamModel, protocolIn string, stream bool, status int, errType string, attempts int, acc *engine.Account, cap *capture) {
 
 	cand := engine.Candidate{UpstreamModel: upstreamModel}
-	g.logRequest(r, start, ck, model, cand, acc, protocolIn, stream, status, false, errType, attempts, usageInfo{}, nil)
+	g.logRequest(r, start, ck, model, cand, acc, protocolIn, stream, status, false, errType, attempts, usageInfo{}, nil, cap)
 }
 
 func (g *Gateway) logRequest(r *http.Request, start time.Time, ck engine.ClientKey,
 	model string, cand engine.Candidate, acc *engine.Account, protocolIn string, stream bool,
-	status int, success bool, errType string, attempts int, usage usageInfo, ttft *int64) {
+	status int, success bool, errType string, attempts int, usage usageInfo, ttft *int64, cap *capture) {
 
 	entry := storeLogEntry(r, start, ck, model, cand, acc, protocolIn, stream,
 		status, success, errType, attempts, usage, ttft)
+	// Enqueue before the log row so the recorded relative path lands on it.
+	entry.PayloadPath = g.enqueuePayload(cap, entry.RequestID, entry.TS)
 	if g.Log != nil {
 		g.Log.Log(entry)
 	}

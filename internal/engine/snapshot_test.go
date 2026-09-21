@@ -526,3 +526,36 @@ func TestResolveProviderTarget(t *testing.T) {
 		t.Fatalf("legacy channel pin must resolve unfiltered: %q %v", summary(cands), ok)
 	}
 }
+
+// SettingBool parses both the seeded "1"/"0" form and the admin-written
+// "true"/"false" form, falling back on garbage and nil snapshots.
+func TestSettingBool(t *testing.T) {
+	snap := &Snapshot{Settings: map[string]string{
+		"on_seed":  "1",
+		"off_seed": "0",
+		"on_ui":    "true",
+		"off_ui":   "false",
+		"garbage":  "maybe",
+	}}
+	for _, tc := range []struct {
+		key      string
+		fallback bool
+		want     bool
+	}{
+		{"on_seed", false, true},
+		{"off_seed", true, false},
+		{"on_ui", false, true},
+		{"off_ui", true, false},
+		{"garbage", true, true},
+		{"missing", true, true},
+		{"missing", false, false},
+	} {
+		if got := snap.SettingBool(tc.key, tc.fallback); got != tc.want {
+			t.Errorf("SettingBool(%q, %v) = %v, want %v", tc.key, tc.fallback, got, tc.want)
+		}
+	}
+	var nilSnap *Snapshot
+	if nilSnap.SettingBool("on_seed", true) != true {
+		t.Error("nil snapshot must return the fallback")
+	}
+}

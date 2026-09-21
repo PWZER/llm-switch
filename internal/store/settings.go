@@ -88,11 +88,12 @@ func (r *SettingsRepo) SetMany(ctx context.Context, kv map[string]string) error 
 // table; internal keys (seeded_providers, auto_bind_new_models) are not in
 // the allowlist and can never pass through SanitizeAdminSettings.
 var AdminSettingKeys = map[string]string{
-	"retention_days":        "int",
-	"max_failover_attempts": "int",
-	"default_max_tokens":    "int",
-	"stream_idle_timeout_s": "int",
-	"log_bodies":            "bool",
+	"retention_days":         "int",
+	"max_failover_attempts":  "int",
+	"default_max_tokens":     "int",
+	"stream_idle_timeout_s":  "int",
+	"log_bodies":             "bool",
+	"payload_retention_days": "int",
 }
 
 // SanitizeAdminSettings filters raw key/value pairs down to the allowlist.

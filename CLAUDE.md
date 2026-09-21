@@ -220,6 +220,20 @@ echoable via `X-Request-Id`); action endpoints use plain path suffixes
 the upstream body. Any non-GET admin request that returns <400 triggers a snapshot
 reload (`reloadAfterMutation`) — read-only POST actions tolerate the rebuild cost.
 
+Payload recording (on-demand full request/response capture): triggered per request
+by the `X-Debug-Trace: 1` client header or globally by the `log_bodies` bool setting
+(hot-applied via snapshot `SettingBool`). The gateway `capture` (internal/gateway/capture.go)
+collects three segments — client request, final-attempt upstream request, upstream
+response — with auth headers redacted at capture time (`payload.RedactHeaders`, so
+plaintext keys never touch disk). Bytes land as files under
+`<data-dir>/payloads/<YYYYMMDD>/<dir>/` via the async `payload.Writer` (queue cap
+256, drop+count on overflow; never blocks the request path), and the log row stores
+the relative directory in `request_logs.payload_path` (empty = not recorded) — the
+explicit mapping, never re-derived (client-supplied `X-Request-Id` is sanitized and
+collision-suffixed). `GET /logs/{id}/payload` serves the segments; payload files
+have their own `payload_retention_days` (default 3) daily prune, independent of log
+retention.
+
 ## Critical Invariants (violating these causes real bugs)
 
 1. **Failover only before the first byte is forwarded to the client.** Read the upstream

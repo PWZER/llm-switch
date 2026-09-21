@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Alert, App as AntApp, Button, Card, Checkbox, Form, Input, InputNumber, Space,
-  Typography, Upload,
+  Switch, Typography, Upload,
 } from 'antd';
 import type { UploadFile } from 'antd';
 import { UploadOutlined } from '@ant-design/icons';
@@ -16,6 +16,7 @@ interface SettingsMap {
   default_max_tokens?: string;
   stream_idle_timeout_s?: string;
   log_bodies?: string;
+  payload_retention_days?: string;
   [k: string]: string | undefined;
 }
 
@@ -32,12 +33,14 @@ export default function Settings() {
         max_failover_attempts: Number(s.max_failover_attempts ?? 3),
         default_max_tokens: Number(s.default_max_tokens ?? 8192),
         stream_idle_timeout_s: Number(s.stream_idle_timeout_s ?? 300),
+        log_bodies: s.log_bodies === '1' || s.log_bodies === 'true',
+        payload_retention_days: Number(s.payload_retention_days ?? 3),
       }),
     );
   }, [form]);
   useEffect(load, [load]);
 
-  const save = async (v: Record<string, number>) => {
+  const save = async (v: Record<string, number | boolean>) => {
     setSaving(true);
     try {
       const body = Object.fromEntries(Object.entries(v).map(([k, x]) => [k, String(x)]));
@@ -90,6 +93,22 @@ export default function Settings() {
             rules={[{ required: true }]}
           >
             <InputNumber min={10} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="log_bodies"
+            label={t('settings.logBodies')}
+            tooltip={t('settings.logBodiesTip')}
+            valuePropName="checked"
+          >
+            <Switch />
+          </Form.Item>
+          <Form.Item
+            name="payload_retention_days"
+            label={t('settings.payloadRetention')}
+            tooltip={t('settings.payloadRetentionTip')}
+            rules={[{ required: true }]}
+          >
+            <InputNumber min={1} style={{ width: '100%' }} />
           </Form.Item>
           <Button type="primary" htmlType="submit" loading={saving}>
             {t('common.save')}

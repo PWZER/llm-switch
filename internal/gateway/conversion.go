@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/PWZER/llm-switch/internal/ir"
+	"github.com/PWZER/llm-switch/internal/payload"
 	"github.com/PWZER/llm-switch/internal/protocol"
 )
 
@@ -54,9 +55,11 @@ func prepareUpstreamBody(raw []byte, clientProto, upstreamProto, upstreamModel s
 }
 
 // relayConvertedStream pipes a cross-protocol upstream SSE stream to the
-// client: upstream SSE -> IR events -> client SSE, flushing per event.
+// client: upstream SSE -> IR events -> client SSE, flushing per event. sink,
+// when non-nil, collects the raw upstream bytes (not the rendered client
+// frames) for payload recording.
 func relayConvertedStream(w http.ResponseWriter, r *http.Request, resp *http.Response,
-	upstreamProto, clientProto, model string, idleTimeout time.Duration) (usageInfo, *int64, error) {
+	upstreamProto, clientProto, model string, idleTimeout time.Duration, sink *payload.Buffer) (usageInfo, *int64, error) {
 
 	defer resp.Body.Close()
 	uc, err := protocol.For(ir.Protocol(upstreamProto))
@@ -106,8 +109,11 @@ func relayConvertedStream(w http.ResponseWriter, r *http.Request, resp *http.Res
 		wdReset()
 		line, rerr := buffered.ReadBytes('\n')
 		if len(line) > 0 {
-			if payload, ok := sseDataPayload(line); ok {
-				for _, ev := range reader.Feed(payload) {
+			if sink != nil {
+				sink.Write(line)
+			}
+			if data, ok := sseDataPayload(line); ok {
+				for _, ev := range reader.Feed(data) {
 					if ev.Kind == ir.EvFinish {
 						usage = usageInfo{
 							Prompt:     ev.Usage.Input,
@@ -154,14 +160,18 @@ func relayConvertedStream(w http.ResponseWriter, r *http.Request, resp *http.Res
 }
 
 // relayConvertedNonStream converts a complete upstream response body into the
-// client's protocol shape.
+// client's protocol shape. sink, when non-nil, collects the raw upstream body
+// for payload recording.
 func relayConvertedNonStream(w http.ResponseWriter, r *http.Request, resp *http.Response,
-	upstreamProto, clientProto, model string) (usageInfo, error) {
+	upstreamProto, clientProto, model string, sink *payload.Buffer) (usageInfo, error) {
 
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
 		return usageInfo{}, err
+	}
+	if sink != nil {
+		sink.Write(body)
 	}
 	uc, err := protocol.For(ir.Protocol(upstreamProto))
 	if err != nil {

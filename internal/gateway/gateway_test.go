@@ -17,6 +17,7 @@ import (
 	"github.com/PWZER/llm-switch/internal/auth"
 	"github.com/PWZER/llm-switch/internal/engine"
 	"github.com/PWZER/llm-switch/internal/gateway"
+	"github.com/PWZER/llm-switch/internal/payload"
 	"github.com/PWZER/llm-switch/internal/stats"
 	"github.com/PWZER/llm-switch/internal/store"
 	"github.com/PWZER/llm-switch/internal/testutil"
@@ -32,6 +33,9 @@ type harness struct {
 	openai *testutil.Fake
 	anthro *testutil.Fake
 	key    string // plaintext client key
+	pw     *payload.Writer
+	// payloadDir is the on-disk payload recording root for this harness.
+	payloadDir string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -87,7 +91,10 @@ func newHarness(t *testing.T) *harness {
 	must(t, holder.Rebuild(ctx, st))
 	logger := stats.New(st)
 	pool := gateway.NewAccountPool()
-	gw := gateway.New(holder, pool, gateway.NewUpstreamClient(), logger)
+	payloadDir := filepath.Join(dir, "payloads")
+	pw := payload.NewWriter(payloadDir, st)
+	t.Cleanup(func() { pw.Close(context.Background()) })
+	gw := gateway.New(holder, pool, gateway.NewUpstreamClient(), logger, pw)
 
 	r := chi.NewRouter()
 	validateKey := func(key string) (gateway.ClientKeyRecord, bool) {
@@ -116,6 +123,7 @@ func newHarness(t *testing.T) *harness {
 	return &harness{
 		t: t, st: st, holder: holder, srv: srv,
 		client: srv.Client(), openai: openai, anthro: anthro, key: plain,
+		pw: pw, payloadDir: payloadDir,
 	}
 }
 

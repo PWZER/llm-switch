@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/PWZER/llm-switch/internal/payload"
 )
 
 // usageInfo is the normalized usage snapshot harvested from upstream traffic.
@@ -179,12 +181,16 @@ func tapNonStreamBody(protocol string, body []byte) usageInfo {
 	return u
 }
 
-// relayNonStream forwards a buffered upstream response to the client.
-func relayNonStream(w http.ResponseWriter, r *http.Request, resp *http.Response, protocol string) (usageInfo, error) {
+// relayNonStream forwards a buffered upstream response to the client. sink,
+// when non-nil, collects the body bytes for payload recording.
+func relayNonStream(w http.ResponseWriter, r *http.Request, resp *http.Response, protocol string, sink *payload.Buffer) (usageInfo, error) {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
 		return usageInfo{}, err
+	}
+	if sink != nil {
+		sink.Write(body)
 	}
 	copyResponseHeaders(w.Header(), resp)
 	w.WriteHeader(resp.StatusCode)
@@ -196,8 +202,9 @@ func relayNonStream(w http.ResponseWriter, r *http.Request, resp *http.Response,
 
 // relayStream pipes an SSE response to the client line by line, flushing per
 // line, while tapping usage. An idle watchdog aborts the upstream if no bytes
-// arrive within idleTimeout.
-func relayStream(w http.ResponseWriter, r *http.Request, resp *http.Response, protocol string, idleTimeout time.Duration) (usageInfo, *int64, error) {
+// arrive within idleTimeout. sink, when non-nil, collects the relayed bytes
+// for payload recording — a pure memory append, never blocking the loop.
+func relayStream(w http.ResponseWriter, r *http.Request, resp *http.Response, protocol string, idleTimeout time.Duration, sink *payload.Buffer) (usageInfo, *int64, error) {
 	defer resp.Body.Close()
 
 	h := w.Header()
@@ -226,6 +233,9 @@ func relayStream(w http.ResponseWriter, r *http.Request, resp *http.Response, pr
 				ttft = &ms
 			}
 			tapStreamLine(protocol, line, &u)
+			if sink != nil {
+				sink.Write(line)
+			}
 			if _, werr := w.Write(line); werr != nil {
 				return u, ttft, werr // client went away; stop quietly
 			}

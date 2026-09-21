@@ -2,9 +2,54 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
+
+// TestLogPayloadPathRoundtrip covers the payload_path marker column: batch
+// insert, list scan, and single-row fetch all carry it; a missing id yields
+// ErrNotFound.
+func TestLogPayloadPathRoundtrip(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	rows := []RequestLog{
+		{TS: time.Now().UnixMilli(), Model: "glm-4.6", Success: true, PayloadPath: "20260921/req-abc"},
+		{TS: time.Now().UnixMilli(), Model: "glm-4.6", Success: true},
+	}
+	if err := st.Logs.InsertBatch(ctx, rows); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	logs, total, err := st.Logs.QueryLogs(ctx, LogFilter{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if total != 2 || len(logs) != 2 {
+		t.Fatalf("want 2 logs, got total=%d items=%d", total, len(logs))
+	}
+	var withPayload *RequestLog
+	for i := range logs {
+		if logs[i].PayloadPath != "" {
+			withPayload = &logs[i]
+		}
+	}
+	if withPayload == nil || withPayload.PayloadPath != "20260921/req-abc" {
+		t.Fatalf("payload_path lost in list scan: %+v", logs)
+	}
+
+	got, err := st.Logs.GetLogByID(ctx, withPayload.ID)
+	if err != nil {
+		t.Fatalf("get by id: %v", err)
+	}
+	if got.PayloadPath != "20260921/req-abc" {
+		t.Fatalf("payload_path lost in single fetch: %+v", got)
+	}
+	if _, err := st.Logs.GetLogByID(ctx, 999999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing id: want ErrNotFound, got %v", err)
+	}
+}
 
 func TestTimeseriesGroupsByModelAndSumsCacheRead(t *testing.T) {
 	st := newTestStore(t)

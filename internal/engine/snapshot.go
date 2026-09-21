@@ -150,6 +150,21 @@ func (s *Snapshot) SettingInt(key string, fallback int) int {
 	return fallback
 }
 
+// SettingBool returns a settings value parsed as bool with a fallback.
+// ParseBool accepts the seeded "1"/"0" form and the "true"/"false" form the
+// admin API writes.
+func (s *Snapshot) SettingBool(key string, fallback bool) bool {
+	if s == nil {
+		return fallback
+	}
+	if v, ok := s.Settings[key]; ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return fallback
+}
+
 // HashKey is the storage/lookup form of a client key.
 func HashKey(plain string) string {
 	sum := sha256.Sum256([]byte(plain))

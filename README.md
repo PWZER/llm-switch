@@ -169,7 +169,15 @@ running binary:
 5. **Client Keys** — issue a key for your agent (shown once).
 
 **Settings** covers log retention, failover attempt cap, injected `default_max_tokens`,
-stream idle timeout, and request-body logging, plus the config **Export/Import** cards.
+stream idle timeout, and payload recording, plus the config **Export/Import** cards.
+
+**Payload recording** captures full request/response traffic (headers + bodies of the
+client request, the upstream request, and the upstream response) for debugging. Enable
+it globally with the **Record full payloads** toggle, or per request with the
+`X-Debug-Trace: 1` header. Recordings are written as files under
+`<data-dir>/payloads/` (never the database) with auth headers redacted, pruned after
+**Payload retention** days (default 3), and viewable from the Logs page — recorded rows
+carry a blue `payload` tag; click the row for the three-segment detail drawer.
 
 ## Connecting clients
 

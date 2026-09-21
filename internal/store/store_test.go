@@ -32,8 +32,8 @@ func TestMigrationsIdempotent(t *testing.T) {
 		t.Fatalf("second migrate: %v", err)
 	}
 	var maxv int
-	if err := st.db.Read.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&maxv); err != nil || maxv != 2 {
-		t.Fatalf("want schema version 2, got %d (err=%v)", maxv, err)
+	if err := st.db.Read.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&maxv); err != nil || maxv != 3 {
+		t.Fatalf("want schema version 3, got %d (err=%v)", maxv, err)
 	}
 }
 
