@@ -1,0 +1,57 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths-ignore:
+      - "README.md"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    # write-all: only the tag-gated release step needs it (asset upload).
+    permissions: write-all
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe --tags` stamps real versions.
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          install-only: true
+
+      # Builds the frontend once, then cross-compiles bin/llm-switch-<goos>-<goarch>.
+      - name: Build release binaries
+        run: make release
+
+      - name: Compress binaries
+        run: make compress
+
+      - name: Upload release
+        if: success() && github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag: ${{ github.ref_name }}
+          files: bin/llm-switch-*
+          generate_release_notes: true
