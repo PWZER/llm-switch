@@ -12,10 +12,12 @@ dev:
 	go run ./cmd/llm-switch --web-dev
 
 # Build the React frontend and copy dist into the embeddable location.
+# The .gitkeep keeps `go build ./...` compiling on fresh clones without Node.
 frontend:
 	cd web && npm ci && npm run build
 	rm -rf internal/web/dist
 	cp -r web/dist internal/web/dist
+	touch internal/web/dist/.gitkeep
 
 # Single-binary release build (embeds frontend).
 build: frontend
