@@ -6,11 +6,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +27,7 @@ import (
 	"github.com/PWZER/llm-switch/internal/daemon"
 	"github.com/PWZER/llm-switch/internal/engine"
 	"github.com/PWZER/llm-switch/internal/gateway"
+	"github.com/PWZER/llm-switch/internal/upgrade"
 	"github.com/PWZER/llm-switch/internal/stats"
 	"github.com/PWZER/llm-switch/internal/store"
 	"github.com/PWZER/llm-switch/internal/web"
@@ -65,8 +69,102 @@ func newRootCommand(cfg *config.Config) *cobra.Command {
 	root.SetVersionTemplate("llm-switch {{.Version}}\n")
 	config.RegisterPersistentFlags(root.PersistentFlags(), cfg)
 	config.RegisterFlags(root.Flags(), cfg)
+	root.AddCommand(newUpgradeCommand(cfg), newStatusCommand(cfg), newStopCommand(cfg))
 	return root
 }
+
+// newUpgradeCommand downloads the latest release, replaces this binary, and
+// restarts a running instance with its original flags.
+func newUpgradeCommand(cfg *config.Config) *cobra.Command {
+	var check, yes bool
+	cmd := &cobra.Command{
+		Use:   "upgrade",
+		Short: "Download the latest release and replace this binary",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return upgrade.Run(upgrade.Options{
+				DataDir:    cfg.DataDir,
+				CurrentVer: version,
+				CheckOnly:  check,
+				Yes:        yes,
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&check, "check", false, "print the current and latest versions without downloading")
+	cmd.Flags().BoolVar(&yes, "yes", false, "skip the confirmation prompt")
+	return cmd
+}
+
+// newStatusCommand reports whether an instance is running, with exit code 0
+// for running and 1 for not running so scripts can branch on it.
+func newStatusCommand(cfg *config.Config) *cobra.Command {
+	return &cobra.Command{
+		Use:           "status",
+		Short:         "Show whether an llm-switch instance is running",
+		SilenceErrors: true, // the not-running case prints its own line
+		RunE: func(_ *cobra.Command, _ []string) error {
+			meta, metaOK := daemon.ReadRunMeta(cfg.DataDir)
+			pid := 0
+			if metaOK && daemon.Alive(meta.PID) {
+				pid = meta.PID
+			} else if candidate := daemon.ReadPid(cfg.DataDir); daemon.Alive(candidate) {
+				pid = candidate
+				metaOK = false
+			}
+			if pid <= 0 {
+				if daemon.ReadPid(cfg.DataDir) > 0 {
+					fmt.Fprintln(os.Stdout, "llm-switch is not running (stale pid file in "+cfg.DataDir+")")
+				} else {
+					fmt.Fprintln(os.Stdout, "llm-switch is not running")
+				}
+				return errNotRunning
+			}
+			fmt.Fprintf(os.Stdout, "pid:      %d\n", pid)
+			if metaOK {
+				if meta.Version != "" {
+					fmt.Fprintf(os.Stdout, "version:  %s\n", meta.Version)
+				}
+				fmt.Fprintf(os.Stdout, "started:  %s\n", time.Unix(meta.StartedAt, 0).Format(time.RFC3339))
+				if len(meta.Args) > 0 {
+					fmt.Fprintf(os.Stdout, "args:     %s\n", strings.Join(meta.Args, " "))
+				}
+			}
+			fmt.Fprintf(os.Stdout, "data dir: %s\n", cfg.DataDir)
+			fmt.Fprintf(os.Stdout, "log:      %s\n", filepath.Join(cfg.DataDir, daemon.LogFile))
+			return nil
+		},
+	}
+}
+
+// newStopCommand terminates the running instance.
+func newStopCommand(cfg *config.Config) *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "stop",
+		Short: "Stop the running llm-switch instance",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			err := daemon.Stop(cfg.DataDir, stopGrace, force)
+			if errors.Is(err, daemon.ErrNotRunning) {
+				fmt.Fprintln(os.Stdout, "llm-switch is not running")
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(os.Stdout, "llm-switch stopped")
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "SIGKILL the instance if it does not exit within the grace period")
+	return cmd
+}
+
+const (
+	// stopGrace covers the server's 30s HTTP drain + 10s stats drain.
+	stopGrace = 45 * time.Second
+)
+
+// errNotRunning drives the status command's exit code (1).
+var errNotRunning = errors.New("llm-switch is not running")
 
 func run(cfg *config.Config) error {
 	logger := newLogger(cfg.LogFormat)
