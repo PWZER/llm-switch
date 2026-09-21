@@ -73,7 +73,8 @@ func TestMigrationProtocolKeyedChannels(t *testing.T) {
 		`INSERT INTO model_routes (name, targets_json, updated_at) VALUES ('r1',
 			'[{"provider_id":1,"channel_id":2,"account_id":null,"upstream_model":"m"},
 			  {"provider_id":1,"channel_id":1,"account_id":null,"upstream_model":"m"}]', 1)`,
-		// A log row to carry through the channel_name -> channel_protocol rename.
+		// A log row to carry through the channel_name rename (0005) and the
+		// channel_protocol drop (0006).
 		`INSERT INTO request_logs (ts, model, protocol_in, protocol_out, status, channel_name)
 			VALUES (1, 'm', 'openai', 'openai', 200, 'main-openai')`,
 	}
@@ -144,10 +145,17 @@ func TestMigrationProtocolKeyedChannels(t *testing.T) {
 		t.Fatalf("surviving-channel pin lost: %s", targets)
 	}
 
-	// The request_logs column renamed with data intact.
-	var proto string
-	if err := db.Read.QueryRow(`SELECT channel_protocol FROM request_logs WHERE ts = 1`).Scan(&proto); err != nil {
-		t.Fatalf("channel_protocol rename failed: %v", err)
+	// The log row survives the rename (0005) + drop (0006) of the redundant
+	// channel column; channel_protocol must be gone from the schema.
+	var protoIn string
+	if err := db.Read.QueryRow(`SELECT protocol_in FROM request_logs WHERE ts = 1`).Scan(&protoIn); err != nil {
+		t.Fatalf("log row lost: %v", err)
+	}
+	var cnt int
+	if err := db.Read.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('request_logs') WHERE name IN ('channel_name', 'channel_protocol')`).
+		Scan(&cnt); err != nil || cnt != 0 {
+		t.Fatalf("channel column must be gone from request_logs (cnt=%d, err=%v)", cnt, err)
 	}
 
 	// The UNIQUE(provider_id, protocol) constraint is live.

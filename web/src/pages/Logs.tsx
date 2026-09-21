@@ -62,11 +62,6 @@ export default function Logs() {
     },
     { title: t('logs.key'), dataIndex: 'api_key_name' },
     {
-      title: t('logs.channel'),
-      dataIndex: 'channel_protocol',
-      render: (v: string) => <ProtocolTag protocol={v} />,
-    },
-    {
       title: t('logs.account'),
       dataIndex: 'account_name',
       render: (v: string) => v || <span style={{ opacity: 0.4 }}>-</span>,

@@ -21,7 +21,6 @@ type RequestLog struct {
 	AccountID        *int64  `json:"account_id"`
 	AccountName      string  `json:"account_name"`
 	ChannelID        *int64  `json:"channel_id"`
-	ChannelProtocol  string  `json:"channel_protocol"`
 	Model            string  `json:"model"`
 	UpstreamModel    string  `json:"upstream_model"`
 	ProtocolIn       string  `json:"protocol_in"`
@@ -58,7 +57,7 @@ type LogFilter struct {
 }
 
 const logColumns = `id, ts, request_id, api_key_id, api_key_name, provider_id, provider_name,
-	account_id, account_name, channel_id, channel_protocol, model, upstream_model, protocol_in, protocol_out, stream,
+	account_id, account_name, channel_id, model, upstream_model, protocol_in, protocol_out, stream,
 	status, success, error_type, attempts, prompt_tokens, completion_tokens,
 	cache_read_tokens, cache_write_tokens, reasoning_tokens, latency_ms, first_token_ms, payload_path`
 
@@ -79,10 +78,10 @@ func (r *LogsRepo) InsertBatch(ctx context.Context, rows []RequestLog) error {
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO request_logs (
 			ts, request_id, api_key_id, api_key_name, provider_id, provider_name,
-			account_id, account_name, channel_id, channel_protocol, model, upstream_model, protocol_in, protocol_out,
+			account_id, account_name, channel_id, model, upstream_model, protocol_in, protocol_out,
 			stream, status, success, error_type, attempts, prompt_tokens, completion_tokens,
 			cache_read_tokens, cache_write_tokens, reasoning_tokens, latency_ms, first_token_ms, payload_path
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare log insert: %w", err)
 	}
@@ -94,7 +93,7 @@ func (r *LogsRepo) InsertBatch(ctx context.Context, rows []RequestLog) error {
 		}
 		if _, err := stmt.ExecContext(ctx,
 			row.TS, row.RequestID, row.APIKeyID, row.APIKeyName, row.ProviderID, row.ProviderName,
-			row.AccountID, row.AccountName, row.ChannelID, row.ChannelProtocol, row.Model, row.UpstreamModel, row.ProtocolIn, row.ProtocolOut,
+			row.AccountID, row.AccountName, row.ChannelID, row.Model, row.UpstreamModel, row.ProtocolIn, row.ProtocolOut,
 			row.Stream, row.Status, row.Success, row.ErrorType, row.Attempts, row.PromptTokens, row.CompletionTokens,
 			row.CacheReadTokens, row.CacheWriteTokens, row.ReasoningTokens, row.LatencyMS, row.FirstTokenMS, row.PayloadPath,
 		); err != nil {
@@ -112,7 +111,7 @@ func scanLog(s rowScanner) (RequestLog, error) {
 	var errType sql.NullString
 	var ftms sql.NullInt64
 	err := s.Scan(&l.ID, &l.TS, &l.RequestID, &l.APIKeyID, &l.APIKeyName, &l.ProviderID, &l.ProviderName,
-		&l.AccountID, &l.AccountName, &l.ChannelID, &l.ChannelProtocol, &l.Model, &l.UpstreamModel, &l.ProtocolIn, &l.ProtocolOut, &l.Stream,
+		&l.AccountID, &l.AccountName, &l.ChannelID, &l.Model, &l.UpstreamModel, &l.ProtocolIn, &l.ProtocolOut, &l.Stream,
 		&l.Status, &l.Success, &errType, &l.Attempts, &l.PromptTokens, &l.CompletionTokens,
 		&l.CacheReadTokens, &l.CacheWriteTokens, &l.ReasoningTokens, &l.LatencyMS, &l.FirstTokenMS, &l.PayloadPath)
 	if err != nil {

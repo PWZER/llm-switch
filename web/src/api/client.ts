@@ -212,7 +212,6 @@ export interface RequestLog {
   provider_name: string;
   account_id: number | null;
   account_name: string;
-  channel_protocol: string;
   model: string;
   upstream_model: string;
   protocol_in: string;
