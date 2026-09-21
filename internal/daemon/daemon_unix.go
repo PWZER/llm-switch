@@ -4,11 +4,13 @@ package daemon
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,10 +36,11 @@ func Lock(dataDir string) (func(), error) {
 	return func() { _ = f.Close() }, nil
 }
 
-// Spawn re-executes the current binary detached (setsid, stdio redirected to
-// <dataDir>/llm-switch.log) and reports the child's startup status on stderr.
-// It returns the exit code the foreground parent should exit with.
-func Spawn(dataDir string) int {
+// SpawnArgs re-executes the current binary detached (setsid, stdio
+// redirected to <dataDir>/llm-switch.log) with args, and reports the child's
+// startup status on stderr. It returns the exit code the foreground parent
+// should exit with.
+func SpawnArgs(dataDir string, args []string) int {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "llm-switch: %v\n", err)
 		return 1
@@ -61,7 +64,7 @@ func Spawn(dataDir string) int {
 		fmt.Fprintf(os.Stderr, "llm-switch: %v\n", err)
 		return 1
 	}
-	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd := exec.Command(exe, args...)
 	cmd.Env = append(os.Environ(), ChildEnv+"=1")
 	cmd.Stdin = nil // /dev/null
 	cmd.Stdout = logFile
@@ -129,4 +132,92 @@ func WritePid(dataDir string) string {
 		return ""
 	}
 	return path
+}
+
+// Alive reports whether the process is runnable: it exists, or it exists but
+// is owned by another user (EPERM — out of reach, but alive).
+func Alive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// Stop terminates the running instance: SIGTERM, then wait up to grace for
+// the single-instance flock to become acquirable — the authoritative exit
+// signal, since the kernel drops it even on SIGKILL. With force, SIGKILL
+// after the grace period elapses. Returns ErrNotRunning (stale leftovers
+// cleaned) when nothing is running.
+func Stop(dataDir string, grace time.Duration, force bool) error {
+	pid := ReadPid(dataDir)
+	if pid <= 0 || !Alive(pid) {
+		// Nothing running — or stale leftovers. The lock arbitrates: if it
+		// is held anyway, the pid file is lying and we refuse to guess.
+		unlock, err := Lock(dataDir)
+		if err != nil {
+			return fmt.Errorf("an llm-switch instance is using %s but %s is missing or unreadable", dataDir, PidFile)
+		}
+		removeRunFiles(dataDir)
+		unlock()
+		return ErrNotRunning
+	}
+	if !looksLikeUs(pid) {
+		return fmt.Errorf("pid %d in %s does not look like llm-switch; not touched", pid, PidFile)
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("failed to signal pid %d: %w", pid, err)
+	}
+	unlock, err := acquireWithin(dataDir, grace)
+	if err != nil {
+		if !force {
+			return fmt.Errorf("instance (pid %d) did not exit within %s; retry with --force to kill it", pid, grace)
+		}
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		if unlock, err = acquireWithin(dataDir, 5*time.Second); err != nil {
+			return fmt.Errorf("instance (pid %d) did not exit after SIGKILL: %w", pid, err)
+		}
+	}
+	removeRunFiles(dataDir)
+	unlock()
+	return nil
+}
+
+// acquireWithin polls the single-instance lock until it can be acquired —
+// meaning the previous holder exited — or the timeout elapses. On success
+// the caller owns the lock and must invoke the returned release func.
+func acquireWithin(dataDir string, timeout time.Duration) (func(), error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		unlock, err := Lock(dataDir)
+		if err == nil {
+			return unlock, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out after %s waiting for the instance to exit", timeout)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// looksLikeUs is a best-effort pid-reuse guard: on Linux, /proc/<pid>/exe
+// must resolve to a program with the same name as this binary. Elsewhere the
+// check is skipped.
+func looksLikeUs(pid int) bool {
+	if runtime.GOOS != "linux" {
+		return true
+	}
+	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		// Kernel thread, zombie, or permission issue: do not guess.
+		return false
+	}
+	// The binary may have been replaced by a self-update (rename over the
+	// running file); the kernel marks the link "(deleted)".
+	exe = strings.TrimSuffix(exe, " (deleted)")
+	me, err := os.Executable()
+	if err != nil {
+		me = "llm-switch"
+	}
+	return filepath.Base(exe) == filepath.Base(me)
 }

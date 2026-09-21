@@ -52,7 +52,7 @@ func newRootCommand(cfg *config.Config) *cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) error {
 			cfg.Finalize(version)
 			if cfg.Daemon && !daemon.IsChild() {
-				os.Exit(daemon.Spawn(cfg.DataDir))
+				os.Exit(daemon.SpawnArgs(cfg.DataDir, os.Args[1:]))
 			}
 			if err := run(cfg); err != nil {
 				daemon.Notify(err)
@@ -214,10 +214,19 @@ func run(cfg *config.Config) error {
 		return err
 	}
 	// The socket is bound: report startup success to a daemon parent and
-	// drop the pid file used to stop the daemon.
+	// drop the pid + run-meta files used by the lifecycle commands
+	// (status / stop / upgrade).
 	daemon.Notify(nil)
 	if pidPath := daemon.WritePid(cfg.DataDir); pidPath != "" {
 		defer os.Remove(pidPath)
+		if metaPath := daemon.WriteRunMeta(cfg.DataDir, daemon.RunMeta{
+			PID:       os.Getpid(),
+			Args:      os.Args[1:],
+			Version:   version,
+			StartedAt: time.Now().Unix(),
+		}); metaPath != "" {
+			defer os.Remove(metaPath)
+		}
 	}
 	go func() {
 		logger.Info("http server listening", "addr", cfg.Addr, "web_dev", cfg.WebDev)
