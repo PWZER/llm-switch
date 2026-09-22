@@ -299,6 +299,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				return
 			}
 
+			dispatchStart := time.Now()
 			resp, err := g.dispatch(r, cand, account.Secret, upBody, stream, clientProtocol, upPath, cap)
 			if err != nil {
 				slog.Warn("upstream attempt failed", "channel_id", cand.Channel.ID,
@@ -348,7 +349,7 @@ func (g *Gateway) serve(clientProtocol string) http.HandlerFunc {
 				continue
 			default:
 				// Committed: 2xx relayed, non-retriable 4xx/5xx passed through.
-				g.commit(w, r, start, resp, cand, account, ck, model, logModel,
+				g.commit(w, r, start, dispatchStart, resp, cand, account, ck, model, logModel,
 					clientProtocol, stream, lastStatus, lastErrType, i+1, cap)
 				return
 			}
@@ -396,8 +397,9 @@ func responsesPassthrough(clientProtocol string, ch *engine.Channel) bool {
 // commit relays a successful (or non-retriable) upstream response to the client
 // and records the request log entry. model seeds the client-facing echo in
 // converted relays; logModel (the canonical resolved name) feeds the log.
+// dispatchStart is when this attempt was sent upstream — the TTFT base.
 // cap, when non-nil, collects the upstream response body while relaying.
-func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time,
+func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start, dispatchStart time.Time,
 	resp *http.Response, cand engine.Candidate, acc engine.Account, ck engine.ClientKey,
 	model, logModel, clientProtocol string, stream bool,
 	prevStatus int, prevErrType string, attempts int, cap *capture) {
@@ -416,12 +418,12 @@ func (g *Gateway) commit(w http.ResponseWriter, r *http.Request, start time.Time
 	sink := cap.sink()
 	switch {
 	case pt && stream && resp.StatusCode < 400:
-		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout(), sink)
+		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout(), sink, dispatchStart)
 	case stream && resp.StatusCode < 400 && converting:
 		usage, ttft, err = relayConvertedStream(w, r, resp,
-			cand.Channel.Protocol, clientProtocol, model, g.idleTimeout(), sink)
+			cand.Channel.Protocol, clientProtocol, model, g.idleTimeout(), sink, dispatchStart)
 	case stream && resp.StatusCode < 400:
-		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout(), sink)
+		usage, ttft, err = relayStream(w, r, resp, tapProto, g.idleTimeout(), sink, dispatchStart)
 	case pt:
 		usage, err = relayNonStream(w, r, resp, tapProto, sink)
 	case converting:

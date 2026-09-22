@@ -409,6 +409,45 @@ func TestAnthropicPassthroughStream(t *testing.T) {
 	}
 }
 
+// TestTTFTLogging: streaming requests record first_token_ms (the fakes emit
+// handshake frames — role chunk / message_start — before content, which must
+// not trip the mark); non-stream requests leave it NULL.
+func TestTTFTLogging(t *testing.T) {
+	h := newHarness(t)
+	resp, raw := h.post("/v1/chat/completions", `{"model":"test-model","stream":true}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("stream status %d: %s", resp.StatusCode, raw)
+	}
+	resp, raw = h.post("/v1/chat/completions", `{"model":"test-model","stream":false}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("non-stream status %d: %s", resp.StatusCode, raw)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+	logs, total, err := h.st.Logs.QueryLogs(context.Background(), store.LogFilter{Model: "test-model"})
+	must(t, err)
+	if total < 2 {
+		t.Fatalf("expected 2 log rows, got %d", total)
+	}
+	var streamTTFT, nonStreamTTFT *int64
+	for _, l := range logs {
+		if l.Stream {
+			streamTTFT = l.FirstTokenMS
+		} else {
+			nonStreamTTFT = l.FirstTokenMS
+		}
+	}
+	if streamTTFT == nil {
+		t.Fatalf("streaming request has NULL first_token_ms")
+	}
+	if *streamTTFT < 0 {
+		t.Fatalf("streaming ttft negative: %d", *streamTTFT)
+	}
+	if nonStreamTTFT != nil {
+		t.Fatalf("non-stream request should keep NULL first_token_ms, got %d", *nonStreamTTFT)
+	}
+}
+
 // TestSameProtocolPreference: a provider-scoped row expands to every live
 // channel of its provider, but the client surface's protocol wins outright —
 // the anthropic surface is served by the anthropic channel and the openai

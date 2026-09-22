@@ -77,3 +77,72 @@ func TestTapResponsesStreamCompleted(t *testing.T) {
 		t.Fatalf("responses stream tap wrong: %+v", u)
 	}
 }
+
+// hasContentDelta gates the TTFT mark on the first frame carrying generated
+// content; handshake frames (role chunk, message_start, ping, response.created)
+// must not trip it.
+
+func TestHasContentDeltaOpenAI(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{"role-only chunk", `{"choices":[{"delta":{"role":"assistant"},"index":0}]}`, false},
+		{"empty content", `{"choices":[{"delta":{"role":"assistant","content":""},"index":0}]}`, false},
+		{"null content", `{"choices":[{"delta":{"content":null},"index":0}]}`, false},
+		{"text delta", `{"choices":[{"delta":{"content":"Hi"},"index":0}]}`, true},
+		{"reasoning delta", `{"choices":[{"delta":{"reasoning_content":"let me"},"index":0}]}`, true},
+		{"tool calls", `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1"}]},"index":0}]}`, true},
+		{"no choices usage frame", `{"choices":[],"usage":{"prompt_tokens":1}}`, false},
+		{"malformed falls back to content", `{not json`, true},
+	}
+	for _, tc := range cases {
+		if got := hasContentDelta(protocolOpenAI, []byte(tc.payload)); got != tc.want {
+			t.Errorf("%s: hasContentDelta(openai) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestHasContentDeltaAnthropic(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{"message_start", `{"type":"message_start","message":{"id":"m"}}`, false},
+		{"ping", `{"type":"ping"}`, false},
+		{"content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`, false},
+		{"text delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}`, true},
+		{"thinking delta", `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}`, true},
+		{"input json delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}`, true},
+		{"message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`, false},
+		{"malformed falls back to content", `{not json`, true},
+	}
+	for _, tc := range cases {
+		if got := hasContentDelta(protocolAnthropic, []byte(tc.payload)); got != tc.want {
+			t.Errorf("%s: hasContentDelta(anthropic) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestHasContentDeltaResponses(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{"response.created", `{"type":"response.created","response":{"id":"r"}}`, false},
+		{"response.in_progress", `{"type":"response.in_progress","response":{"id":"r"}}`, false},
+		{"output item added", `{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}`, false},
+		{"output text delta", `{"type":"response.output_text.delta","delta":"Hi"}`, true},
+		{"reasoning summary delta", `{"type":"response.reasoning_summary_text.delta","delta":"hmm"}`, true},
+		{"function args delta", `{"type":"response.function_call_arguments.delta","delta":"{}"}`, true},
+		{"malformed falls back to content", `{not json`, true},
+	}
+	for _, tc := range cases {
+		if got := hasContentDelta(protocolResponses, []byte(tc.payload)); got != tc.want {
+			t.Errorf("%s: hasContentDelta(responses) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

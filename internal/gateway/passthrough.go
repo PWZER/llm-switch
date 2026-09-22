@@ -192,6 +192,70 @@ func tapResponsesUsage(payload []byte, u *usageInfo) {
 	}
 }
 
+// hasContentDelta reports whether a `data:` payload carries generated content
+// (the TTFT signal), as opposed to handshake/keep-alive frames such as the
+// OpenAI role-only chunk, Anthropic message_start/ping, or Responses
+// response.created. Unparseable payloads and unknown protocols conservatively
+// count as content so ttft is never lost to a parsing gap.
+func hasContentDelta(protocol string, payload []byte) bool {
+	switch protocol {
+	case protocolOpenAI:
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content          json.RawMessage `json:"content"`
+					ReasoningContent json.RawMessage `json:"reasoning_content"`
+					ToolCalls        json.RawMessage `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(payload, &chunk); err != nil {
+			return true
+		}
+		for _, c := range chunk.Choices {
+			if nonEmptyJSONString(c.Delta.Content) || nonEmptyJSONString(c.Delta.ReasoningContent) ||
+				nonEmptyJSONArray(c.Delta.ToolCalls) {
+				return true
+			}
+		}
+		return false
+	case protocolAnthropic:
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(payload, &ev); err != nil {
+			return true
+		}
+		// content_block_delta covers text_delta / thinking_delta /
+		// input_json_delta — every form of generated output.
+		return ev.Type == "content_block_delta"
+	case protocolResponses, protocolOpenAIResponses:
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(payload, &ev); err != nil {
+			return true
+		}
+		// response.output_text.delta, response.reasoning_summary_text.delta,
+		// response.function_call_arguments.delta, ...
+		return strings.HasSuffix(ev.Type, ".delta")
+	default:
+		return true
+	}
+}
+
+// nonEmptyJSONString reports whether raw is a JSON string with content
+// (excludes null, "", and absent fields).
+func nonEmptyJSONString(raw json.RawMessage) bool {
+	return len(raw) > 2 && raw[0] == '"'
+}
+
+// nonEmptyJSONArray reports whether raw is a JSON array with at least one
+// element (excludes null, [], and absent fields).
+func nonEmptyJSONArray(raw json.RawMessage) bool {
+	return len(raw) > 2 && raw[0] == '['
+}
+
 // sseDataPayload returns the JSON payload of a `data:` line, if any.
 func sseDataPayload(line []byte) ([]byte, bool) {
 	trimmed := bytes.TrimSpace(line)
@@ -235,7 +299,9 @@ func relayNonStream(w http.ResponseWriter, r *http.Request, resp *http.Response,
 // line, while tapping usage. An idle watchdog aborts the upstream if no bytes
 // arrive within idleTimeout. sink, when non-nil, collects the relayed bytes
 // for payload recording — a pure memory append, never blocking the loop.
-func relayStream(w http.ResponseWriter, r *http.Request, resp *http.Response, protocol string, idleTimeout time.Duration, sink *payload.Buffer) (usageInfo, *int64, error) {
+// start is when the upstream request was dispatched: the reported ttft is the
+// upstream-side time to the first content-bearing frame.
+func relayStream(w http.ResponseWriter, r *http.Request, resp *http.Response, protocol string, idleTimeout time.Duration, sink *payload.Buffer, start time.Time) (usageInfo, *int64, error) {
 	defer resp.Body.Close()
 
 	h := w.Header()
@@ -249,7 +315,6 @@ func relayStream(w http.ResponseWriter, r *http.Request, resp *http.Response, pr
 
 	var u usageInfo
 	var ttft *int64
-	start := time.Now()
 
 	wdCtx, wdReset, wdStop := idleWatchdog(r.Context(), idleTimeout)
 	defer wdStop()
@@ -260,8 +325,10 @@ func relayStream(w http.ResponseWriter, r *http.Request, resp *http.Response, pr
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			if ttft == nil {
-				ms := time.Since(start).Milliseconds()
-				ttft = &ms
+				if data, ok := sseDataPayload(line); ok && hasContentDelta(protocol, data) {
+					ms := time.Since(start).Milliseconds()
+					ttft = &ms
+				}
 			}
 			tapStreamLine(protocol, line, &u)
 			if sink != nil {

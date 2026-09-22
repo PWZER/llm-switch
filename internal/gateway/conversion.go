@@ -57,9 +57,11 @@ func prepareUpstreamBody(raw []byte, clientProto, upstreamProto, upstreamModel s
 // relayConvertedStream pipes a cross-protocol upstream SSE stream to the
 // client: upstream SSE -> IR events -> client SSE, flushing per event. sink,
 // when non-nil, collects the raw upstream bytes (not the rendered client
-// frames) for payload recording.
+// frames) for payload recording. start is when the upstream request was
+// dispatched: the reported ttft is the upstream-side time to the first
+// content-bearing IR event.
 func relayConvertedStream(w http.ResponseWriter, r *http.Request, resp *http.Response,
-	upstreamProto, clientProto, model string, idleTimeout time.Duration, sink *payload.Buffer) (usageInfo, *int64, error) {
+	upstreamProto, clientProto, model string, idleTimeout time.Duration, sink *payload.Buffer, start time.Time) (usageInfo, *int64, error) {
 
 	defer resp.Body.Close()
 	uc, err := protocol.For(ir.Protocol(upstreamProto))
@@ -99,7 +101,6 @@ func relayConvertedStream(w http.ResponseWriter, r *http.Request, resp *http.Res
 	renderer := cr.NewRenderer(model)
 	var usage usageInfo
 	var ttft *int64
-	start := time.Now()
 
 	wdCtx, wdReset, wdStop := idleWatchdog(r.Context(), idleTimeout)
 	defer wdStop()
@@ -124,7 +125,7 @@ func relayConvertedStream(w http.ResponseWriter, r *http.Request, resp *http.Res
 						}
 					}
 					frame, _ := renderer.Frame(ev)
-					if ttft == nil && len(frame) > 0 {
+					if ttft == nil && isContentEvent(ev.Kind) {
 						ms := time.Since(start).Milliseconds()
 						ttft = &ms
 					}
@@ -156,6 +157,18 @@ func relayConvertedStream(w http.ResponseWriter, r *http.Request, resp *http.Res
 			slog.Warn("converted stream read failed", "upstream", upstreamProto, "client", clientProto, "err", rerr)
 			return usage, ttft, rerr
 		}
+	}
+}
+
+// isContentEvent reports whether an IR event carries generated content (the
+// TTFT signal). EvStart/EvPing are handshake frames; EvFinish/EvError arrive
+// after generation, so none of them mark the first token.
+func isContentEvent(kind ir.EventKind) bool {
+	switch kind {
+	case ir.EvTextDelta, ir.EvThinkDelta, ir.EvToolStart, ir.EvToolDelta:
+		return true
+	default:
+		return false
 	}
 }
 
