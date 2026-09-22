@@ -42,7 +42,7 @@ export default function Logs() {
     {
       title: t('logs.time'),
       dataIndex: 'ts',
-      width: 110,
+      width: 150,
       render: (ts: number) => dayjs(ts).format('MM-DD HH:mm:ss'),
     },
     { title: t('logs.model'), dataIndex: 'model' },
